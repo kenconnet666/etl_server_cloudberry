@@ -8,14 +8,21 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 cloudberry-etl-core.workspace = true
 cloudberry-etl-metadata.workspace = true
 cloudberry-etl-source-postgres.workspace = true
 cloudberry-etl-target-cloudberry.workspace = true
 futures.workspace = true
+native-tls.workspace = true
+postgres-native-tls.workspace = true
+secrecy.workspace = true
 sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-postgres.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -24,4 +31,4 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

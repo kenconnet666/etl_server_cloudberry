@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use cloudberry_etl_core::{
-    id::{PipelineId, SourceId, TargetId},
+    id::{OperationId, PipelineId, SourceId, TargetId},
     mapping::SourcePrefix,
     pipeline::SourceTopology,
 };
@@ -46,7 +46,26 @@ pub struct PipelineDefinition {
     pub target_id: TargetId,
     pub desired_running: bool,
     pub config_revision: i64,
+    /// Monotonic target snapshot/rebuild epoch, independent of desired state.
+    pub snapshot_generation: i64,
     pub settings: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RebuildRequest {
+    pub pipeline: PipelineDefinition,
+    pub operation_id: OperationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRecord {
+    pub id: OperationId,
+    pub pipeline_id: Option<PipelineId>,
+    pub operation_type: String,
+    pub state: String,
+    pub detail: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

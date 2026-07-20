@@ -50,7 +50,7 @@ impl PublicationSpec {
             .join(", ");
         let name = quote_identifier(&self.name)?;
         Ok(format!(
-            "CREATE PUBLICATION {name} FOR TABLE {tables} WITH (publish = 'insert, update, delete, truncate', publish_via_partition_root = {})",
+            "CREATE PUBLICATION {name} FOR TABLE {tables} WITH (publish = 'insert, update, delete, truncate', publish_via_partition_root = {}, publish_generated_columns = 'stored')",
             if self.publish_via_partition_root {
                 "true"
             } else {
@@ -83,6 +83,7 @@ pub struct PublicationState {
     pub publish_delete: bool,
     pub publish_truncate: bool,
     pub publish_via_partition_root: bool,
+    pub publish_generated_columns_stored: bool,
     pub tables: Vec<QualifiedName>,
 }
 
@@ -90,9 +91,67 @@ pub struct PublicationState {
 pub struct LogicalSlotState {
     pub name: String,
     pub plugin: String,
+    pub database: Option<String>,
+    pub temporary: bool,
     pub active: bool,
     pub confirmed_flush_lsn: Option<String>,
     pub restart_lsn: Option<String>,
+    /// Bytes of WAL retained by this slot, measured from `restart_lsn` to the current WAL head.
+    /// The value is `None` when the slot has no restart position yet.
+    pub retained_wal_bytes: Option<u64>,
+    /// PostgreSQL 18's remaining WAL budget before this slot can be invalidated. It is `None`
+    /// when `max_slot_wal_keep_size` is unlimited or the slot is already lost.
+    pub safe_wal_size: Option<u64>,
+    pub wal_status: Option<String>,
+    pub invalidation_reason: Option<String>,
+    pub two_phase: bool,
+    pub failover: bool,
+    pub synced: bool,
+}
+
+/// Capabilities intentionally exposed by the fork-backed pgoutput transport.
+///
+/// The pinned fork decodes protocol version 1 only. Streaming and two-phase messages are
+/// therefore disabled/rejected rather than silently skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationCapabilities {
+    pub proto_version: u8,
+    pub messages: bool,
+    pub streaming: bool,
+    pub two_phase: bool,
+}
+
+impl Default for ReplicationCapabilities {
+    fn default() -> Self {
+        Self {
+            proto_version: 1,
+            messages: true,
+            streaming: false,
+            two_phase: false,
+        }
+    }
+}
+
+impl ReplicationCapabilities {
+    pub fn validate(self) -> SourceResult<()> {
+        if self.proto_version != 1 {
+            return Err(SourceError::unsupported(format!(
+                "pgoutput protocol version {} is not supported by the pinned decoder",
+                self.proto_version
+            )));
+        }
+        if !self.messages {
+            return Err(SourceError::contract(
+                "pgoutput messages must be enabled for transactional DDL notices",
+            ));
+        }
+        if self.streaming || self.two_phase {
+            return Err(SourceError::unsupported(
+                "streaming/two-phase logical replication is unavailable; pause and rebuild instead",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Create or reconcile one explicit publication. Existing unmanaged publications are rejected.
@@ -133,17 +192,65 @@ pub async fn ensure_publication(
                 spec.name, state.publish_via_partition_root, spec.publish_via_partition_root
             )));
         }
-        // Reconcile table membership explicitly. This also removes stale tables after a config
-        // change, while never widening scope implicitly.
-        client.batch_execute(&spec.alter_tables_sql()?).await?;
+        if !state.publish_generated_columns_stored {
+            execute_internal_ddl(
+                client,
+                &format!(
+                    "ALTER PUBLICATION {} SET (publish_generated_columns = 'stored')",
+                    quote_identifier(&spec.name)?
+                ),
+            )
+            .await?;
+        }
+        // Avoid producing catalog WAL and DDL-capture noise on every reconnect. Reconcile only
+        // when membership actually changed; this still removes stale tables explicitly.
+        if !membership_matches(&state.tables, &spec.tables) {
+            execute_internal_ddl(client, &spec.alter_tables_sql()?).await?;
+        }
     } else {
-        client.batch_execute(&spec.create_sql()?).await?;
+        execute_internal_ddl(client, &spec.create_sql()?).await?;
     }
     let state = inspect_publication(client, &spec.name)
         .await?
         .ok_or_else(|| SourceError::contract("publication disappeared after creation"))?;
-    validate_membership(&state, spec)?;
+    validate_publication_state(&state, spec, expected_owner)?;
     Ok(state)
+}
+
+/// Validate the managed publication without changing it. This is used while resuming from an
+/// existing checkpoint: silently repairing membership there could skip WAL that was omitted while
+/// an external operator had removed a table from the publication.
+pub async fn validate_publication(
+    client: &Client,
+    spec: &PublicationSpec,
+    expected_owner: Option<&str>,
+) -> SourceResult<PublicationState> {
+    let state = inspect_publication(client, &spec.name)
+        .await?
+        .ok_or_else(|| SourceError::contract(format!("publication {} is missing", spec.name)))?;
+    validate_publication_state(&state, spec, expected_owner)?;
+    Ok(state)
+}
+
+async fn execute_internal_ddl(client: &Client, ddl: &str) -> SourceResult<()> {
+    client.batch_execute("BEGIN").await?;
+    let result = async {
+        client
+            .batch_execute("SELECT set_config('pg2cb.internal_ddl', 'on', true)")
+            .await?;
+        client.batch_execute(ddl).await?;
+        Ok::<(), SourceError>(())
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = client.batch_execute("ROLLBACK").await;
+        return Err(error);
+    }
+    if let Err(error) = client.batch_execute("COMMIT").await {
+        let _ = client.batch_execute("ROLLBACK").await;
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 pub async fn inspect_publication(
@@ -155,7 +262,7 @@ pub async fn inspect_publication(
         .query_opt(
             "SELECT p.pubowner::regrole::text,
                     p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate,
-                    p.pubviaroot
+                    p.pubviaroot, p.pubgencols = 's'
                FROM pg_publication p
               WHERE p.pubname = $1
               ",
@@ -192,6 +299,7 @@ pub async fn inspect_publication(
         publish_delete: row.try_get(4)?,
         publish_truncate: row.try_get(5)?,
         publish_via_partition_root: row.try_get(6)?,
+        publish_generated_columns_stored: row.try_get(7)?,
         tables,
     }))
 }
@@ -231,7 +339,12 @@ pub async fn inspect_logical_slot(
     validate_name(slot_name)?;
     let row = client
         .query_opt(
-            "SELECT slot_name, plugin, active, confirmed_flush_lsn::text, restart_lsn::text
+            "SELECT slot_name, plugin, database, temporary, active,
+                    confirmed_flush_lsn::text, restart_lsn::text,
+                    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::text,
+                    safe_wal_size::text,
+                    wal_status::text, invalidation_reason::text,
+                    two_phase, failover, synced
                FROM pg_replication_slots
               WHERE slot_name = $1 AND slot_type = 'logical'",
             &[&slot_name],
@@ -241,12 +354,33 @@ pub async fn inspect_logical_slot(
         Ok(LogicalSlotState {
             name: row.try_get(0)?,
             plugin: row.try_get(1)?,
-            active: row.try_get(2)?,
-            confirmed_flush_lsn: row.try_get(3)?,
-            restart_lsn: row.try_get(4)?,
+            database: row.try_get(2)?,
+            temporary: row.try_get(3)?,
+            active: row.try_get(4)?,
+            confirmed_flush_lsn: row.try_get(5)?,
+            restart_lsn: row.try_get(6)?,
+            retained_wal_bytes: parse_optional_nonnegative_u64(row.try_get(7)?, "retained WAL")?,
+            safe_wal_size: parse_optional_nonnegative_u64(row.try_get(8)?, "safe WAL size")?,
+            wal_status: row.try_get(9)?,
+            invalidation_reason: row.try_get(10)?,
+            two_phase: row.try_get(11)?,
+            failover: row.try_get(12)?,
+            synced: row.try_get(13)?,
         })
     })
     .transpose()
+}
+
+fn parse_optional_nonnegative_u64(value: Option<String>, label: &str) -> SourceResult<Option<u64>> {
+    value
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                SourceError::contract(format!(
+                    "{label} value `{value}` is not a non-negative integer"
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// Build a replication command for the fork transport. The option values are quoted literals;
@@ -256,36 +390,94 @@ pub fn start_replication_sql(
     start_lsn: &str,
     publication_name: &str,
 ) -> SourceResult<String> {
+    start_replication_sql_with_capabilities(
+        slot_name,
+        start_lsn,
+        publication_name,
+        ReplicationCapabilities::default(),
+    )
+}
+
+pub fn start_replication_sql_with_capabilities(
+    slot_name: &str,
+    start_lsn: &str,
+    publication_name: &str,
+    capabilities: ReplicationCapabilities,
+) -> SourceResult<String> {
     validate_name(slot_name)?;
     validate_name(publication_name)?;
     validate_lsn(start_lsn)?;
+    capabilities.validate()?;
     Ok(format!(
-        "START_REPLICATION SLOT {} LOGICAL {} (\"proto_version\" {}, \"publication_names\" {})",
+        "START_REPLICATION SLOT {} LOGICAL {} (\"proto_version\" {}, \"publication_names\" {}, \"messages\" {})",
         quote_identifier(slot_name)?,
         start_lsn,
-        quote_literal("1")?,
-        quote_literal(publication_name)?
+        quote_literal(&capabilities.proto_version.to_string())?,
+        quote_literal(publication_name)?,
+        quote_literal(if capabilities.messages {
+            "true"
+        } else {
+            "false"
+        })?
     ))
 }
 
-fn validate_membership(state: &PublicationState, spec: &PublicationSpec) -> SourceResult<()> {
+fn validate_publication_state(
+    state: &PublicationState,
+    spec: &PublicationSpec,
+    expected_owner: Option<&str>,
+) -> SourceResult<()> {
     if state.all_tables {
         return Err(SourceError::contract(format!(
             "publication {} unexpectedly includes all tables",
             spec.name
         )));
     }
-    let mut expected = spec.tables.clone();
-    let mut actual = state.tables.clone();
-    expected.sort_by_key(ToString::to_string);
-    actual.sort_by_key(ToString::to_string);
-    if expected != actual {
+    if let Some(owner) = expected_owner
+        && state.owner != owner
+    {
+        return Err(SourceError::contract(format!(
+            "publication {} is owned by {}, expected {owner}",
+            spec.name, state.owner
+        )));
+    }
+    if !(state.publish_insert
+        && state.publish_update
+        && state.publish_delete
+        && state.publish_truncate)
+    {
+        return Err(SourceError::contract(format!(
+            "publication {} does not publish the required row operations",
+            spec.name
+        )));
+    }
+    if state.publish_via_partition_root != spec.publish_via_partition_root {
+        return Err(SourceError::contract(format!(
+            "publication {} has publish_via_partition_root={}, expected {}",
+            spec.name, state.publish_via_partition_root, spec.publish_via_partition_root
+        )));
+    }
+    if !state.publish_generated_columns_stored {
+        return Err(SourceError::contract(format!(
+            "publication {} does not publish stored generated columns",
+            spec.name
+        )));
+    }
+    if !membership_matches(&state.tables, &spec.tables) {
         return Err(SourceError::contract(format!(
             "publication {} table allow-list differs from configuration",
             spec.name
         )));
     }
     Ok(())
+}
+
+fn membership_matches(actual: &[QualifiedName], expected: &[QualifiedName]) -> bool {
+    let mut actual = actual.to_vec();
+    let mut expected = expected.to_vec();
+    actual.sort_by_key(ToString::to_string);
+    expected.sort_by_key(ToString::to_string);
+    actual == expected
 }
 
 fn validate_name(name: &str) -> SourceResult<()> {
@@ -323,6 +515,33 @@ mod tests {
         assert!(!sql.contains("FOR ALL TABLES"));
         assert!(sql.contains("\"pub\"\"x\""));
         assert!(sql.contains("\"t\"\"x\""));
+        assert!(sql.contains("publish_generated_columns = 'stored'"));
+    }
+
+    #[test]
+    fn publication_state_validation_is_fail_closed() {
+        let spec = PublicationSpec::new("managed", vec![table("public", "items")]).unwrap();
+        let mut state = PublicationState {
+            owner: "etl".to_owned(),
+            all_tables: false,
+            publish_insert: true,
+            publish_update: true,
+            publish_delete: true,
+            publish_truncate: true,
+            publish_via_partition_root: false,
+            publish_generated_columns_stored: true,
+            tables: spec.tables.clone(),
+        };
+        validate_publication_state(&state, &spec, Some("etl")).unwrap();
+
+        state.publish_generated_columns_stored = false;
+        assert!(validate_publication_state(&state, &spec, Some("etl")).is_err());
+        state.publish_generated_columns_stored = true;
+        state.publish_delete = false;
+        assert!(validate_publication_state(&state, &spec, Some("etl")).is_err());
+        state.publish_delete = true;
+        state.owner = "other".to_owned();
+        assert!(validate_publication_state(&state, &spec, Some("etl")).is_err());
     }
 
     #[test]
@@ -330,5 +549,37 @@ mod tests {
         assert!(start_replication_sql("slot", "0/0;DROP", "pub").is_err());
         let sql = start_replication_sql("slot", "0/0", "pub'name").unwrap();
         assert!(sql.contains("'pub''name'"));
+        assert!(sql.contains("\"messages\" 'true'"));
+        assert!(
+            start_replication_sql_with_capabilities(
+                "slot",
+                "0/0",
+                "pub",
+                ReplicationCapabilities {
+                    streaming: true,
+                    ..ReplicationCapabilities::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            ReplicationCapabilities {
+                proto_version: 2,
+                ..ReplicationCapabilities::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_slot_wal_sizes_without_signed_truncation() {
+        assert_eq!(
+            parse_optional_nonnegative_u64(Some(u64::MAX.to_string()), "size").unwrap(),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_optional_nonnegative_u64(None, "size").unwrap(), None);
+        assert!(parse_optional_nonnegative_u64(Some("-1".to_owned()), "size").is_err());
+        assert!(parse_optional_nonnegative_u64(Some("1.5".to_owned()), "size").is_err());
     }
 }

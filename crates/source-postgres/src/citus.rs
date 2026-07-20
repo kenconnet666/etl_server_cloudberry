@@ -58,7 +58,7 @@ impl Default for CitusOptions {
 #[derive(Debug, Clone)]
 struct DistributionDescriptor {
     method: char,
-    part_key: String,
+    part_key: Option<String>,
     replication_model: Option<String>,
 }
 
@@ -85,14 +85,12 @@ pub async fn discover(
         )));
     }
 
-    let has_node_catalog = client
-        .query_one(
-            "SELECT to_regclass('pg_catalog.pg_dist_node') IS NOT NULL",
-            &[],
-        )
+    // Workers also expose pg_dist_node, so catalog presence cannot distinguish their role.
+    let is_coordinator = client
+        .query_one("SELECT pg_catalog.citus_is_coordinator()", &[])
         .await?
         .try_get::<_, bool>(0)?;
-    let role = if has_node_catalog {
+    let role = if is_coordinator {
         CitusRole::Coordinator
     } else {
         CitusRole::Worker
@@ -144,7 +142,8 @@ pub async fn load_nodes(client: &Client) -> SourceResult<Vec<CitusNode>> {
                     noderole::text, isactive
                FROM pg_dist_node
               WHERE isactive
-              ORDER BY nodeid",
+                AND noderole = 'primary'
+              ORDER BY groupid, nodeid",
             &[],
         )
         .await?;
@@ -214,9 +213,18 @@ pub async fn apply_table_metadata_with_options(
         let Some(descriptor) = descriptors.get(&table.relation_id) else {
             continue;
         };
-        let key = parse_distribution_key(&descriptor.part_key)?;
+        let key = match descriptor.part_key.as_deref() {
+            Some(value) => parse_distribution_key(value)?,
+            None => Vec::new(),
+        };
         match descriptor.method {
             'h' => {
+                if key.is_empty() {
+                    return Err(SourceError::unsupported(format!(
+                        "Citus hash-distributed table {} has no distribution key",
+                        table.name
+                    )));
+                }
                 table.kind = TableKind::CitusDistributed;
                 table.distribution_key = key;
             }
@@ -323,7 +331,7 @@ mod tests {
     fn parses_plain_distribution_var_nodes() {
         assert_eq!(
             parse_distribution_key("{VAR :varattno 2} {VAR :varattno 1}").unwrap(),
-            vec![1, 2]
+            vec![2, 1]
         );
     }
 

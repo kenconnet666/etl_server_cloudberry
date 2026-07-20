@@ -54,7 +54,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Apache Cloudberry</p><h2>Targets</h2></div>
     <div class="page-actions">
-      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh targets" aria-label="Refresh targets"><RefreshCw class:spin={loading} size={18} /></button>
+      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh targets" aria-label="Refresh targets"><RefreshCw class={loading ? 'spin' : undefined} size={18} /></button>
       <button class="button primary" type="button" onclick={() => (dialogOpen = true)}><Plus size={16} /> Add target</button>
     </div>
   </div>

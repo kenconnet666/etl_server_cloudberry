@@ -67,6 +67,8 @@ pub struct DdlMessage {
     pub version: u16,
     pub command_tag: String,
     pub relation_ids: Vec<u32>,
+    #[serde(default)]
+    pub affected_schemas: Vec<String>,
     pub schema_fingerprint: String,
 }
 

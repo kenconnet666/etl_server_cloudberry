@@ -24,6 +24,8 @@ pub enum ConfigError {
 pub struct BootstrapConfig {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub engine: EngineConfig,
     pub admin: AdminConfig,
     pub control: ControlConfig,
     pub security: SecurityConfig,
@@ -61,6 +63,8 @@ impl BootstrapConfig {
         }
         validate_environment_name(&self.control.database_url_env)?;
         validate_environment_name(&self.security.master_key_env)?;
+        self.server.validate()?;
+        self.engine.validate()?;
         Ok(())
     }
 
@@ -90,6 +94,78 @@ impl Default for ServerConfig {
             secure_cookies: true,
             session_ttl_seconds: 8 * 60 * 60,
         }
+    }
+}
+
+impl ServerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.session_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "server.session_ttl_seconds must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineConfig {
+    pub reconcile_interval_seconds: u64,
+    pub lease_ttl_seconds: u64,
+    pub lease_renew_interval_seconds: u64,
+    pub restart_backoff_initial_seconds: u64,
+    pub restart_backoff_max_seconds: u64,
+    pub restart_backoff_reset_seconds: u64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            reconcile_interval_seconds: 2,
+            lease_ttl_seconds: 30,
+            lease_renew_interval_seconds: 10,
+            restart_backoff_initial_seconds: 1,
+            restart_backoff_max_seconds: 60,
+            restart_backoff_reset_seconds: 300,
+        }
+    }
+}
+
+impl EngineConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.reconcile_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "engine.reconcile_interval_seconds must be greater than zero".into(),
+            ));
+        }
+        if self.lease_ttl_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "engine.lease_ttl_seconds must be greater than zero".into(),
+            ));
+        }
+        if self.lease_renew_interval_seconds == 0
+            || self.lease_renew_interval_seconds >= self.lease_ttl_seconds
+        {
+            return Err(ConfigError::Invalid(
+                "engine.lease_renew_interval_seconds must be greater than zero and shorter than engine.lease_ttl_seconds"
+                    .into(),
+            ));
+        }
+        if self.restart_backoff_initial_seconds == 0
+            || self.restart_backoff_initial_seconds > self.restart_backoff_max_seconds
+        {
+            return Err(ConfigError::Invalid(
+                "engine restart backoff must be positive and initial must not exceed maximum"
+                    .into(),
+            ));
+        }
+        if self.restart_backoff_reset_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "engine.restart_backoff_reset_seconds must be greater than zero".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -144,6 +220,14 @@ mod tests {
         secure_cookies = false
         session_ttl_seconds = 3600
 
+        [engine]
+        reconcile_interval_seconds = 2
+        lease_ttl_seconds = 30
+        lease_renew_interval_seconds = 10
+        restart_backoff_initial_seconds = 1
+        restart_backoff_max_seconds = 60
+        restart_backoff_reset_seconds = 300
+
         [admin]
         username = "admin"
         password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
@@ -172,6 +256,21 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         let config = CONFIG.replace("secure_cookies = false", "unknown = true");
+        assert!(BootstrapConfig::from_toml(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_lease_renewal_at_or_after_expiry() {
+        let config = CONFIG.replace(
+            "lease_renew_interval_seconds = 10",
+            "lease_renew_interval_seconds = 30",
+        );
+        assert!(BootstrapConfig::from_toml(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_session_ttl() {
+        let config = CONFIG.replace("session_ttl_seconds = 3600", "session_ttl_seconds = 0");
         assert!(BootstrapConfig::from_toml(&config).is_err());
     }
 }

@@ -39,9 +39,19 @@ pub enum SchemaError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTypeDefinition {
+    /// Ordered labels of a PostgreSQL enum.  Keeping the labels structured lets the target
+    /// reconciler apply safe `ADD VALUE`/`RENAME VALUE` changes without parsing SQL text.
+    Enum { labels: Vec<String> },
+    /// The already-rendered base type of a constraint-free domain.
+    Domain { base_sql: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTypePlan {
     pub name: QualifiedName,
     pub create_sql: String,
+    pub definition: UserTypeDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +266,7 @@ fn plan_type_inner(
                 return Err(unsupported_type(data_type, "enum has duplicate labels"));
             }
             let target_name = QualifiedName::new(target_type_schema, &data_type.name.name)?;
-            let labels = labels
+            let rendered_labels = labels
                 .iter()
                 .map(|label| quote_literal(label))
                 .collect::<Result<Vec<_>, _>>()?
@@ -264,9 +274,12 @@ fn plan_type_inner(
             prerequisites.push(UserTypePlan {
                 name: target_name.clone(),
                 create_sql: format!(
-                    "CREATE TYPE {} AS ENUM ({labels})",
+                    "CREATE TYPE {} AS ENUM ({rendered_labels})",
                     quote_qualified_name(&target_name)?
                 ),
+                definition: UserTypeDefinition::Enum {
+                    labels: labels.clone(),
+                },
             });
             quote_qualified_name(&target_name)?
         }
@@ -285,6 +298,7 @@ fn plan_type_inner(
                     "CREATE DOMAIN {} AS {base_sql}",
                     quote_qualified_name(&target_name)?
                 ),
+                definition: UserTypeDefinition::Domain { base_sql },
             });
             quote_qualified_name(&target_name)?
         }
@@ -511,6 +525,12 @@ mod tests {
         assert_eq!(
             plan.prerequisites[0].create_sql,
             r#"CREATE TYPE "tenant"."order_status" AS ENUM (E'new', E'customer''s')"#
+        );
+        assert_eq!(
+            plan.prerequisites[0].definition,
+            UserTypeDefinition::Enum {
+                labels: vec!["new".into(), "customer's".into()]
+            }
         );
     }
 

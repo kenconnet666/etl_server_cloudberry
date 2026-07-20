@@ -54,7 +54,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">PostgreSQL 18</p><h2>Sources</h2></div>
     <div class="page-actions">
-      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh sources" aria-label="Refresh sources"><RefreshCw class:spin={loading} size={18} /></button>
+      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh sources" aria-label="Refresh sources"><RefreshCw class={loading ? 'spin' : undefined} size={18} /></button>
       <button class="button primary" type="button" onclick={() => (dialogOpen = true)}><Plus size={16} /> Add source</button>
     </div>
   </div>

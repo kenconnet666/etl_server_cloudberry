@@ -34,6 +34,8 @@ const CSRF_COOKIE: &str = "csrf_token";
 const CSRF_HEADER: &str = "x-csrf-token";
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: usize = 5;
+const MAX_FAILURE_ADDRESSES: usize = 10_000;
+const MAX_SESSIONS: usize = 10_000;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -104,21 +106,23 @@ impl AuthState {
     async fn is_rate_limited(&self, address: IpAddr) -> bool {
         let now = Instant::now();
         let mut failures = self.inner.failures.lock().await;
+        failures.retain(|_, attempts| {
+            attempts.retain(|instant| now.duration_since(*instant) <= LOGIN_WINDOW);
+            !attempts.is_empty()
+        });
         let attempts = failures.entry(address).or_default();
-        while attempts
-            .front()
-            .is_some_and(|instant| now.duration_since(*instant) > LOGIN_WINDOW)
-        {
-            attempts.pop_front();
-        }
         attempts.len() >= MAX_LOGIN_FAILURES
     }
 
     async fn register_failure(&self, address: IpAddr) {
-        self.inner
-            .failures
-            .lock()
-            .await
+        let mut failures = self.inner.failures.lock().await;
+        if failures.len() >= MAX_FAILURE_ADDRESSES
+            && !failures.contains_key(&address)
+            && let Some(oldest) = failures.keys().next().copied()
+        {
+            failures.remove(&oldest);
+        }
+        failures
             .entry(address)
             .or_default()
             .push_back(Instant::now());
@@ -155,11 +159,15 @@ impl AuthState {
             csrf_token: random_token(),
             expires_at: Instant::now() + self.inner.session_ttl,
         };
-        self.inner
-            .sessions
-            .lock()
-            .await
-            .insert(hash_token(&token), session.clone());
+        let now = Instant::now();
+        let mut sessions = self.inner.sessions.lock().await;
+        sessions.retain(|_, existing| existing.expires_at > now);
+        if sessions.len() >= MAX_SESSIONS
+            && let Some(oldest) = sessions.keys().next().copied()
+        {
+            sessions.remove(&oldest);
+        }
+        sessions.insert(hash_token(&token), session.clone());
         (token, session)
     }
 

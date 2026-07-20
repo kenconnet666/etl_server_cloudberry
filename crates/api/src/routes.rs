@@ -1,10 +1,13 @@
 //! Management API routes.
 
+use std::{collections::HashMap, fmt::Display};
+
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware,
+    response::IntoResponse,
     routing::{get, post},
 };
 use chrono::Utc;
@@ -14,18 +17,20 @@ use cloudberry_etl_core::{
     pipeline::SourceTopology,
 };
 use cloudberry_etl_metadata::{
+    crypto::{source_credential_aad, target_credential_aad},
     model::{PipelineDefinition, SourceProfile, TargetProfile},
     store::StoreError,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     auth::{AuthState, current_session, login, logout, require_session},
     error::ApiError,
     state::{AppState, ConnectionReport},
 };
+use cloudberry_etl_engine::telemetry::PipelineRuntimeSnapshot;
 
 pub fn router(state: AppState, auth: AuthState) -> Router {
     let auth_middleware = middleware::from_fn_with_state(auth.clone(), require_session);
@@ -34,6 +39,10 @@ pub fn router(state: AppState, auth: AuthState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route_layer(auth_middleware.clone())
         .with_state(auth.clone());
+    let operational = Router::new()
+        .route("/health/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .with_state(state.clone());
     let authenticated_api = Router::new()
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/operations", get(operations))
@@ -56,12 +65,197 @@ pub fn router(state: AppState, auth: AuthState) -> Router {
         .route("/health/live", get(live))
         .route("/api/v1/auth/login", post(login))
         .with_state(auth)
+        .merge(operational)
         .merge(authenticated_auth)
         .merge(authenticated_api)
 }
 
 async fn live() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn ready(State(state): State<AppState>) -> StatusCode {
+    match state.control.list_pipelines().await {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(error) => {
+            tracing::warn!(%error, "readiness check could not reach the control database");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let (sources, targets, pipelines) = tokio::try_join!(
+        state.control.list_sources(),
+        state.control.list_targets(),
+        state.control.list_pipelines()
+    )
+    .map_err(store_error)?;
+    let desired_running = pipelines
+        .iter()
+        .filter(|pipeline| pipeline.desired_running)
+        .count();
+    let running = state.supervisor.running().await.len();
+    let snapshots: HashMap<_, _> = state
+        .supervisor
+        .runtime_snapshots()
+        .await
+        .into_iter()
+        .map(|snapshot| (snapshot.pipeline_id, snapshot))
+        .collect();
+    let mut body = format!(
+        "# HELP pg2cb_sources_configured Configured PostgreSQL source profiles.\n\
+         # TYPE pg2cb_sources_configured gauge\n\
+         pg2cb_sources_configured {}\n\
+         # HELP pg2cb_targets_configured Configured Cloudberry target profiles.\n\
+         # TYPE pg2cb_targets_configured gauge\n\
+         pg2cb_targets_configured {}\n\
+         # HELP pg2cb_pipelines_configured Configured replication pipelines.\n\
+         # TYPE pg2cb_pipelines_configured gauge\n\
+         pg2cb_pipelines_configured {}\n\
+         # HELP pg2cb_pipelines_desired_running Pipelines whose desired state is running.\n\
+         # TYPE pg2cb_pipelines_desired_running gauge\n\
+         pg2cb_pipelines_desired_running {}\n\
+         # HELP pg2cb_pipelines_running Pipeline jobs currently owned by this process.\n\
+         # TYPE pg2cb_pipelines_running gauge\n\
+         pg2cb_pipelines_running {}\n",
+        sources.len(),
+        targets.len(),
+        pipelines.len(),
+        desired_running,
+        running,
+    );
+    body.push_str(
+        "# HELP pg2cb_pipeline_runtime_state Current runtime state.\n\
+         # TYPE pg2cb_pipeline_runtime_state gauge\n\
+         # HELP pg2cb_pipeline_phase Current replication phase.\n\
+         # TYPE pg2cb_pipeline_phase gauge\n\
+         # HELP pg2cb_pipeline_source_received_lsn Source WAL position observed on the wire.\n\
+         # TYPE pg2cb_pipeline_source_received_lsn gauge\n\
+         # HELP pg2cb_pipeline_source_current_lsn Latest committed source WAL position.\n\
+         # TYPE pg2cb_pipeline_source_current_lsn gauge\n\
+         # HELP pg2cb_pipeline_target_checkpoint_lsn Target-durable checkpoint WAL position.\n\
+         # TYPE pg2cb_pipeline_target_checkpoint_lsn gauge\n\
+         # HELP pg2cb_pipeline_estimated_byte_lag Estimated WAL byte distance.\n\
+         # TYPE pg2cb_pipeline_estimated_byte_lag gauge\n\
+         # HELP pg2cb_pipeline_slot_retained_wal_bytes WAL bytes retained by the source logical slot.\n\
+         # TYPE pg2cb_pipeline_slot_retained_wal_bytes gauge\n\
+         # HELP pg2cb_pipeline_slot_safe_wal_bytes WAL bytes remaining before PostgreSQL may invalidate the slot.\n\
+         # TYPE pg2cb_pipeline_slot_safe_wal_bytes gauge\n\
+         # HELP pg2cb_pipeline_wal_retention_warning Whether source WAL retention crossed a warning threshold.\n\
+         # TYPE pg2cb_pipeline_wal_retention_warning gauge\n\
+         # HELP pg2cb_pipeline_last_transaction_timestamp_seconds Last source transaction time.\n\
+         # TYPE pg2cb_pipeline_last_transaction_timestamp_seconds gauge\n\
+         # HELP pg2cb_pipeline_last_apply_timestamp_seconds Last target apply time.\n\
+         # TYPE pg2cb_pipeline_last_apply_timestamp_seconds gauge\n\
+         # HELP pg2cb_pipeline_last_ack_timestamp_seconds Last source acknowledgement time.\n\
+         # TYPE pg2cb_pipeline_last_ack_timestamp_seconds gauge\n\
+         # HELP pg2cb_pipeline_restart_total Number of restarts after the first start.\n\
+         # TYPE pg2cb_pipeline_restart_total counter\n\
+         # HELP pg2cb_pipeline_last_error_info Whether a runtime error is present.\n\
+         # TYPE pg2cb_pipeline_last_error_info gauge\n",
+    );
+    for pipeline in &pipelines {
+        let Some(snapshot) = snapshots.get(&pipeline.id) else {
+            continue;
+        };
+        let pipeline_id = escape_prometheus_label(&pipeline.id.to_string());
+        body.push_str(&format!(
+            "pg2cb_pipeline_runtime_state{{pipeline_id=\"{pipeline_id}\",state=\"{}\"}} 1\n\
+             pg2cb_pipeline_phase{{pipeline_id=\"{pipeline_id}\",phase=\"{}\"}} 1\n",
+            snapshot.state.as_str(),
+            snapshot.phase_name(),
+        ));
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_source_received_lsn",
+            &pipeline_id,
+            snapshot.source_received_lsn.map(|lsn| lsn.as_u64()),
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_source_current_lsn",
+            &pipeline_id,
+            snapshot.source_current_lsn.map(|lsn| lsn.as_u64()),
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_target_checkpoint_lsn",
+            &pipeline_id,
+            snapshot.target_checkpoint_lsn.map(|lsn| lsn.as_u64()),
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_estimated_byte_lag",
+            &pipeline_id,
+            snapshot.estimated_byte_lag,
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_slot_retained_wal_bytes",
+            &pipeline_id,
+            snapshot.slot_retained_wal_bytes,
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_slot_safe_wal_bytes",
+            &pipeline_id,
+            snapshot.slot_safe_wal_bytes,
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_last_transaction_timestamp_seconds",
+            &pipeline_id,
+            snapshot
+                .last_transaction_at
+                .map(|timestamp| timestamp.timestamp()),
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_last_apply_timestamp_seconds",
+            &pipeline_id,
+            snapshot
+                .last_apply_at
+                .map(|timestamp| timestamp.timestamp()),
+        );
+        append_optional_metric(
+            &mut body,
+            "pg2cb_pipeline_last_ack_timestamp_seconds",
+            &pipeline_id,
+            snapshot.last_ack_at.map(|timestamp| timestamp.timestamp()),
+        );
+        body.push_str(&format!(
+            "pg2cb_pipeline_restart_total{{pipeline_id=\"{pipeline_id}\"}} {}\n\
+             pg2cb_pipeline_last_error_info{{pipeline_id=\"{pipeline_id}\"}} {}\n\
+             pg2cb_pipeline_wal_retention_warning{{pipeline_id=\"{pipeline_id}\"}} {}\n",
+            snapshot.restart_count,
+            u8::from(snapshot.last_error.is_some()),
+            u8::from(snapshot.wal_retention_warning),
+        ));
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    Ok((headers, body))
+}
+
+fn append_optional_metric<T: Display>(
+    body: &mut String,
+    name: &str,
+    pipeline_id: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        body.push_str(&format!(
+            "{name}{{pipeline_id=\"{pipeline_id}\"}} {value}\n"
+        ));
+    }
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[derive(Debug, Serialize)]
@@ -95,23 +289,62 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
 #[derive(Debug, Serialize)]
 struct OperationView {
     id: String,
-    operation_type: &'static str,
-    state: &'static str,
+    pipeline_id: Option<PipelineId>,
+    operation_type: String,
+    state: String,
+    detail: Value,
+    runtime: Option<PipelineRuntimeSnapshot>,
+    created_at: Option<chrono::DateTime<Utc>>,
+    updated_at: Option<chrono::DateTime<Utc>>,
 }
 
-async fn operations(State(state): State<AppState>) -> Json<ListResponse<OperationView>> {
-    let items = state
-        .supervisor
-        .running()
+async fn operations(
+    State(state): State<AppState>,
+) -> Result<Json<ListResponse<OperationView>>, ApiError> {
+    let mut items = state
+        .control
+        .list_operations()
         .await
+        .map_err(store_error)?
         .into_iter()
-        .map(|id| OperationView {
-            id: id.to_string(),
-            operation_type: "replication",
-            state: "running",
+        .map(|operation| OperationView {
+            id: operation.id.to_string(),
+            pipeline_id: operation.pipeline_id,
+            operation_type: operation.operation_type,
+            state: operation.state,
+            detail: operation.detail,
+            runtime: None,
+            created_at: Some(operation.created_at),
+            updated_at: Some(operation.updated_at),
         })
-        .collect();
-    Json(ListResponse { items })
+        .collect::<Vec<_>>();
+    items.extend(
+        state
+            .supervisor
+            .runtime_snapshots()
+            .await
+            .into_iter()
+            .map(|snapshot| {
+                let updated_at = snapshot
+                    .last_ack_at
+                    .or(snapshot.last_apply_at)
+                    .or(snapshot.last_transaction_at)
+                    .or(snapshot.stopped_at)
+                    .or(snapshot.started_at);
+                OperationView {
+                    id: format!("runtime:{}", snapshot.pipeline_id),
+                    pipeline_id: Some(snapshot.pipeline_id),
+                    operation_type: "replication".to_owned(),
+                    state: snapshot.state.as_str().to_owned(),
+                    detail: serde_json::to_value(&snapshot)
+                        .unwrap_or_else(|_| Value::Object(Default::default())),
+                    runtime: Some(snapshot),
+                    created_at: None,
+                    updated_at,
+                }
+            }),
+    );
+    Ok(Json(ListResponse { items }))
 }
 
 #[derive(Deserialize)]
@@ -186,11 +419,7 @@ async fn create_source(
         topology: request.topology,
         encrypted_dsn: state
             .master_key
-            .encrypt(
-                &request.dsn,
-                associated_data("source", id.to_string()).as_bytes(),
-                1,
-            )
+            .encrypt(&request.dsn, source_credential_aad(id).as_bytes(), 1)
             .map_err(|error| {
                 tracing::error!(error = %error, "failed to encrypt source credential");
                 ApiError::internal()
@@ -271,11 +500,7 @@ async fn create_target(
         database_name: request.database_name,
         encrypted_dsn: state
             .master_key
-            .encrypt(
-                &request.dsn,
-                associated_data("target", id.to_string()).as_bytes(),
-                1,
-            )
+            .encrypt(&request.dsn, target_credential_aad(id).as_bytes(), 1)
             .map_err(|error| {
                 tracing::error!(error = %error, "failed to encrypt target credential");
                 ApiError::internal()
@@ -339,13 +564,23 @@ struct PipelineView {
     target_id: TargetId,
     desired_running: bool,
     config_revision: i64,
+    snapshot_generation: i64,
     settings: Value,
-    runtime_state: &'static str,
+    runtime_state: String,
+    runtime: Option<PipelineRuntimeSnapshot>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
 
-fn pipeline_view(pipeline: PipelineDefinition, running: bool) -> PipelineView {
+fn pipeline_view(
+    pipeline: PipelineDefinition,
+    running: bool,
+    runtime: Option<PipelineRuntimeSnapshot>,
+) -> PipelineView {
+    let runtime_state = runtime.as_ref().map_or_else(
+        || if running { "running" } else { "stopped" }.to_owned(),
+        |snapshot| snapshot.state.as_str().to_owned(),
+    );
     PipelineView {
         id: pipeline.id,
         name: pipeline.name,
@@ -353,8 +588,10 @@ fn pipeline_view(pipeline: PipelineDefinition, running: bool) -> PipelineView {
         target_id: pipeline.target_id,
         desired_running: pipeline.desired_running,
         config_revision: pipeline.config_revision,
+        snapshot_generation: pipeline.snapshot_generation,
         settings: pipeline.settings,
-        runtime_state: if running { "running" } else { "stopped" },
+        runtime_state,
+        runtime,
         created_at: pipeline.created_at,
         updated_at: pipeline.updated_at,
     }
@@ -364,6 +601,13 @@ async fn list_pipelines(
     State(state): State<AppState>,
 ) -> Result<Json<ListResponse<PipelineView>>, ApiError> {
     let running = state.supervisor.running().await;
+    let snapshots: HashMap<_, _> = state
+        .supervisor
+        .runtime_snapshots()
+        .await
+        .into_iter()
+        .map(|snapshot| (snapshot.pipeline_id, snapshot))
+        .collect();
     let items = state
         .control
         .list_pipelines()
@@ -371,8 +615,9 @@ async fn list_pipelines(
         .map_err(store_error)?
         .into_iter()
         .map(|pipeline| {
-            let is_running = running.contains(&pipeline.id);
-            pipeline_view(pipeline, is_running)
+            let pipeline_id = pipeline.id;
+            let is_running = running.contains(&pipeline_id);
+            pipeline_view(pipeline, is_running, snapshots.get(&pipeline_id).cloned())
         })
         .collect();
     Ok(Json(ListResponse { items }))
@@ -400,6 +645,7 @@ async fn create_pipeline(
         target_id: request.target_id,
         desired_running: false,
         config_revision: 1,
+        snapshot_generation: 1,
         settings: request.settings,
         created_at: now,
         updated_at: now,
@@ -409,7 +655,10 @@ async fn create_pipeline(
         .put_pipeline(&pipeline)
         .await
         .map_err(store_error)?;
-    Ok((StatusCode::CREATED, Json(pipeline_view(pipeline, false))))
+    Ok((
+        StatusCode::CREATED,
+        Json(pipeline_view(pipeline, false, None)),
+    ))
 }
 
 async fn get_pipeline(
@@ -418,58 +667,64 @@ async fn get_pipeline(
 ) -> Result<Json<PipelineView>, ApiError> {
     let pipeline = find_pipeline(&state, id).await?;
     let running = state.supervisor.running().await.contains(&id);
-    Ok(Json(pipeline_view(pipeline, running)))
+    let runtime = state.supervisor.runtime_snapshot(id).await;
+    Ok(Json(pipeline_view(pipeline, running, runtime)))
 }
 
 async fn start_pipeline(
     State(state): State<AppState>,
     Path(id): Path<PipelineId>,
 ) -> Result<Json<PipelineView>, ApiError> {
-    update_pipeline_desire(&state, id, PipelineCommand::Start).await
+    set_pipeline_desired_running(&state, id, true).await
 }
 
 async fn pause_pipeline(
     State(state): State<AppState>,
     Path(id): Path<PipelineId>,
 ) -> Result<Json<PipelineView>, ApiError> {
-    update_pipeline_desire(&state, id, PipelineCommand::Pause).await
+    set_pipeline_desired_running(&state, id, false).await
 }
 
 async fn rebuild_pipeline(
     State(state): State<AppState>,
     Path(id): Path<PipelineId>,
-) -> Result<Json<PipelineView>, ApiError> {
-    update_pipeline_desire(&state, id, PipelineCommand::Rebuild).await
+) -> Result<(HeaderMap, Json<PipelineView>), ApiError> {
+    let request = state
+        .control
+        .request_pipeline_rebuild(id)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| ApiError::not_found("pipeline"))?;
+    let running = state.supervisor.running().await.contains(&id);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-operation-id",
+        HeaderValue::from_str(&request.operation_id.to_string()).map_err(|error| {
+            tracing::error!(%error, "failed to encode rebuild operation id");
+            ApiError::internal()
+        })?,
+    );
+    let runtime = state.supervisor.runtime_snapshot(id).await;
+    Ok((
+        headers,
+        Json(pipeline_view(request.pipeline, running, runtime)),
+    ))
 }
 
-enum PipelineCommand {
-    Start,
-    Pause,
-    Rebuild,
-}
-
-async fn update_pipeline_desire(
+async fn set_pipeline_desired_running(
     state: &AppState,
     id: PipelineId,
-    command: PipelineCommand,
+    desired_running: bool,
 ) -> Result<Json<PipelineView>, ApiError> {
-    let mut pipeline = find_pipeline(state, id).await?;
-    match command {
-        PipelineCommand::Start => pipeline.desired_running = true,
-        PipelineCommand::Pause => pipeline.desired_running = false,
-        PipelineCommand::Rebuild => {
-            pipeline.settings["rebuild_requested_at"] = json!(Utc::now());
-        }
-    }
-    pipeline.config_revision += 1;
-    pipeline.updated_at = Utc::now();
-    state
+    let pipeline = state
         .control
-        .put_pipeline(&pipeline)
+        .set_pipeline_desired_running(id, desired_running)
         .await
-        .map_err(store_error)?;
+        .map_err(store_error)?
+        .ok_or_else(|| ApiError::not_found("pipeline"))?;
     let running = state.supervisor.running().await.contains(&id);
-    Ok(Json(pipeline_view(pipeline, running)))
+    let runtime = state.supervisor.runtime_snapshot(id).await;
+    Ok(Json(pipeline_view(pipeline, running, runtime)))
 }
 
 async fn find_pipeline(state: &AppState, id: PipelineId) -> Result<PipelineDefinition, ApiError> {
@@ -504,10 +759,6 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-fn associated_data(kind: &str, id: String) -> String {
-    format!("cloudberry-etl:{kind}:{id}")
-}
-
 fn store_error(error: StoreError) -> ApiError {
     if let StoreError::Database(database) = &error
         && database.as_db_error().is_some_and(|detail| {
@@ -518,4 +769,254 @@ fn store_error(error: StoreError) -> ApiError {
     }
     tracing::error!(error = %error, "control database request failed");
     ApiError::internal()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use cloudberry_etl_core::{id::OperationId, lsn::PgLsn, pipeline::PipelinePhase};
+    use cloudberry_etl_engine::supervisor::PipelineSupervisor;
+    use cloudberry_etl_metadata::{
+        crypto::MasterKey,
+        model::{PipelineLease, RebuildRequest},
+        store::ControlStore,
+    };
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::state::ConnectionTester;
+
+    struct CommandStore {
+        pipeline: Mutex<PipelineDefinition>,
+    }
+
+    #[async_trait]
+    impl ControlStore for CommandStore {
+        async fn put_source(&self, _source: &SourceProfile) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_sources(&self) -> Result<Vec<SourceProfile>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn put_target(&self, _target: &TargetProfile) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_targets(&self) -> Result<Vec<TargetProfile>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn put_pipeline(&self, pipeline: &PipelineDefinition) -> Result<(), StoreError> {
+            *self.pipeline.lock().await = pipeline.clone();
+            Ok(())
+        }
+
+        async fn list_pipelines(&self) -> Result<Vec<PipelineDefinition>, StoreError> {
+            Ok(vec![self.pipeline.lock().await.clone()])
+        }
+
+        async fn set_pipeline_desired_running(
+            &self,
+            pipeline_id: PipelineId,
+            desired_running: bool,
+        ) -> Result<Option<PipelineDefinition>, StoreError> {
+            let mut pipeline = self.pipeline.lock().await;
+            if pipeline.id != pipeline_id {
+                return Ok(None);
+            }
+            pipeline.desired_running = desired_running;
+            pipeline.updated_at = Utc::now();
+            Ok(Some(pipeline.clone()))
+        }
+
+        async fn request_pipeline_rebuild(
+            &self,
+            pipeline_id: PipelineId,
+        ) -> Result<Option<RebuildRequest>, StoreError> {
+            let mut pipeline = self.pipeline.lock().await;
+            if pipeline.id != pipeline_id {
+                return Ok(None);
+            }
+            pipeline.snapshot_generation += 1;
+            pipeline.updated_at = Utc::now();
+            Ok(Some(RebuildRequest {
+                pipeline: pipeline.clone(),
+                operation_id: OperationId::new(),
+            }))
+        }
+
+        async fn complete_pipeline_rebuilds(
+            &self,
+            _pipeline_id: PipelineId,
+            _snapshot_generation: i64,
+        ) -> Result<u64, StoreError> {
+            Ok(0)
+        }
+
+        async fn list_operations(
+            &self,
+        ) -> Result<Vec<cloudberry_etl_metadata::model::OperationRecord>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn try_acquire_lease(
+            &self,
+            _pipeline_id: PipelineId,
+            _holder_id: Uuid,
+            _ttl: Duration,
+        ) -> Result<Option<PipelineLease>, StoreError> {
+            Ok(None)
+        }
+
+        async fn renew_lease(
+            &self,
+            _lease: &PipelineLease,
+            _ttl: Duration,
+        ) -> Result<Option<PipelineLease>, StoreError> {
+            Ok(None)
+        }
+
+        async fn release_lease(&self, _lease: &PipelineLease) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct NoopConnectionTester;
+
+    #[async_trait]
+    impl ConnectionTester for NoopConnectionTester {
+        async fn test_source(&self, _dsn: &SecretString) -> Result<ConnectionReport, String> {
+            unreachable!("connection tests are not part of command route coverage")
+        }
+
+        async fn test_target(&self, _dsn: &SecretString) -> Result<ConnectionReport, String> {
+            unreachable!("connection tests are not part of command route coverage")
+        }
+    }
+
+    fn command_state() -> (AppState, PipelineId) {
+        let now = Utc::now();
+        let pipeline = PipelineDefinition {
+            id: PipelineId::new(),
+            name: "orders".into(),
+            source_id: SourceId::new(),
+            target_id: TargetId::new(),
+            desired_running: false,
+            config_revision: 7,
+            snapshot_generation: 3,
+            settings: serde_json::json!({"batch": {"max_rows": 100}}),
+            created_at: now,
+            updated_at: now,
+        };
+        let id = pipeline.id;
+        let key = MasterKey::from_base64(&SecretString::from(STANDARD.encode([7_u8; 32])))
+            .expect("test key is valid");
+        (
+            AppState {
+                control: Arc::new(CommandStore {
+                    pipeline: Mutex::new(pipeline),
+                }),
+                master_key: Arc::new(key),
+                supervisor: Arc::new(PipelineSupervisor::new()),
+                connection_tester: Arc::new(NoopConnectionTester),
+            },
+            id,
+        )
+    }
+
+    #[tokio::test]
+    async fn start_and_pause_only_change_desired_state() {
+        let (state, id) = command_state();
+
+        let Json(started) = set_pipeline_desired_running(&state, id, true)
+            .await
+            .expect("start succeeds");
+        assert!(started.desired_running);
+        assert_eq!(started.config_revision, 7);
+        assert_eq!(started.snapshot_generation, 3);
+
+        let Json(paused) = set_pipeline_desired_running(&state, id, false)
+            .await
+            .expect("pause succeeds");
+        assert!(!paused.desired_running);
+        assert_eq!(paused.config_revision, 7);
+        assert_eq!(paused.snapshot_generation, 3);
+    }
+
+    #[tokio::test]
+    async fn rebuild_changes_only_snapshot_generation_and_returns_operation_id() {
+        let (state, id) = command_state();
+
+        let (headers, Json(rebuilt)) = rebuild_pipeline(State(state), Path(id))
+            .await
+            .expect("rebuild succeeds");
+        assert_eq!(rebuilt.config_revision, 7);
+        assert_eq!(rebuilt.snapshot_generation, 4);
+        assert!(rebuilt.settings.get("rebuild_requested_at").is_none());
+        let operation_id = headers
+            .get("x-operation-id")
+            .expect("operation header is present")
+            .to_str()
+            .expect("operation header is ASCII");
+        assert!(Uuid::parse_str(operation_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn exposes_runtime_progress_without_leaking_error_text_into_metrics() {
+        let (state, id) = command_state();
+        let telemetry = state.supervisor.telemetry_for(id).await;
+        telemetry.mark_started();
+        telemetry.mark_running();
+        telemetry.set_phase(PipelinePhase::CatchingUp);
+        telemetry.source_received(PgLsn::new(200));
+        telemetry.transaction_received(PgLsn::new(180), Utc::now());
+        telemetry.checkpoint_initialized(PgLsn::new(100));
+        telemetry.applied(PgLsn::new(150));
+        telemetry.acknowledged(PgLsn::new(150));
+        telemetry.error("postgresql://admin:secret@example.invalid/private_table");
+
+        let Json(view) = get_pipeline(State(state.clone()), Path(id))
+            .await
+            .expect("pipeline detail succeeds");
+        let runtime = view.runtime.expect("runtime is included");
+        assert_eq!(runtime.pipeline_id, id);
+        assert_eq!(runtime.estimated_byte_lag, Some(50));
+        assert_eq!(runtime.target_checkpoint_lsn, Some(PgLsn::new(150)));
+
+        let Json(operation_list) = operations(State(state.clone()))
+            .await
+            .expect("operations succeeds");
+        let operation = operation_list
+            .items
+            .into_iter()
+            .find(|operation| operation.id == format!("runtime:{id}"))
+            .expect("runtime operation is included");
+        assert_eq!(operation.state, "running");
+        assert_eq!(
+            operation
+                .runtime
+                .expect("operation includes telemetry")
+                .estimated_byte_lag,
+            Some(50)
+        );
+
+        let response = metrics(State(state))
+            .await
+            .expect("metrics succeeds")
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body can be read");
+        let body = String::from_utf8(body.to_vec()).expect("metrics are UTF-8");
+        assert!(body.contains("pg2cb_pipeline_estimated_byte_lag"));
+        assert!(body.contains(&format!("pipeline_id=\"{id}\"")));
+        assert!(!body.contains("secret"));
+        assert!(!body.contains("private_table"));
+    }
 }

@@ -44,12 +44,12 @@ INSERT INTO pg2cb_meta.node_checkpoints (
     pipeline_id, topology_generation, node_id, system_identifier,
     timeline, slot_name, applied_lsn, fencing_token
 )
-VALUES ($1, $2, $3, $4::numeric, $5, $6, $7::pg_lsn, $8)
+VALUES ($1, $2, $3, $4::text::numeric, $5, $6, $7::text::pg_lsn, $8)
 "#;
 
 pub const UPDATE_NODE_CHECKPOINT_SQL: &str = r#"
 UPDATE pg2cb_meta.node_checkpoints
-SET applied_lsn = $4::pg_lsn, fencing_token = $5, updated_at = clock_timestamp()
+SET applied_lsn = $4::text::pg_lsn, fencing_token = $5, updated_at = clock_timestamp()
 WHERE pipeline_id = $1 AND topology_generation = $2 AND node_id = $3
 "#;
 
@@ -172,6 +172,23 @@ pub async fn load_node_checkpoint(
         .transpose()
 }
 
+/// Loads and locks one checkpoint inside a caller-owned transaction.
+pub(crate) async fn load_node_checkpoint_locked(
+    transaction: &Transaction<'_>,
+    key: CheckpointKey,
+) -> Result<Option<StoredNodeCheckpoint>, CheckpointError> {
+    let generation = database_generation(key.topology_generation)?;
+    let pipeline_id = key.pipeline_id.as_uuid();
+    transaction
+        .query_opt(
+            LOCK_NODE_CHECKPOINT_SQL,
+            &[&pipeline_id, &generation, &key.node_id],
+        )
+        .await?
+        .map(checkpoint_from_row)
+        .transpose()
+}
+
 /// Locks and verifies the pipeline fence inside the caller's apply transaction.
 pub async fn lock_pipeline_fence(
     transaction: &Transaction<'_>,
@@ -282,13 +299,7 @@ pub fn check_advance(
     let Some(current) = current else {
         return Ok(AdvanceOutcome::Inserted);
     };
-    if current.checkpoint.key != proposed.key
-        || current.checkpoint.system_identifier != proposed.system_identifier
-        || current.checkpoint.timeline != proposed.timeline
-        || current.checkpoint.slot_name != proposed.slot_name
-    {
-        return Err(CheckpointError::SourceIdentityChanged);
-    }
+    ensure_same_identity(&current.checkpoint, proposed)?;
     match proposed.applied_lsn.cmp(&current.checkpoint.applied_lsn) {
         std::cmp::Ordering::Less => Err(CheckpointError::LsnRegression {
             current: current.checkpoint.applied_lsn,
@@ -298,6 +309,37 @@ pub fn check_advance(
         std::cmp::Ordering::Greater => Ok(AdvanceOutcome::Advanced {
             previous_lsn: current.checkpoint.applied_lsn,
         }),
+    }
+}
+
+/// Checks whether a committed checkpoint has reached the required source position.
+///
+/// A later LSN is valid for activation retry because the WAL runtime may have advanced after the
+/// activation transaction committed but before the caller retried its lost response.
+pub fn checkpoint_reached(
+    current: Option<&StoredNodeCheckpoint>,
+    required: &NodeCheckpoint,
+) -> Result<bool, CheckpointError> {
+    validate_checkpoint(required)?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    ensure_same_identity(&current.checkpoint, required)?;
+    Ok(current.checkpoint.applied_lsn >= required.applied_lsn)
+}
+
+fn ensure_same_identity(
+    current: &NodeCheckpoint,
+    proposed: &NodeCheckpoint,
+) -> Result<(), CheckpointError> {
+    if current.key == proposed.key
+        && current.system_identifier == proposed.system_identifier
+        && current.timeline == proposed.timeline
+        && current.slot_name == proposed.slot_name
+    {
+        Ok(())
+    } else {
+        Err(CheckpointError::SourceIdentityChanged)
     }
 }
 
@@ -446,6 +488,22 @@ mod tests {
     }
 
     #[test]
+    fn activation_retry_accepts_equal_or_later_checkpoint() {
+        assert!(!checkpoint_reached(None, &checkpoint(10)).unwrap());
+        assert!(checkpoint_reached(Some(&stored(10)), &checkpoint(10)).unwrap());
+        assert!(checkpoint_reached(Some(&stored(12)), &checkpoint(10)).unwrap());
+        assert!(!checkpoint_reached(Some(&stored(9)), &checkpoint(10)).unwrap());
+
+        let current = stored(10);
+        let mut different = checkpoint(10);
+        different.slot_name.push_str("_replacement");
+        assert!(matches!(
+            checkpoint_reached(Some(&current), &different),
+            Err(CheckpointError::SourceIdentityChanged)
+        ));
+    }
+
+    #[test]
     fn validates_values_before_database_io() {
         let mut invalid = checkpoint(1);
         invalid.timeline = 0;
@@ -463,8 +521,9 @@ mod tests {
 
     #[test]
     fn sql_uses_native_lsn_and_lossless_system_identifier_types() {
-        assert!(INSERT_NODE_CHECKPOINT_SQL.contains("$4::numeric"));
-        assert!(INSERT_NODE_CHECKPOINT_SQL.contains("$7::pg_lsn"));
+        assert!(INSERT_NODE_CHECKPOINT_SQL.contains("$4::text::numeric"));
+        assert!(INSERT_NODE_CHECKPOINT_SQL.contains("$7::text::pg_lsn"));
+        assert!(UPDATE_NODE_CHECKPOINT_SQL.contains("$4::text::pg_lsn"));
         assert!(LOCK_PIPELINE_FENCE_SQL.ends_with("FOR UPDATE"));
     }
 }

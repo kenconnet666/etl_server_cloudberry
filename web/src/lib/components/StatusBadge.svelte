@@ -3,7 +3,7 @@
 
   let { value, compact = false }: { value?: string; compact?: boolean } = $props();
 
-  const positive = new Set(['healthy', 'running', 'succeeded']);
+  const positive = new Set(['healthy', 'running', 'succeeded', 'enabled']);
   const warning = new Set([
     'validating',
     'snapshotting',
@@ -14,7 +14,7 @@
     'rebuilding'
   ]);
   const negative = new Set(['failed', 'unreachable', 'blocked', 'cancelled']);
-  const quiet = new Set(['paused', 'stopped', 'quarantined', 'unknown', 'draft']);
+  const quiet = new Set(['paused', 'stopped', 'quarantined', 'unknown', 'draft', 'disabled']);
 
   let tone = $derived(
     positive.has(value || '')

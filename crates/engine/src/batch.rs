@@ -108,7 +108,10 @@ impl Batcher {
         let must_flush = !self.pending.is_empty()
             && (barrier
                 || self.pending_rows.saturating_add(rows) > self.limits.max_rows
-                || self.pending_bytes.saturating_add(bytes) > self.limits.max_bytes);
+                || self.pending_bytes.saturating_add(bytes) > self.limits.max_bytes
+                // Empty transactions still carry a commit position; cap their count so they
+                // cannot accumulate indefinitely when a source emits no row changes.
+                || self.pending.len() >= self.limits.max_rows);
         let full = must_flush.then(|| self.take_pending());
 
         self.node_identity = Some((
@@ -252,6 +255,7 @@ mod tests {
             version: 1,
             command_tag: "ALTER TABLE".into(),
             relation_ids: vec![7],
+            affected_schemas: vec!["public".into()],
             schema_fingerprint: "abc".into(),
         });
         let full = batcher.push(transaction(2, vec![ddl])).unwrap().unwrap();
@@ -269,5 +273,20 @@ mod tests {
             batcher.push(transaction(1, vec![])),
             Err(BatchError::NonMonotonicLsn { .. })
         ));
+    }
+
+    #[test]
+    fn empty_transactions_are_bounded_by_the_row_limit() {
+        let mut batcher = Batcher::new(BatchLimits {
+            max_rows: 2,
+            max_bytes: 1024,
+            max_delay: Duration::from_secs(1),
+        })
+        .unwrap();
+        assert!(batcher.push(transaction(1, vec![])).unwrap().is_none());
+        assert!(batcher.push(transaction(2, vec![])).unwrap().is_none());
+        let full = batcher.push(transaction(3, vec![])).unwrap().unwrap();
+        assert_eq!(full.transactions().len(), 2);
+        assert_eq!(full.row_count(), 0);
     }
 }

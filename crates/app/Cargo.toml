@@ -28,6 +28,7 @@ rpassword.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

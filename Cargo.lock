@@ -461,9 +461,15 @@ dependencies = [
  "cloudberry-etl-source-postgres",
  "cloudberry-etl-target-cloudberry",
  "futures",
+ "native-tls",
+ "postgres-native-tls 0.5.3",
+ "secrecy",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "tokio",
+ "tokio-postgres 0.7.18",
  "tokio-util",
  "tracing",
  "uuid",
@@ -484,6 +490,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
  "tokio-postgres 0.7.18",
  "uuid",
  "zeroize",
@@ -498,6 +505,8 @@ dependencies = [
  "chrono",
  "cloudberry-etl-core",
  "futures",
+ "native-tls",
+ "postgres-native-tls 0.5.0",
  "postgres-replication",
  "serde",
  "serde_json",
@@ -703,12 +712,13 @@ dependencies = [
  "cloudberry-etl-source-postgres",
  "cloudberry-etl-target-cloudberry",
  "native-tls",
- "postgres-native-tls",
+ "postgres-native-tls 0.5.3",
  "rand 0.9.5",
  "rpassword",
  "secrecy",
  "tokio",
  "tokio-postgres 0.7.18",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -1437,6 +1447,17 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+]
+
+[[package]]
+name = "postgres-native-tls"
+version = "0.5.0"
+source = "git+https://github.com/iambriccardo/rust-postgres?rev=31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38#31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38"
+dependencies = [
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres 0.7.11",
 ]
 
 [[package]]

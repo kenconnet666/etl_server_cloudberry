@@ -1,6 +1,6 @@
 //! Transactional staging apply and durable checkpoint advancement.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -41,6 +41,14 @@ pub enum ApplyError {
     InvalidRowArity { expected: usize, actual: usize },
     #[error("primary-key column `{0}` is NULL or unchanged")]
     MissingPrimaryKey(String),
+    #[error("move staging row has {actual} old-key cells, expected {expected}")]
+    InvalidOldKeyArity { expected: usize, actual: usize },
+    #[error("move staging row is missing its old primary key")]
+    MissingOldPrimaryKey,
+    #[error("only move staging rows may carry an old primary key")]
+    UnexpectedOldPrimaryKey,
+    #[error("old primary-key column `{0}` is NULL or unchanged")]
+    MissingOldPrimaryKeyColumn(String),
     #[error("staging name `{0}` is repeated in one target transaction")]
     DuplicateStagingName(String),
     #[error("Cloudberry rejected an invalid or non-collapsed staging batch for {0}")]
@@ -55,10 +63,20 @@ pub struct PresenceColumn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldKeyColumn {
+    pub source_column_index: usize,
+    pub source_column_name: String,
+    pub staging_column_name: String,
+    pub type_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyLayout {
     pub operation_column: String,
     pub data_columns: Vec<String>,
     pub presence_columns: Vec<PresenceColumn>,
+    pub old_key_present_column: String,
+    pub old_key_columns: Vec<OldKeyColumn>,
 }
 
 /// Pure SQL plan for applying one already-collapsed table batch.
@@ -75,6 +93,8 @@ pub struct ApplyPlan {
     pub copy_sql: String,
     pub validation_sql: String,
     pub delete_sql: String,
+    pub move_sql: String,
+    pub delete_moved_sql: String,
     pub update_sql: Option<String>,
     pub insert_sql: String,
 }
@@ -83,17 +103,20 @@ pub struct ApplyPlan {
 pub enum StageOperation {
     Upsert,
     Delete,
+    Move,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagingRow {
     pub operation: StageOperation,
     pub cells: Vec<Cell>,
+    /// Old PK cells in primary-key ordinal order. Present only for `Move`.
+    pub old_key: Option<Vec<Cell>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TableApplyBatch {
-    pub plan: ApplyPlan,
+    pub plan: Arc<ApplyPlan>,
     pub rows: Vec<StagingRow>,
 }
 
@@ -108,6 +131,7 @@ pub struct ApplyRequest {
 pub struct ApplyOutcome {
     pub staged_rows: u64,
     pub deleted_rows: u64,
+    pub moved_rows: u64,
     pub updated_rows: u64,
     pub inserted_rows: u64,
     pub checkpoint: AdvanceOutcome,
@@ -128,6 +152,7 @@ pub async fn execute_apply(
     let mut outcome = ApplyOutcome {
         staged_rows: 0,
         deleted_rows: 0,
+        moved_rows: 0,
         updated_rows: 0,
         inserted_rows: 0,
         checkpoint: AdvanceOutcome::Unchanged,
@@ -161,6 +186,14 @@ pub async fn execute_apply(
         outcome.deleted_rows = outcome
             .deleted_rows
             .saturating_add(transaction.execute(&table.plan.delete_sql, &[]).await?);
+        outcome.moved_rows = outcome
+            .moved_rows
+            .saturating_add(transaction.execute(&table.plan.move_sql, &[]).await?);
+        outcome.deleted_rows = outcome.deleted_rows.saturating_add(
+            transaction
+                .execute(&table.plan.delete_moved_sql, &[])
+                .await?,
+        );
         if let Some(update_sql) = &table.plan.update_sql {
             outcome.updated_rows = outcome
                 .updated_rows
@@ -191,12 +224,38 @@ pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>,
         }
     }
 
+    match (row.operation, row.old_key.as_deref()) {
+        (StageOperation::Move, None) => return Err(ApplyError::MissingOldPrimaryKey),
+        (StageOperation::Upsert | StageOperation::Delete, Some(_)) => {
+            return Err(ApplyError::UnexpectedOldPrimaryKey);
+        }
+        _ => {}
+    }
+    if let Some(old_key) = &row.old_key {
+        if old_key.len() != plan.copy_layout.old_key_columns.len() {
+            return Err(ApplyError::InvalidOldKeyArity {
+                expected: plan.copy_layout.old_key_columns.len(),
+                actual: old_key.len(),
+            });
+        }
+        for (column, cell) in plan.copy_layout.old_key_columns.iter().zip(old_key) {
+            if matches!(cell, Cell::Null | Cell::UnchangedToast) {
+                return Err(ApplyError::MissingOldPrimaryKeyColumn(
+                    column.source_column_name.clone(),
+                ));
+            }
+        }
+    }
+
     let mut fields = Vec::with_capacity(
-        1 + plan.copy_layout.data_columns.len() + plan.copy_layout.presence_columns.len(),
+        2 + plan.copy_layout.data_columns.len()
+            + plan.copy_layout.presence_columns.len()
+            + plan.copy_layout.old_key_columns.len(),
     );
     fields.push(Cell::Text(Bytes::from_static(match row.operation {
         StageOperation::Upsert => b"U",
         StageOperation::Delete => b"D",
+        StageOperation::Move => b"M",
     })));
     fields.extend(row.cells.iter().map(|cell| match cell {
         Cell::UnchangedToast => Cell::Null,
@@ -209,6 +268,15 @@ pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>,
         );
         Cell::Text(Bytes::from_static(if is_present { b"t" } else { b"f" }))
     }));
+    fields.push(Cell::Text(Bytes::from_static(if row.old_key.is_some() {
+        b"t"
+    } else {
+        b"f"
+    })));
+    match &row.old_key {
+        Some(old_key) => fields.extend(old_key.iter().cloned()),
+        None => fields.extend(plan.copy_layout.old_key_columns.iter().map(|_| Cell::Null)),
+    }
     encode_row(&fields).map_err(ApplyError::from)
 }
 
@@ -224,12 +292,11 @@ fn validate_request(request: &ApplyRequest) -> Result<(), ApplyError> {
     Ok(())
 }
 
-/// Plans a typed temporary staging table and colocated delete/update/insert SQL.
+/// Plans a typed temporary staging table and colocated current-state apply SQL.
 ///
-/// The stage operation is `U` for upsert or `D` for delete. PK changes must be
-/// collapsed upstream into `D(old key)` plus `U(new row)`. A false presence flag
-/// means the source sent `UnchangedToast`; it is valid only when the target row
-/// already exists.
+/// `U` upserts a stable key, `D` deletes a stable key, and `M` moves a row to a
+/// new primary key. A false presence flag means the source sent
+/// `UnchangedToast`; it is valid only when the target can supply the prior value.
 pub fn plan_apply(
     source: &TableSchema,
     target: QualifiedName,
@@ -255,11 +322,31 @@ pub fn plan_apply(
             staging_column_name: format!("{control_prefix}present_{}", column.source_attnum),
         })
         .collect();
+    let old_key_present_column = format!("{control_prefix}old_key_present");
+    let old_key_columns: Vec<_> = table
+        .primary_key
+        .iter()
+        .map(|key_name| {
+            let (source_column_index, column) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, column)| &column.name == key_name)
+                .expect("planned primary key names always reference planned columns");
+            OldKeyColumn {
+                source_column_index,
+                source_column_name: column.name.clone(),
+                staging_column_name: format!("{control_prefix}old_{}", column.source_attnum),
+                type_sql: column.type_sql.clone(),
+            }
+        })
+        .collect();
 
     let mut staging_definitions = vec![format!(
-        "    {quoted_operation} character(1) NOT NULL CHECK ({quoted_operation} IN ({}, {}))",
+        "    {quoted_operation} character(1) NOT NULL CHECK ({quoted_operation} IN ({}, {}, {}))",
         quote_literal("U")?,
-        quote_literal("D")?
+        quote_literal("D")?,
+        quote_literal("M")?
     )];
     staging_definitions.extend(
         table
@@ -285,6 +372,22 @@ pub fn plan_apply(
             })
             .collect::<Result<Vec<_>, SqlRenderError>>()?,
     );
+    staging_definitions.push(format!(
+        "    {} boolean NOT NULL",
+        quote_identifier(&old_key_present_column)?
+    ));
+    staging_definitions.extend(
+        old_key_columns
+            .iter()
+            .map(|column| {
+                Ok(format!(
+                    "    {} {}",
+                    quote_identifier(&column.staging_column_name)?,
+                    column.type_sql
+                ))
+            })
+            .collect::<Result<Vec<_>, SqlRenderError>>()?,
+    );
 
     let quoted_key = quote_identifier_list(key_names)?;
     let create_staging_sql = format!(
@@ -299,6 +402,12 @@ pub fn plan_apply(
             .iter()
             .map(|column| column.staging_column_name.clone()),
     );
+    copy_columns.push(old_key_present_column.clone());
+    copy_columns.extend(
+        old_key_columns
+            .iter()
+            .map(|column| column.staging_column_name.clone()),
+    );
     let copy_sql = format!(
         "COPY {quoted_staging} ({}) FROM STDIN WITH (FORMAT text, DELIMITER {}, NULL {})",
         quote_identifier_list(&copy_columns)?,
@@ -307,15 +416,62 @@ pub fn plan_apply(
     );
 
     let key_join = equality_join("t", "s", key_names)?;
+    let old_key_join = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "t.{} = s.{}",
+                quote_identifier(&column.source_column_name)?,
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" AND ");
     let key_is_null = qualified_columns("s", key_names)?
         .into_iter()
         .map(|column| format!("{column} IS NULL"))
         .collect::<Vec<_>>()
         .join(" OR ");
     let target_missing = format!(
-        "t.{} IS NULL",
+        "(t.{} IS NULL)",
         quote_identifier(key_names.first().expect("schema validation requires a PK"))?
     );
+    let old_target_missing = format!(
+        "(old_t.{} IS NULL)",
+        quote_identifier(key_names.first().expect("schema validation requires a PK"))?
+    );
+    let old_key_present = format!("s.{}", quote_identifier(&old_key_present_column)?);
+    let old_key_is_null = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "s.{} IS NULL",
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" OR ");
+    let old_key_is_not_null = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "s.{} IS NOT NULL",
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" OR ");
+    let same_move_key = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "s.{} = s.{}",
+                quote_identifier(&column.source_column_name)?,
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" AND ");
     let all_present = if presence_columns.is_empty() {
         "TRUE".to_owned()
     } else {
@@ -331,15 +487,74 @@ pub fn plan_apply(
             .join(" AND ")
     };
     let grouped_key = qualified_columns("s", key_names)?.join(", ");
+    let grouped_old_key = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "s.{}",
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(", ");
+    let old_validation_join = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "old_t.{} = s.{}",
+                quote_identifier(&column.source_column_name)?,
+                quote_identifier(&column.staging_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" AND ");
     let validation_sql = format!(
-        "SELECT (\n    EXISTS (\n        SELECT 1\n        FROM {quoted_staging} AS s\n        LEFT JOIN {quoted_target} AS t ON {key_join}\n        WHERE s.{quoted_operation} NOT IN ({upsert}, {delete})\n           OR {key_is_null}\n           OR (s.{quoted_operation} = {upsert} AND {target_missing} AND NOT ({all_present}))\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        GROUP BY {grouped_key}\n        HAVING count(*) > 1\n    )\n) AS invalid_batch",
+        "SELECT (\n    EXISTS (\n        SELECT 1\n        FROM {quoted_staging} AS s\n        LEFT JOIN {quoted_target} AS t ON {key_join}\n        LEFT JOIN {quoted_target} AS old_t ON {old_validation_join}\n        WHERE s.{quoted_operation} NOT IN ({upsert}, {delete}, {move_op})\n           OR {key_is_null}\n           OR (s.{quoted_operation} IN ({upsert}, {delete}) AND ({old_key_present} OR ({old_key_is_not_null})))\n           OR (s.{quoted_operation} = {move_op} AND (NOT {old_key_present} OR ({old_key_is_null}) OR ({same_move_key})))\n           OR (s.{quoted_operation} = {move_op} AND {target_missing} = {old_target_missing})\n           OR (s.{quoted_operation} = {upsert} AND {target_missing} AND NOT ({all_present}))\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        GROUP BY {grouped_key}\n        HAVING count(*) > 1\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        WHERE s.{quoted_operation} = {move_op}\n        GROUP BY {grouped_old_key}\n        HAVING count(*) > 1\n    )\n) AS invalid_batch",
         upsert = quote_literal("U")?,
         delete = quote_literal("D")?,
+        move_op = quote_literal("M")?,
     );
 
     let delete_sql = format!(
         "DELETE FROM {quoted_target} AS t\nUSING {quoted_staging} AS s\nWHERE s.{quoted_operation} = {} AND {key_join}",
         quote_literal("D")?
+    );
+
+    let data_names: Vec<_> = table
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let moved_columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(source_column_index, column)| {
+            let data = quote_identifier(&column.name)?;
+            if column.primary_key_ordinal.is_some() {
+                Ok(format!("s.{data}"))
+            } else {
+                let presence = presence_columns
+                    .iter()
+                    .find(|presence| presence.source_column_index == source_column_index)
+                    .expect("every non-key column has a presence column");
+                let present = quote_identifier(&presence.staging_column_name)?;
+                Ok(format!(
+                    "CASE WHEN s.{present} THEN s.{data} ELSE t.{data} END"
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(", ");
+    let move_sql = format!(
+        "INSERT INTO {quoted_target} ({})\nSELECT {moved_columns}\nFROM {quoted_staging} AS s\nJOIN {quoted_target} AS t ON {old_key_join}\nWHERE s.{quoted_operation} = {}\n  AND NOT EXISTS (SELECT 1 FROM {quoted_target} AS new_t WHERE {})",
+        quote_identifier_list(&data_names)?,
+        quote_literal("M")?,
+        equality_join("new_t", "s", key_names)?,
+    );
+    let delete_moved_sql = format!(
+        "DELETE FROM {quoted_target} AS t\nUSING {quoted_staging} AS s\nWHERE s.{quoted_operation} = {} AND {old_key_join}",
+        quote_literal("M")?
     );
 
     let update_sql = if presence_columns.is_empty() {
@@ -362,11 +577,6 @@ pub fn plan_apply(
         ))
     };
 
-    let data_names: Vec<_> = table
-        .columns
-        .iter()
-        .map(|column| column.name.clone())
-        .collect();
     let selected_columns = qualified_columns("s", &data_names)?.join(", ");
     let insert_sql = format!(
         "INSERT INTO {quoted_target} ({})\nSELECT {selected_columns}\nFROM {quoted_staging} AS s\nWHERE s.{quoted_operation} = {}\n  AND NOT EXISTS (SELECT 1 FROM {quoted_target} AS t WHERE {key_join})",
@@ -381,11 +591,15 @@ pub fn plan_apply(
             operation_column,
             data_columns: data_names,
             presence_columns,
+            old_key_present_column,
+            old_key_columns,
         },
         create_staging_sql,
         copy_sql,
         validation_sql,
         delete_sql,
+        move_sql,
+        delete_moved_sql,
         update_sql,
         insert_sql,
     })
@@ -488,12 +702,24 @@ mod tests {
         );
         assert!(plan.copy_sql.starts_with("COPY \"stage_orders\""));
         assert_eq!(plan.copy_layout.presence_columns.len(), 1);
+        assert_eq!(
+            plan.copy_layout
+                .old_key_columns
+                .iter()
+                .map(|column| column.source_column_name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "tenant"]
+        );
+        assert!(plan.create_staging_sql.contains("IN (E'U', E'D', E'M')"));
         assert!(plan.validation_sql.contains("HAVING count(*) > 1"));
         assert!(
             plan.delete_sql
                 .contains("DELETE FROM \"target\".\"orders\"")
         );
         assert!(plan.update_sql.as_ref().unwrap().contains("CASE WHEN"));
+        assert!(plan.move_sql.contains("JOIN \"target\".\"orders\" AS t"));
+        assert!(plan.move_sql.contains("ELSE t.\"payload\" END"));
+        assert!(plan.delete_moved_sql.contains("s.\"__pg2cb_op\" = E'M'"));
         assert!(plan.insert_sql.contains("NOT EXISTS"));
     }
 
@@ -543,6 +769,7 @@ mod tests {
             &StagingRow {
                 operation: StageOperation::Upsert,
                 cells: vec![Cell::Text(Bytes::from_static(b"1")), Cell::UnchangedToast],
+                old_key: None,
             },
         )
         .unwrap();
@@ -551,11 +778,12 @@ mod tests {
             &StagingRow {
                 operation: StageOperation::Upsert,
                 cells: vec![Cell::Text(Bytes::from_static(b"1")), Cell::Null],
+                old_key: None,
             },
         )
         .unwrap();
-        assert_eq!(unchanged, b"U\t1\t\\N\tf\n");
-        assert_eq!(explicit_null, b"U\t1\t\\N\tt\n");
+        assert_eq!(unchanged, b"U\t1\t\\N\tf\tf\t\\N\n");
+        assert_eq!(explicit_null, b"U\t1\t\\N\tt\tf\t\\N\n");
     }
 
     #[test]
@@ -573,6 +801,7 @@ mod tests {
                 &StagingRow {
                     operation: StageOperation::Delete,
                     cells: vec![Cell::Null, Cell::Null],
+                    old_key: None,
                 }
             ),
             Err(ApplyError::MissingPrimaryKey(_))
@@ -583,9 +812,88 @@ mod tests {
                 &StagingRow {
                     operation: StageOperation::Delete,
                     cells: vec![Cell::Text(Bytes::from_static(b"1"))],
+                    old_key: None,
                 }
             ),
             Err(ApplyError::InvalidRowArity { .. })
+        ));
+    }
+
+    #[test]
+    fn staging_encoding_carries_a_typed_old_key_for_moves() {
+        let source = table(vec![
+            column(1, "tenant", Some(2)),
+            column(2, "id", Some(1)),
+            column(3, "payload", None),
+        ]);
+        let plan = plan_apply(
+            &source,
+            QualifiedName::new("target", "orders").unwrap(),
+            "stage_orders",
+        )
+        .unwrap();
+        let encoded = encode_staging_row(
+            &plan,
+            &StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![
+                    Cell::Text(Bytes::from_static(b"20")),
+                    Cell::Text(Bytes::from_static(b"2")),
+                    Cell::UnchangedToast,
+                ],
+                old_key: Some(vec![
+                    Cell::Text(Bytes::from_static(b"1")),
+                    Cell::Text(Bytes::from_static(b"10")),
+                ]),
+            },
+        )
+        .unwrap();
+        assert_eq!(encoded, b"M\t20\t2\t\\N\tf\tt\t1\t10\n");
+    }
+
+    #[test]
+    fn staging_encoding_enforces_move_old_key_ownership_and_arity() {
+        let source = table(vec![column(1, "id", Some(1)), column(2, "payload", None)]);
+        let plan = plan_apply(
+            &source,
+            QualifiedName::new("target", "orders").unwrap(),
+            "stage_orders",
+        )
+        .unwrap();
+        let cells = vec![Cell::Text(Bytes::from_static(b"2")), Cell::UnchangedToast];
+
+        assert!(matches!(
+            encode_staging_row(
+                &plan,
+                &StagingRow {
+                    operation: StageOperation::Move,
+                    cells: cells.clone(),
+                    old_key: None,
+                }
+            ),
+            Err(ApplyError::MissingOldPrimaryKey)
+        ));
+        assert!(matches!(
+            encode_staging_row(
+                &plan,
+                &StagingRow {
+                    operation: StageOperation::Upsert,
+                    cells: cells.clone(),
+                    old_key: Some(vec![Cell::Text(Bytes::from_static(b"1"))]),
+                }
+            ),
+            Err(ApplyError::UnexpectedOldPrimaryKey)
+        ));
+        assert!(matches!(
+            encode_staging_row(
+                &plan,
+                &StagingRow {
+                    operation: StageOperation::Move,
+                    cells,
+                    old_key: Some(Vec::new()),
+                }
+            ),
+            Err(ApplyError::InvalidOldKeyArity { .. })
         ));
     }
 }

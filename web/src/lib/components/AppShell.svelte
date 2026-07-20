@@ -99,7 +99,7 @@
           <Menu size={20} />
         </button>
         <button class="icon-button collapse-button" type="button" onclick={() => (collapsed = !collapsed)} title={collapsed ? 'Expand navigation' : 'Collapse navigation'} aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}>
-          <PanelLeftClose class:flipped={collapsed} size={19} />
+          <PanelLeftClose class={collapsed ? 'flipped' : undefined} size={19} />
         </button>
         <h1>{VIEW_TITLES[current]}</h1>
       </div>

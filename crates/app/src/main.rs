@@ -12,16 +12,23 @@ use cloudberry_etl_api::{
     state::{AppState, ConnectionReport, ConnectionTester},
 };
 use cloudberry_etl_config::BootstrapConfig;
-use cloudberry_etl_engine::supervisor::PipelineSupervisor;
+use cloudberry_etl_engine::{
+    runtime::{
+        PostgresCloudberryJobFactory,
+        reconciler::{PipelineReconciler, ReconcilerConfig},
+    },
+    supervisor::PipelineSupervisor,
+};
 use cloudberry_etl_metadata::{
     crypto::MasterKey,
-    migration::migrate_control_database,
+    migration::{CONTROL_SCHEMA_VERSION, migrate_control_database},
     store::{ControlStore, PostgresControlStore},
 };
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_postgres::{Client, Config as PgConfig};
+use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
 
@@ -127,9 +134,9 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     let master_key = Arc::new(MasterKey::from_base64(&config.master_key()?)?);
     let supervisor = Arc::new(PipelineSupervisor::new());
     let state = AppState {
-        control,
-        master_key,
-        supervisor: supervisor.clone(),
+        control: Arc::clone(&control),
+        master_key: Arc::clone(&master_key),
+        supervisor: Arc::clone(&supervisor),
         connection_tester: Arc::new(PostgresConnectionTester),
     };
     let auth = AuthState::new(
@@ -145,17 +152,44 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
+    let factory = Arc::new(PostgresCloudberryJobFactory::new(
+        Arc::clone(&control),
+        master_key,
+    ));
+    let engine = &config.engine;
+    let reconciler = PipelineReconciler::new(
+        control,
+        supervisor,
+        factory,
+        ReconcilerConfig {
+            poll_interval: Duration::from_secs(engine.reconcile_interval_seconds),
+            lease_ttl: Duration::from_secs(engine.lease_ttl_seconds),
+            lease_renew_interval: Duration::from_secs(engine.lease_renew_interval_seconds),
+            restart_backoff_initial: Duration::from_secs(engine.restart_backoff_initial_seconds),
+            restart_backoff_max: Duration::from_secs(engine.restart_backoff_max_seconds),
+            restart_backoff_reset_after: Duration::from_secs(engine.restart_backoff_reset_seconds),
+        },
+    )
+    .context("invalid pipeline engine configuration")?;
+    let shutdown = CancellationToken::new();
+    let reconciler_shutdown = shutdown.clone();
+    let reconciler_task = tokio::spawn(async move { reconciler.run(reconciler_shutdown).await });
     tracing::info!(listen = %config.server.listen, "management server started");
-    axum::serve(
+    let server_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(supervisor))
-    .await?;
+    .with_graceful_shutdown(shutdown_signal(shutdown.clone()))
+    .await;
+    shutdown.cancel();
+    reconciler_task
+        .await
+        .context("pipeline reconciler task terminated unexpectedly")?;
+    server_result?;
     Ok(())
 }
 
-async fn shutdown_signal(supervisor: Arc<PipelineSupervisor>) {
+async fn shutdown_signal(shutdown: CancellationToken) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::error!(%error, "failed to install Ctrl-C handler");
@@ -179,9 +213,7 @@ async fn shutdown_signal(supervisor: Arc<PipelineSupervisor>) {
         () = terminate => {}
     }
     tracing::info!("shutdown requested");
-    if let Err(error) = supervisor.stop_all().await {
-        tracing::error!(%error, "pipeline shutdown failed");
-    }
+    shutdown.cancel();
 }
 
 async fn connect_database(dsn: &SecretString) -> Result<Client> {
@@ -221,8 +253,10 @@ async fn ensure_control_database_migrated(client: &Client) -> Result<()> {
         )
         .await?
         .get(0);
-    if version != 1 {
-        bail!("unsupported control database migration version {version}; expected 1");
+    if version != CONTROL_SCHEMA_VERSION {
+        bail!(
+            "unsupported control database migration version {version}; expected {CONTROL_SCHEMA_VERSION}"
+        );
     }
     Ok(())
 }
@@ -238,9 +272,13 @@ impl ConnectionTester for PostgresConnectionTester {
             .map_err(sanitize_connection_error)?;
         let row = client
             .query_one(
-                "SELECT current_setting('server_version_num'), current_setting('server_encoding'),\
-                        current_setting('wal_level'),\
-                        COALESCE((SELECT extversion FROM pg_extension WHERE extname='citus'), '')",
+                r#"SELECT current_setting('server_version_num'),
+                          current_setting('server_encoding'),
+                          current_setting('wal_level'),
+                          COALESCE(
+                              (SELECT extversion FROM pg_extension WHERE extname='citus'),
+                              ''
+                          )"#,
                 &[],
             )
             .await

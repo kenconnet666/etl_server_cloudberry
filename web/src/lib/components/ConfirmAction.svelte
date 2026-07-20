@@ -30,7 +30,7 @@
       <button class="button ghost" type="button" disabled={busy} onclick={onClose}>Cancel</button>
       <button class="button danger" type="button" disabled={busy} onclick={onConfirm}>
         {#if busy}<LoaderCircle class="spin" size={16} />{:else}<RefreshCw size={16} />{/if}
-        {busy ? 'Starting rebuild' : confirmLabel}
+        {busy ? 'Requesting rebuild' : confirmLabel}
       </button>
     </footer>
   </div>

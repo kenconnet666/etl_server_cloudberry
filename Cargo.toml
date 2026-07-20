@@ -45,6 +45,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 replication-postgres = { package = "tokio-postgres", git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 postgres-replication = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
+replication-postgres-native-tls = { package = "postgres-native-tls", git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
 toml = "0.9"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["catch-panic", "compression-gzip", "cors", "fs", "request-id", "sensitive-headers", "set-header", "trace"] }

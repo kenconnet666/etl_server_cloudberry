@@ -88,7 +88,7 @@
       </label>
       <label class="field">
         <span>Source prefix</span>
-        <input required maxlength="24" pattern="[a-z][a-z0-9_]{0,23}" bind:value={form.prefix} placeholder="orders_prod" />
+        <input required maxlength="24" pattern={'[a-z][a-z0-9_]{0,23}'} bind:value={form.prefix} placeholder="orders_prod" />
         <small>Lowercase namespace identifier, unique across all sources.</small>
       </label>
       <label class="field">

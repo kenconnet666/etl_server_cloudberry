@@ -14,7 +14,10 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
 use cloudberry_etl_core::{
-    change::{Cell, DdlMessage, RowChange, TableChange, Tuple},
+    change::{
+        Cell, DdlMessage, RowChange, SourcePosition, SourceTransaction, TableChange,
+        TransactionChange, Tuple,
+    },
     lsn::PgLsn,
 };
 use futures::Stream;
@@ -45,6 +48,8 @@ pub struct RelationEvent {
     pub relation_id: u32,
     pub namespace: String,
     pub name: String,
+    /// Monotonically increasing schema generation for this relation identity.
+    pub generation: u64,
     pub replica_identity: WireReplicaIdentityKind,
     pub columns: Vec<RelationColumn>,
 }
@@ -81,15 +86,18 @@ pub enum DecodedMessage {
     Type(TypeEvent),
     Insert {
         relation_id: u32,
+        generation: u64,
         new: Tuple,
     },
     Update {
         relation_id: u32,
+        generation: u64,
         old_key: Option<Tuple>,
         new: Tuple,
     },
     Delete {
         relation_id: u32,
+        generation: u64,
         old_key: Tuple,
     },
     Truncate {
@@ -108,13 +116,18 @@ impl DecodedMessage {
     #[must_use]
     pub fn as_table_change(&self, generation: u64) -> Option<TableChange> {
         match self {
-            Self::Insert { relation_id, new } => Some(TableChange {
+            Self::Insert {
+                relation_id,
+                generation: _,
+                new,
+            } => Some(TableChange {
                 relation_id: *relation_id,
                 generation,
                 change: RowChange::Insert { new: new.clone() },
             }),
             Self::Update {
                 relation_id,
+                generation: _,
                 old_key,
                 new,
             } => Some(TableChange {
@@ -127,6 +140,7 @@ impl DecodedMessage {
             }),
             Self::Delete {
                 relation_id,
+                generation: _,
                 old_key,
             } => Some(TableChange {
                 relation_id: *relation_id,
@@ -137,6 +151,372 @@ impl DecodedMessage {
             }),
             _ => None,
         }
+    }
+
+    #[must_use]
+    pub fn relation_generation(&self) -> Option<u64> {
+        match self {
+            Self::Insert { generation, .. }
+            | Self::Update { generation, .. }
+            | Self::Delete { generation, .. } => Some(*generation),
+            Self::Relation(relation) => Some(relation.generation),
+            _ => None,
+        }
+    }
+
+    fn to_transaction_change(&self) -> SourceResult<Option<TransactionChange>> {
+        let change = match self {
+            Self::Insert {
+                relation_id,
+                generation,
+                new,
+            } => TransactionChange::Row(TableChange {
+                relation_id: *relation_id,
+                generation: *generation,
+                change: RowChange::Insert { new: new.clone() },
+            }),
+            Self::Update {
+                relation_id,
+                generation,
+                old_key,
+                new,
+            } => TransactionChange::Row(TableChange {
+                relation_id: *relation_id,
+                generation: *generation,
+                change: RowChange::Update {
+                    old_key: old_key.clone(),
+                    new: new.clone(),
+                },
+            }),
+            Self::Delete {
+                relation_id,
+                generation,
+                old_key,
+            } => TransactionChange::Row(TableChange {
+                relation_id: *relation_id,
+                generation: *generation,
+                change: RowChange::Delete {
+                    old_key: old_key.clone(),
+                },
+            }),
+            Self::Truncate {
+                relation_ids,
+                options,
+            } => TransactionChange::Truncate {
+                relation_ids: relation_ids.clone(),
+                cascade: options & 1 != 0,
+                restart_identity: options & 2 != 0,
+            },
+            Self::Ddl(message) => TransactionChange::Ddl(message.clone()),
+            _ => return Ok(None),
+        };
+        Ok(Some(change))
+    }
+}
+
+fn relation_shape_equal(left: &RelationEvent, right: &RelationEvent) -> bool {
+    left.relation_id == right.relation_id
+        && left.namespace == right.namespace
+        && left.name == right.name
+        && left.replica_identity == right.replica_identity
+        && left.columns == right.columns
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceNodeIdentity {
+    pub node_id: i32,
+    pub system_identifier: u64,
+    pub timeline: u32,
+}
+
+impl SourceNodeIdentity {
+    #[must_use]
+    pub const fn position(self, lsn: PgLsn) -> SourcePosition {
+        SourcePosition {
+            node_id: self.node_id,
+            system_identifier: self.system_identifier,
+            timeline: self.timeline,
+            lsn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionLimits {
+    pub max_changes: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for TransactionLimits {
+    fn default() -> Self {
+        Self {
+            max_changes: 1_000_000,
+            max_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+impl TransactionLimits {
+    pub fn validate(self) -> SourceResult<()> {
+        if self.max_changes == 0 || self.max_bytes == 0 {
+            return Err(SourceError::contract(
+                "transaction limits must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedTransaction {
+    pub transaction: SourceTransaction,
+    /// The commit record LSN. `transaction.final_position.lsn` is the commit end LSN used for ACK.
+    pub commit_lsn: PgLsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssembledEvent {
+    Transaction(CommittedTransaction),
+    Keepalive {
+        wal_end: PgLsn,
+        timestamp_micros: i64,
+        reply_requested: bool,
+    },
+}
+
+#[derive(Debug)]
+struct PendingTransaction {
+    xid: u32,
+    begin_lsn: PgLsn,
+    begin_time: DateTime<Utc>,
+    changes: Vec<TransactionChange>,
+    buffered_bytes: usize,
+}
+
+/// Turn decoded pgoutput events into complete, node-scoped source transactions.
+///
+/// A commit is the only event that produces a transaction. Keepalives are returned immediately
+/// and never enter the transaction change list, so an ACK scheduler cannot mistake a heartbeat for
+/// an applied data prefix.
+#[derive(Debug)]
+pub struct TransactionAssembler {
+    identity: SourceNodeIdentity,
+    limits: TransactionLimits,
+    pending: Option<PendingTransaction>,
+    last_commit_lsn: Option<PgLsn>,
+    relation_generations: HashMap<u32, u64>,
+}
+
+impl TransactionAssembler {
+    #[must_use]
+    pub fn new(identity: SourceNodeIdentity) -> Self {
+        Self {
+            identity,
+            limits: TransactionLimits::default(),
+            pending: None,
+            last_commit_lsn: None,
+            relation_generations: HashMap::new(),
+        }
+    }
+
+    pub fn with_limits(
+        identity: SourceNodeIdentity,
+        limits: TransactionLimits,
+    ) -> SourceResult<Self> {
+        limits.validate()?;
+        Ok(Self {
+            identity,
+            limits,
+            pending: None,
+            last_commit_lsn: None,
+            relation_generations: HashMap::new(),
+        })
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> SourceNodeIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn pending_xid(&self) -> Option<u32> {
+        self.pending.as_ref().map(|pending| pending.xid)
+    }
+
+    #[must_use]
+    pub fn relation_generation(&self, relation_id: u32) -> Option<u64> {
+        self.relation_generations.get(&relation_id).copied()
+    }
+
+    pub fn push(&mut self, event: DecodedMessage) -> SourceResult<Option<AssembledEvent>> {
+        match event {
+            DecodedMessage::Keepalive {
+                wal_end,
+                timestamp_micros,
+                reply_requested,
+            } => Ok(Some(AssembledEvent::Keepalive {
+                wal_end,
+                timestamp_micros,
+                reply_requested,
+            })),
+            DecodedMessage::Relation(relation) => {
+                self.accept_relation(&relation)?;
+                Ok(None)
+            }
+            DecodedMessage::Type(_) => Ok(None),
+            DecodedMessage::Begin {
+                final_lsn,
+                timestamp,
+                xid,
+            } => {
+                if self.pending.is_some() {
+                    return Err(SourceError::ReplicationProtocol(
+                        "BEGIN arrived before the previous transaction committed".to_owned(),
+                    ));
+                }
+                if let Some(previous) = self.last_commit_lsn
+                    && final_lsn < previous
+                {
+                    return Err(SourceError::ReplicationProtocol(format!(
+                        "BEGIN final LSN {} moved behind committed LSN {}",
+                        final_lsn, previous
+                    )));
+                }
+                self.pending = Some(PendingTransaction {
+                    xid,
+                    begin_lsn: final_lsn,
+                    begin_time: timestamp,
+                    changes: Vec::new(),
+                    buffered_bytes: 0,
+                });
+                Ok(None)
+            }
+            DecodedMessage::Commit {
+                commit_lsn,
+                end_lsn,
+                timestamp,
+                flags,
+            } => self.commit(commit_lsn, end_lsn, timestamp, flags),
+            event => {
+                let Some(change) = event.to_transaction_change()? else {
+                    return Ok(None);
+                };
+                if self.pending.is_none() {
+                    return Err(SourceError::ReplicationProtocol(
+                        "transactional pgoutput event arrived without BEGIN".to_owned(),
+                    ));
+                }
+                if let TransactionChange::Row(row) = &change
+                    && self.relation_generations.get(&row.relation_id).copied()
+                        != Some(row.generation)
+                {
+                    return Err(SourceError::ReplicationProtocol(format!(
+                        "relation {} generation {} is not current",
+                        row.relation_id, row.generation
+                    )));
+                }
+                let pending = self.pending.as_mut().expect("checked above");
+                if pending.changes.len() >= self.limits.max_changes {
+                    return Err(SourceError::unsupported(format!(
+                        "transaction {} exceeds {} changes; streaming protocol is unavailable",
+                        pending.xid, self.limits.max_changes
+                    )));
+                }
+                let bytes = transaction_change_bytes(&change);
+                if pending.buffered_bytes.saturating_add(bytes) > self.limits.max_bytes {
+                    return Err(SourceError::unsupported(format!(
+                        "transaction {} exceeds {} buffered bytes; streaming protocol is unavailable",
+                        pending.xid, self.limits.max_bytes
+                    )));
+                }
+                pending.buffered_bytes = pending.buffered_bytes.saturating_add(bytes);
+                pending.changes.push(change);
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn finish(&self) -> SourceResult<()> {
+        if let Some(pending) = &self.pending {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "replication stream ended with open transaction {}",
+                pending.xid
+            )));
+        }
+        Ok(())
+    }
+
+    fn accept_relation(&mut self, relation: &RelationEvent) -> SourceResult<()> {
+        if relation.generation == 0 {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "relation {} has zero schema generation",
+                relation.relation_id
+            )));
+        }
+        if let Some(previous) = self.relation_generations.get(&relation.relation_id)
+            && relation.generation < *previous
+        {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "relation {} generation moved backwards from {} to {}",
+                relation.relation_id, previous, relation.generation
+            )));
+        }
+        self.relation_generations
+            .insert(relation.relation_id, relation.generation);
+        Ok(())
+    }
+
+    fn commit(
+        &mut self,
+        commit_lsn: PgLsn,
+        end_lsn: PgLsn,
+        timestamp: DateTime<Utc>,
+        flags: i8,
+    ) -> SourceResult<Option<AssembledEvent>> {
+        if flags != 0 {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "unsupported pgoutput COMMIT flags {flags}"
+            )));
+        }
+        if end_lsn < commit_lsn {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "commit end LSN {} precedes commit LSN {}",
+                end_lsn, commit_lsn
+            )));
+        }
+        if let Some(previous) = self.last_commit_lsn
+            && end_lsn < previous
+        {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "commit LSN {} moved backwards from {}",
+                end_lsn, previous
+            )));
+        }
+        let pending = self.pending.take().ok_or_else(|| {
+            SourceError::ReplicationProtocol("COMMIT arrived without BEGIN".to_owned())
+        })?;
+        if pending.begin_lsn > end_lsn {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "transaction {} begins after its commit",
+                pending.xid
+            )));
+        }
+        if timestamp < pending.begin_time {
+            return Err(SourceError::ReplicationProtocol(format!(
+                "transaction {} commit timestamp precedes BEGIN timestamp",
+                pending.xid
+            )));
+        }
+        self.last_commit_lsn = Some(end_lsn);
+        Ok(Some(AssembledEvent::Transaction(CommittedTransaction {
+            transaction: SourceTransaction {
+                xid: pending.xid,
+                commit_time: timestamp,
+                final_position: self.identity.position(end_lsn),
+                changes: pending.changes,
+            },
+            commit_lsn,
+        })))
     }
 }
 
@@ -187,10 +567,11 @@ impl TransactionDecoder {
                 })
             }
             LogicalReplicationMessage::Relation(body) => {
-                let event = RelationEvent {
+                let mut event = RelationEvent {
                     relation_id: body.rel_id(),
                     namespace: body.namespace()?.to_owned(),
                     name: body.name()?.to_owned(),
+                    generation: 1,
                     replica_identity: map_replica_identity(body.replica_identity()),
                     columns: body
                         .columns()
@@ -210,6 +591,18 @@ impl TransactionDecoder {
                         })
                         .collect::<SourceResult<Vec<_>>>()?,
                 };
+                if let Some(previous) = self.relations.get(&event.relation_id) {
+                    event.generation = if relation_shape_equal(previous, &event) {
+                        previous.generation
+                    } else {
+                        previous.generation.checked_add(1).ok_or_else(|| {
+                            SourceError::ReplicationProtocol(format!(
+                                "relation {} generation overflow",
+                                event.relation_id
+                            ))
+                        })?
+                    };
+                }
                 self.relations.insert(event.relation_id, event.clone());
                 Ok(DecodedMessage::Relation(event))
             }
@@ -224,6 +617,7 @@ impl TransactionDecoder {
                 self.require_relation(relation_id)?;
                 Ok(DecodedMessage::Insert {
                     relation_id,
+                    generation: self.relation_generation(relation_id)?,
                     new: convert_tuple(body.tuple())?,
                 })
             }
@@ -238,6 +632,7 @@ impl TransactionDecoder {
                     .transpose()?;
                 Ok(DecodedMessage::Update {
                     relation_id,
+                    generation: self.relation_generation(relation_id)?,
                     old_key,
                     new: convert_tuple(body.new_tuple())?,
                 })
@@ -256,6 +651,7 @@ impl TransactionDecoder {
                     })?;
                 Ok(DecodedMessage::Delete {
                     relation_id,
+                    generation: self.relation_generation(relation_id)?,
                     old_key: convert_tuple(old_key)?,
                 })
             }
@@ -318,6 +714,53 @@ impl TransactionDecoder {
         }
         Ok(())
     }
+
+    fn relation_generation(&self, relation_id: u32) -> SourceResult<u64> {
+        self.relations
+            .get(&relation_id)
+            .map(|relation| relation.generation)
+            .ok_or_else(|| {
+                SourceError::ReplicationProtocol(format!(
+                    "DML references unknown relation {relation_id}"
+                ))
+            })
+    }
+}
+
+fn transaction_change_bytes(change: &TransactionChange) -> usize {
+    match change {
+        TransactionChange::Row(row) => match &row.change {
+            RowChange::Insert { new } => tuple_bytes(&new.cells),
+            RowChange::Update { old_key, new } => {
+                old_key
+                    .as_ref()
+                    .map_or(0, |tuple| tuple_bytes(&tuple.cells))
+                    + tuple_bytes(&new.cells)
+            }
+            RowChange::Delete { old_key } => tuple_bytes(&old_key.cells),
+        },
+        TransactionChange::Truncate { relation_ids, .. } => relation_ids.len() * 4,
+        TransactionChange::Ddl(message) => {
+            message.command_tag.len()
+                + message.schema_fingerprint.len()
+                + message.relation_ids.len() * 4
+                + message
+                    .affected_schemas
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+        }
+    }
+}
+
+fn tuple_bytes(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .map(|cell| match cell {
+            Cell::Null | Cell::UnchangedToast => 1,
+            Cell::Text(bytes) | Cell::Binary(bytes) => bytes.len(),
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,9 +892,61 @@ pub fn parse_logical_payload(payload: Bytes) -> SourceResult<LogicalReplicationM
 mod tests {
     use super::*;
 
+    fn timestamp(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn relation(relation_id: u32, generation: u64) -> RelationEvent {
+        RelationEvent {
+            relation_id,
+            namespace: "public".to_owned(),
+            name: "items".to_owned(),
+            generation,
+            replica_identity: WireReplicaIdentityKind::Default,
+            columns: Vec::new(),
+        }
+    }
+
+    fn insert(relation_id: u32, generation: u64) -> DecodedMessage {
+        DecodedMessage::Insert {
+            relation_id,
+            generation,
+            new: Tuple { cells: Vec::new() },
+        }
+    }
+
+    fn begin(lsn: u64, xid: u32) -> DecodedMessage {
+        DecodedMessage::Begin {
+            final_lsn: PgLsn::new(lsn),
+            timestamp: timestamp(1),
+            xid,
+        }
+    }
+
+    fn commit(commit_lsn: u64, end_lsn: u64) -> DecodedMessage {
+        DecodedMessage::Commit {
+            commit_lsn: PgLsn::new(commit_lsn),
+            end_lsn: PgLsn::new(end_lsn),
+            timestamp: timestamp(2),
+            flags: 0,
+        }
+    }
+
     #[test]
     fn unknown_protocol_tag_fails_closed() {
         assert!(parse_logical_payload(Bytes::from_static(b"Z")).is_err());
+    }
+
+    #[test]
+    fn streaming_and_two_phase_tags_fail_closed() {
+        for tag in *b"SEcAP" {
+            assert!(
+                parse_logical_payload(Bytes::from(vec![tag])).is_err(),
+                "unsupported protocol tag {tag:?} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -464,5 +959,149 @@ mod tests {
         // Constructing the fork's private tuple is intentionally impossible here; the mapping
         // is covered by the protocol integration tests. This assertion documents the contract.
         assert_eq!(std::mem::size_of::<Cell>(), std::mem::size_of::<Cell>());
+    }
+
+    #[test]
+    fn assembler_emits_only_on_commit_and_keeps_keepalive_separate() {
+        let identity = SourceNodeIdentity {
+            node_id: 7,
+            system_identifier: 99,
+            timeline: 3,
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assert!(
+            assembler
+                .push(DecodedMessage::Relation(relation(42, 1)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(assembler.push(begin(10, 11)).unwrap().is_none());
+        let heartbeat = assembler
+            .push(DecodedMessage::Keepalive {
+                wal_end: PgLsn::new(12),
+                timestamp_micros: 1,
+                reply_requested: true,
+            })
+            .unwrap();
+        assert!(matches!(heartbeat, Some(AssembledEvent::Keepalive { .. })));
+        assert!(assembler.push(insert(42, 1)).unwrap().is_none());
+        assert!(
+            assembler
+                .push(DecodedMessage::Ddl(DdlMessage {
+                    version: 1,
+                    command_tag: "ALTER TABLE".to_owned(),
+                    relation_ids: vec![42],
+                    affected_schemas: vec!["public".to_owned()],
+                    schema_fingerprint: "abc".to_owned(),
+                }))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            assembler
+                .push(DecodedMessage::Truncate {
+                    relation_ids: vec![42],
+                    options: 3,
+                })
+                .unwrap()
+                .is_none()
+        );
+        let output = assembler.push(commit(20, 21)).unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = output else {
+            panic!("commit did not produce a transaction")
+        };
+        assert_eq!(committed.commit_lsn, PgLsn::new(20));
+        assert_eq!(
+            committed.transaction.final_position,
+            identity.position(PgLsn::new(21))
+        );
+        assert_eq!(committed.transaction.xid, 11);
+        assert_eq!(committed.transaction.changes.len(), 3);
+        assert!(assembler.finish().is_ok());
+    }
+
+    #[test]
+    fn assembler_rejects_invalid_sequence_and_lsn_regression() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assert!(assembler.push(commit(1, 1)).is_err());
+        assert!(assembler.push(begin(2, 1)).unwrap().is_none());
+        assert!(assembler.push(begin(3, 2)).is_err());
+        assert!(assembler.push(commit(4, 5)).unwrap().is_some());
+        assert!(assembler.push(begin(5, 2)).unwrap().is_none());
+        assert!(assembler.push(commit(3, 3)).is_err());
+    }
+
+    #[test]
+    fn assembler_enforces_relation_generation() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler
+            .push(DecodedMessage::Relation(relation(9, 1)))
+            .unwrap();
+        assembler.push(begin(1, 1)).unwrap();
+        assert!(assembler.push(insert(9, 2)).is_err());
+
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler
+            .push(DecodedMessage::Relation(relation(9, 1)))
+            .unwrap();
+        assembler
+            .push(DecodedMessage::Relation(relation(9, 2)))
+            .unwrap();
+        assert_eq!(assembler.relation_generation(9), Some(2));
+        assembler.push(begin(1, 1)).unwrap();
+        assert!(assembler.push(insert(9, 1)).is_err());
+        assert!(assembler.push(insert(9, 2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn assembler_detects_open_transaction_at_end() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler.push(begin(1, 1)).unwrap();
+        assert!(assembler.finish().is_err());
+    }
+
+    #[test]
+    fn assembler_rejects_unstreamable_large_transactions_with_a_clear_error() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let limits = TransactionLimits {
+            max_changes: 1,
+            max_bytes: 1,
+        };
+        let mut assembler = TransactionAssembler::with_limits(identity, limits).unwrap();
+        assembler
+            .push(DecodedMessage::Relation(relation(1, 1)))
+            .unwrap();
+        assembler.push(begin(1, 1)).unwrap();
+        assembler.push(insert(1, 1)).unwrap();
+        assert!(assembler.push(insert(1, 1)).is_err());
+        assert!(
+            TransactionAssembler::with_limits(
+                identity,
+                TransactionLimits {
+                    max_changes: 0,
+                    max_bytes: 1,
+                }
+            )
+            .is_err()
+        );
     }
 }

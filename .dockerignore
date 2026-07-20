@@ -1,0 +1,10 @@
+.git
+.github
+.idea
+target
+web/node_modules
+web/dist
+.env
+etl-server-cloudberry.toml
+*.log
+

@@ -1,0 +1,22 @@
+[server]
+listen = "0.0.0.0:8080"
+secure_cookies = false
+session_ttl_seconds = 28800
+
+[engine]
+reconcile_interval_seconds = 2
+lease_ttl_seconds = 30
+lease_renew_interval_seconds = 10
+restart_backoff_initial_seconds = 1
+restart_backoff_max_seconds = 60
+restart_backoff_reset_seconds = 300
+
+[admin]
+username = "admin"
+password_hash = "$argon2id$v=19$m=16384,t=2,p=1$cGcyY2J0ZXN0c2FsdDEyMw$HJwLH1iZRaNJzPkUWMiK8TfSxXA0nQMcZIw8XJN59wo"
+
+[control]
+database_url_env = "ETL_CONTROL_DATABASE_URL"
+
+[security]
+master_key_env = "ETL_MASTER_KEY"

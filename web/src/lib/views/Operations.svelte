@@ -5,7 +5,7 @@
   import EmptyState from '../components/EmptyState.svelte';
   import InlineNotice from '../components/InlineNotice.svelte';
   import StatusBadge from '../components/StatusBadge.svelte';
-  import { label, truncateMiddle } from '../format';
+  import { formatBytes, formatDateTime, label, truncateMiddle } from '../format';
   import type { Operation } from '../types';
 
   let { refreshVersion, onApiState }: { refreshVersion: number; onApiState: (online: boolean) => void } = $props();
@@ -36,7 +36,7 @@
 <div class="page-content">
   <div class="page-heading">
     <div><p class="eyebrow">Active workload</p><h2>Operations</h2></div>
-    <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh operations" aria-label="Refresh operations"><RefreshCw class:spin={loading} size={18} /></button>
+    <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh operations" aria-label="Refresh operations"><RefreshCw class={loading ? 'spin' : undefined} size={18} /></button>
   </div>
 
   {#if error}<InlineNotice tone="error" title="Operations could not be loaded" detail={error} actionLabel="Retry" onAction={load} />{/if}
@@ -45,13 +45,16 @@
     {#if operations.length > 0}
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Operation</th><th>Pipeline ID</th><th>Status</th></tr></thead>
+          <thead><tr><th>Operation</th><th>Pipeline ID</th><th>Status</th><th>Phase</th><th>Lag</th><th>Updated</th></tr></thead>
           <tbody>
             {#each operations as operation}
               <tr>
-                <td data-label="Operation"><strong>{label(operation.operation_type)}</strong></td>
-                <td data-label="Pipeline ID" class="mono">{truncateMiddle(operation.id, 32)}</td>
+                <td data-label="Operation"><strong>{label(operation.operation_type)}</strong><small class="mono">{truncateMiddle(operation.id, 24)}</small></td>
+                <td data-label="Pipeline ID" class="mono">{operation.pipeline_id ? truncateMiddle(operation.pipeline_id, 32) : '—'}</td>
                 <td data-label="Status"><StatusBadge value={operation.state} compact /></td>
+                <td data-label="Phase">{operation.runtime ? label(operation.runtime.phase) : '—'}</td>
+                <td data-label="Lag">{formatBytes(operation.runtime?.estimated_byte_lag ?? undefined)}</td>
+                <td data-label="Updated">{formatDateTime(operation.updated_at ?? undefined)}</td>
               </tr>
             {/each}
           </tbody>

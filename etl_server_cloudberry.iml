@@ -9,8 +9,11 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/engine/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/metadata/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/metadata/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/source-postgres/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/source-postgres/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/target-cloudberry/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/target-cloudberry/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>

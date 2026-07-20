@@ -79,6 +79,9 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
 
   const payload = await decodeResponse(response);
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('etl:unauthorized'));
+    }
     const details = errorDetails(payload, `${response.status} ${response.statusText}`);
     throw new ApiError(details.message, response.status, details.code);
   }

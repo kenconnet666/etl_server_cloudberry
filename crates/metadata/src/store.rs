@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cloudberry_etl_core::{
-    id::{PipelineId, SourceId, TargetId},
+    id::{OperationId, PipelineId, SourceId, TargetId},
     mapping::SourcePrefix,
     pipeline::SourceTopology,
 };
@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 use crate::{
     crypto::EncryptedSecret,
-    model::{PipelineDefinition, PipelineLease, SourceProfile, TargetProfile},
+    model::{
+        OperationRecord, PipelineDefinition, PipelineLease, RebuildRequest, SourceProfile,
+        TargetProfile,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -40,6 +43,21 @@ pub trait ControlStore: Send + Sync {
     async fn list_targets(&self) -> Result<Vec<TargetProfile>, StoreError>;
     async fn put_pipeline(&self, pipeline: &PipelineDefinition) -> Result<(), StoreError>;
     async fn list_pipelines(&self) -> Result<Vec<PipelineDefinition>, StoreError>;
+    async fn set_pipeline_desired_running(
+        &self,
+        pipeline_id: PipelineId,
+        desired_running: bool,
+    ) -> Result<Option<PipelineDefinition>, StoreError>;
+    async fn request_pipeline_rebuild(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<Option<RebuildRequest>, StoreError>;
+    async fn complete_pipeline_rebuilds(
+        &self,
+        pipeline_id: PipelineId,
+        snapshot_generation: i64,
+    ) -> Result<u64, StoreError>;
+    async fn list_operations(&self) -> Result<Vec<OperationRecord>, StoreError>;
     async fn try_acquire_lease(
         &self,
         pipeline_id: PipelineId,
@@ -73,15 +91,16 @@ impl ControlStore for PostgresControlStore {
     async fn put_source(&self, source: &SourceProfile) -> Result<(), StoreError> {
         self.client
             .execute(
-                "INSERT INTO cloudberry_etl_control.sources (\
-                    id, name, prefix, database_name, topology, dsn_key_version, dsn_nonce,\
-                    dsn_ciphertext, settings, enabled, created_at, updated_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)\
-                 ON CONFLICT (id) DO UPDATE SET\
-                    name=EXCLUDED.name, prefix=EXCLUDED.prefix, database_name=EXCLUDED.database_name,\
-                    topology=EXCLUDED.topology, dsn_key_version=EXCLUDED.dsn_key_version,\
-                    dsn_nonce=EXCLUDED.dsn_nonce, dsn_ciphertext=EXCLUDED.dsn_ciphertext,\
-                    settings=EXCLUDED.settings, enabled=EXCLUDED.enabled, updated_at=clock_timestamp()",
+                r#"INSERT INTO cloudberry_etl_control.sources (
+                    id, name, prefix, database_name, topology, dsn_key_version, dsn_nonce,
+                    dsn_ciphertext, settings, enabled, created_at, updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (id) DO UPDATE SET
+                    name=EXCLUDED.name, prefix=EXCLUDED.prefix, database_name=EXCLUDED.database_name,
+                    topology=EXCLUDED.topology, dsn_key_version=EXCLUDED.dsn_key_version,
+                    dsn_nonce=EXCLUDED.dsn_nonce, dsn_ciphertext=EXCLUDED.dsn_ciphertext,
+                    settings=EXCLUDED.settings, enabled=EXCLUDED.enabled,
+                    updated_at=clock_timestamp()"#,
                 &[
                     &source.id.as_uuid(),
                     &source.name,
@@ -104,9 +123,10 @@ impl ControlStore for PostgresControlStore {
     async fn list_sources(&self) -> Result<Vec<SourceProfile>, StoreError> {
         self.client
             .query(
-                "SELECT id,name,prefix,database_name,topology,dsn_key_version,dsn_nonce,\
-                        dsn_ciphertext,settings,enabled,created_at,updated_at\
-                 FROM cloudberry_etl_control.sources ORDER BY name",
+                r#"SELECT id,name,prefix,database_name,topology,dsn_key_version,dsn_nonce,
+                          dsn_ciphertext,settings,enabled,created_at,updated_at
+                   FROM cloudberry_etl_control.sources
+                   ORDER BY name"#,
                 &[],
             )
             .await?
@@ -118,13 +138,15 @@ impl ControlStore for PostgresControlStore {
     async fn put_target(&self, target: &TargetProfile) -> Result<(), StoreError> {
         self.client
             .execute(
-                "INSERT INTO cloudberry_etl_control.targets (\
-                    id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,settings,enabled,created_at,updated_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)\
-                 ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,database_name=EXCLUDED.database_name,\
-                    dsn_key_version=EXCLUDED.dsn_key_version,dsn_nonce=EXCLUDED.dsn_nonce,\
-                    dsn_ciphertext=EXCLUDED.dsn_ciphertext,settings=EXCLUDED.settings,\
-                    enabled=EXCLUDED.enabled,updated_at=clock_timestamp()",
+                r#"INSERT INTO cloudberry_etl_control.targets (
+                    id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,
+                    settings,enabled,created_at,updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                ON CONFLICT (id) DO UPDATE SET
+                    name=EXCLUDED.name,database_name=EXCLUDED.database_name,
+                    dsn_key_version=EXCLUDED.dsn_key_version,dsn_nonce=EXCLUDED.dsn_nonce,
+                    dsn_ciphertext=EXCLUDED.dsn_ciphertext,settings=EXCLUDED.settings,
+                    enabled=EXCLUDED.enabled,updated_at=clock_timestamp()"#,
                 &[
                     &target.id.as_uuid(),
                     &target.name,
@@ -146,9 +168,10 @@ impl ControlStore for PostgresControlStore {
         Ok(self
             .client
             .query(
-                "SELECT id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,\
-                        settings,enabled,created_at,updated_at\
-                 FROM cloudberry_etl_control.targets ORDER BY name",
+                r#"SELECT id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,
+                          settings,enabled,created_at,updated_at
+                   FROM cloudberry_etl_control.targets
+                   ORDER BY name"#,
                 &[],
             )
             .await?
@@ -163,26 +186,32 @@ impl ControlStore for PostgresControlStore {
             "name": pipeline.name,
             "source_id": pipeline.source_id,
             "target_id": pipeline.target_id,
-            "desired_running": pipeline.desired_running,
             "config_revision": pipeline.config_revision,
+            "snapshot_generation": pipeline.snapshot_generation,
             "settings": pipeline.settings,
         });
         let affected = self
             .client
             .execute(
-                "WITH changed AS (\
-                    INSERT INTO cloudberry_etl_control.pipelines (\
-                        id,name,source_id,target_id,desired_running,config_revision,settings,created_at,updated_at\
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)\
-                    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,source_id=EXCLUDED.source_id,\
-                        target_id=EXCLUDED.target_id,desired_running=EXCLUDED.desired_running,\
-                        config_revision=EXCLUDED.config_revision,settings=EXCLUDED.settings,\
-                        updated_at=clock_timestamp()\
-                    WHERE cloudberry_etl_control.pipelines.config_revision < EXCLUDED.config_revision\
-                    RETURNING id,config_revision\
-                 )\
-                 INSERT INTO cloudberry_etl_control.config_revisions (pipeline_id,revision,definition)\
-                 SELECT id,config_revision,$10 FROM changed ON CONFLICT DO NOTHING",
+                r#"WITH changed AS (
+                    INSERT INTO cloudberry_etl_control.pipelines (
+                        id,name,source_id,target_id,desired_running,config_revision,
+                        snapshot_generation,settings,created_at,updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    ON CONFLICT (id) DO UPDATE SET
+                        name=EXCLUDED.name,source_id=EXCLUDED.source_id,
+                        target_id=EXCLUDED.target_id,
+                        config_revision=EXCLUDED.config_revision,
+                        snapshot_generation=EXCLUDED.snapshot_generation,
+                        settings=EXCLUDED.settings,
+                        updated_at=clock_timestamp()
+                    WHERE cloudberry_etl_control.pipelines.config_revision < EXCLUDED.config_revision
+                      AND cloudberry_etl_control.pipelines.snapshot_generation < EXCLUDED.snapshot_generation
+                    RETURNING id,config_revision
+                )
+                INSERT INTO cloudberry_etl_control.config_revisions (pipeline_id,revision,definition)
+                SELECT id,config_revision,$11 FROM changed
+                ON CONFLICT DO NOTHING"#,
                 &[
                     &pipeline.id.as_uuid(),
                     &pipeline.name,
@@ -190,6 +219,7 @@ impl ControlStore for PostgresControlStore {
                     &pipeline.target_id.as_uuid(),
                     &pipeline.desired_running,
                     &pipeline.config_revision,
+                    &pipeline.snapshot_generation,
                     &pipeline.settings,
                     &pipeline.created_at,
                     &pipeline.updated_at,
@@ -207,13 +237,141 @@ impl ControlStore for PostgresControlStore {
         Ok(self
             .client
             .query(
-                "SELECT id,name,source_id,target_id,desired_running,config_revision,settings,created_at,updated_at\
-                 FROM cloudberry_etl_control.pipelines ORDER BY name",
+                r#"SELECT id,name,source_id,target_id,desired_running,config_revision,
+                          snapshot_generation,settings,created_at,updated_at
+                   FROM cloudberry_etl_control.pipelines
+                   ORDER BY name"#,
                 &[],
             )
             .await?
             .into_iter()
             .map(pipeline_from_row)
+            .collect())
+    }
+
+    async fn set_pipeline_desired_running(
+        &self,
+        pipeline_id: PipelineId,
+        desired_running: bool,
+    ) -> Result<Option<PipelineDefinition>, StoreError> {
+        let row = self
+            .client
+            .query_opt(
+                r#"UPDATE cloudberry_etl_control.pipelines
+                      SET desired_running=$2, updated_at=clock_timestamp()
+                    WHERE id=$1
+                RETURNING id,name,source_id,target_id,desired_running,config_revision,
+                          snapshot_generation,settings,created_at,updated_at"#,
+                &[&pipeline_id.as_uuid(), &desired_running],
+            )
+            .await?;
+        Ok(row.map(pipeline_from_row))
+    }
+
+    async fn request_pipeline_rebuild(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<Option<RebuildRequest>, StoreError> {
+        let operation_id = OperationId::new();
+        let row = self
+            .client
+            .query_opt(
+                r#"WITH bumped AS (
+                         UPDATE cloudberry_etl_control.pipelines
+                            SET snapshot_generation=snapshot_generation + 1,
+                                updated_at=clock_timestamp()
+                          WHERE id=$1
+                         RETURNING id,name,source_id,target_id,desired_running,config_revision,
+                                   snapshot_generation,settings,created_at,updated_at
+                     ), recorded AS (
+                         INSERT INTO cloudberry_etl_control.operations
+                             (id,pipeline_id,operation_type,state,detail)
+                         SELECT $2,id,'rebuild','requested',
+                                jsonb_build_object('snapshot_generation', snapshot_generation)
+                           FROM bumped
+                         RETURNING id
+                     ), audited AS (
+                         INSERT INTO cloudberry_etl_control.audit_log
+                             (action,object_type,object_id,detail)
+                         SELECT 'pipeline.rebuild_requested','pipeline',id::text,
+                                jsonb_build_object(
+                                    'operation_id', $2::uuid,
+                                    'snapshot_generation', snapshot_generation
+                                )
+                           FROM bumped
+                         RETURNING id
+                     )
+                     SELECT bumped.id,bumped.name,bumped.source_id,bumped.target_id,
+                            bumped.desired_running,bumped.config_revision,
+                            bumped.snapshot_generation,bumped.settings,bumped.created_at,
+                            bumped.updated_at,recorded.id AS operation_id
+                       FROM bumped
+                       JOIN recorded ON true"#,
+                &[&pipeline_id.as_uuid(), &operation_id.as_uuid()],
+            )
+            .await?;
+        Ok(row.map(|row| {
+            let operation_id = OperationId::from_uuid(row.get("operation_id"));
+            RebuildRequest {
+                pipeline: pipeline_from_row(row),
+                operation_id,
+            }
+        }))
+    }
+
+    async fn complete_pipeline_rebuilds(
+        &self,
+        pipeline_id: PipelineId,
+        snapshot_generation: i64,
+    ) -> Result<u64, StoreError> {
+        let row = self
+            .client
+            .query_one(
+                r#"WITH completed AS (
+                       UPDATE cloudberry_etl_control.operations
+                          SET state='completed',
+                              detail=detail || jsonb_build_object(
+                                  'completed_snapshot_generation', $2::bigint
+                              ),
+                              updated_at=clock_timestamp()
+                        WHERE pipeline_id=$1
+                          AND operation_type='rebuild'
+                          AND state='requested'
+                          AND jsonb_typeof(detail->'snapshot_generation')='number'
+                          AND (detail->>'snapshot_generation')::bigint <= $2
+                      RETURNING id
+                   ), audited AS (
+                       INSERT INTO cloudberry_etl_control.audit_log
+                           (action,object_type,object_id,detail)
+                       SELECT 'pipeline.rebuild_completed','pipeline',$1::uuid::text,
+                              jsonb_build_object(
+                                  'operation_id', id,
+                                  'snapshot_generation', $2::bigint
+                              )
+                         FROM completed
+                       RETURNING id
+                   )
+                   SELECT count(*)::bigint FROM completed"#,
+                &[&pipeline_id.as_uuid(), &snapshot_generation],
+            )
+            .await?;
+        let completed: i64 = row.try_get(0)?;
+        Ok(u64::try_from(completed).expect("PostgreSQL count cannot be negative"))
+    }
+
+    async fn list_operations(&self) -> Result<Vec<OperationRecord>, StoreError> {
+        Ok(self
+            .client
+            .query(
+                r#"SELECT id,pipeline_id,operation_type,state,detail,created_at,updated_at
+                     FROM cloudberry_etl_control.operations
+                    ORDER BY created_at DESC
+                    LIMIT 200"#,
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(operation_from_row)
             .collect())
     }
 
@@ -227,16 +385,16 @@ impl ControlStore for PostgresControlStore {
         let row = self
             .client
             .query_opt(
-                "INSERT INTO cloudberry_etl_control.pipeline_leases (\
-                    pipeline_id,holder_id,fencing_token,expires_at\
-                 ) VALUES ($1,$2,1,clock_timestamp() + $3 * interval '1 second')\
-                 ON CONFLICT (pipeline_id) DO UPDATE SET\
-                    holder_id=EXCLUDED.holder_id,\
-                    fencing_token=cloudberry_etl_control.pipeline_leases.fencing_token + 1,\
-                    expires_at=EXCLUDED.expires_at,updated_at=clock_timestamp()\
-                 WHERE cloudberry_etl_control.pipeline_leases.expires_at <= clock_timestamp()\
-                    OR cloudberry_etl_control.pipeline_leases.holder_id = EXCLUDED.holder_id\
-                 RETURNING pipeline_id,holder_id,fencing_token,expires_at",
+                r#"INSERT INTO cloudberry_etl_control.pipeline_leases (
+                    pipeline_id,holder_id,fencing_token,expires_at
+                ) VALUES ($1,$2,1,clock_timestamp() + $3 * interval '1 second')
+                ON CONFLICT (pipeline_id) DO UPDATE SET
+                    holder_id=EXCLUDED.holder_id,
+                    fencing_token=cloudberry_etl_control.pipeline_leases.fencing_token + 1,
+                    expires_at=EXCLUDED.expires_at,updated_at=clock_timestamp()
+                WHERE cloudberry_etl_control.pipeline_leases.expires_at <= clock_timestamp()
+                   OR cloudberry_etl_control.pipeline_leases.holder_id = EXCLUDED.holder_id
+                RETURNING pipeline_id,holder_id,fencing_token,expires_at"#,
                 &[&pipeline_id.as_uuid(), &holder_id, &ttl_seconds],
             )
             .await?;
@@ -252,11 +410,12 @@ impl ControlStore for PostgresControlStore {
         let row = self
             .client
             .query_opt(
-                "UPDATE cloudberry_etl_control.pipeline_leases SET\
-                    expires_at=clock_timestamp() + $4 * interval '1 second',updated_at=clock_timestamp()\
-                 WHERE pipeline_id=$1 AND holder_id=$2 AND fencing_token=$3\
-                    AND expires_at > clock_timestamp()\
-                 RETURNING pipeline_id,holder_id,fencing_token,expires_at",
+                r#"UPDATE cloudberry_etl_control.pipeline_leases SET
+                    expires_at=clock_timestamp() + $4 * interval '1 second',
+                    updated_at=clock_timestamp()
+                   WHERE pipeline_id=$1 AND holder_id=$2 AND fencing_token=$3
+                     AND expires_at > clock_timestamp()
+                   RETURNING pipeline_id,holder_id,fencing_token,expires_at"#,
                 &[
                     &lease.pipeline_id.as_uuid(),
                     &lease.holder_id,
@@ -271,8 +430,10 @@ impl ControlStore for PostgresControlStore {
     async fn release_lease(&self, lease: &PipelineLease) -> Result<(), StoreError> {
         self.client
             .execute(
-                "DELETE FROM cloudberry_etl_control.pipeline_leases\
-                 WHERE pipeline_id=$1 AND holder_id=$2 AND fencing_token=$3",
+                r#"UPDATE cloudberry_etl_control.pipeline_leases
+                      SET expires_at = clock_timestamp(),
+                          updated_at = clock_timestamp()
+                    WHERE pipeline_id=$1 AND holder_id=$2 AND fencing_token=$3"#,
                 &[
                     &lease.pipeline_id.as_uuid(),
                     &lease.holder_id,
@@ -354,7 +515,22 @@ fn pipeline_from_row(row: Row) -> PipelineDefinition {
         target_id: TargetId::from_uuid(row.get("target_id")),
         desired_running: row.get("desired_running"),
         config_revision: row.get("config_revision"),
+        snapshot_generation: row.get("snapshot_generation"),
         settings: row.get("settings"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+fn operation_from_row(row: Row) -> OperationRecord {
+    OperationRecord {
+        id: OperationId::from_uuid(row.get("id")),
+        pipeline_id: row
+            .get::<_, Option<Uuid>>("pipeline_id")
+            .map(PipelineId::from_uuid),
+        operation_type: row.get("operation_type"),
+        state: row.get("state"),
+        detail: row.get("detail"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

@@ -1,0 +1,79 @@
+name: pg2cb-citus-it
+
+x-citus-node: &citus-node
+  image: citusdata/citus:14.1.0@sha256:100bb457c798d7b50de1ece819fad7109744c0ed812dc63fb76a90e99767602f
+  restart: unless-stopped
+  environment: &citus-environment
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: pg2cb_citus_test_only
+    POSTGRES_DB: source
+    PGUSER: postgres
+    PGPASSWORD: pg2cb_citus_test_only
+    PGDATABASE: source
+  command: &postgres-command
+    - postgres
+    - -c
+    - shared_preload_libraries=citus
+    - -c
+    - wal_level=logical
+    - -c
+    - max_replication_slots=32
+    - -c
+    - max_wal_senders=32
+    - -c
+    - citus.enable_change_data_capture=on
+  healthcheck: &citus-healthcheck
+    test:
+      - CMD-SHELL
+      - >-
+        pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" &&
+        test "$$(psql -X -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -Atqc
+        "SELECT count(*) FROM pg_extension WHERE extname = 'citus'")" = "1"
+    interval: 2s
+    timeout: 5s
+    retries: 60
+    start_period: 8s
+  networks:
+    - citus
+
+services:
+  worker1:
+    <<: *citus-node
+    container_name: pg2cb-citus-it-worker1
+    ports:
+      - "127.0.0.1:55441:5432"
+    volumes:
+      - worker1-data:/var/lib/postgresql
+      - ./init/worker/001-worker.sql:/docker-entrypoint-initdb.d/010-pg2cb-worker.sql:ro
+
+  worker2:
+    <<: *citus-node
+    container_name: pg2cb-citus-it-worker2
+    ports:
+      - "127.0.0.1:55442:5432"
+    volumes:
+      - worker2-data:/var/lib/postgresql
+      - ./init/worker/001-worker.sql:/docker-entrypoint-initdb.d/010-pg2cb-worker.sql:ro
+
+  coordinator:
+    <<: *citus-node
+    container_name: pg2cb-citus-it-coordinator
+    depends_on:
+      worker1:
+        condition: service_healthy
+      worker2:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:55440:5432"
+    volumes:
+      - coordinator-data:/var/lib/postgresql
+      - ./init/coordinator/001-cluster.sql:/docker-entrypoint-initdb.d/010-pg2cb-cluster.sql:ro
+
+networks:
+  citus:
+    name: pg2cb-citus-it-network
+
+volumes:
+  coordinator-data:
+  worker1-data:
+  worker2-data:

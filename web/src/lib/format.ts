@@ -12,7 +12,10 @@ export function formatBytes(value?: number): string {
   if (value === undefined || !Number.isFinite(value)) return '—';
   if (value === 0) return '0 B';
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const exponent = Math.min(Math.floor(Math.log(Math.abs(value)) / Math.log(1024)), units.length - 1);
+  const exponent = Math.min(
+    Math.max(0, Math.floor(Math.log(Math.abs(value)) / Math.log(1024))),
+    units.length - 1
+  );
   const amount = value / 1024 ** exponent;
   return `${amount >= 10 || exponent === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[exponent]}`;
 }

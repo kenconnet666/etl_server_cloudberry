@@ -9,6 +9,13 @@
 
 本契约使用白名单。未明确列为 supported 的能力都视为 validation-gated 或 rejected，不能自动降级。
 
+## V3 当前执行边界
+
+- 只有 `Standalone` topology 已接入 pipeline runtime。
+- `PhysicalHa` 和 `Citus` 当前会被 runtime 明确拒绝。相应章节定义准入目标，不表示已经具备端到端 snapshot/WAL/apply 能力。
+- 对配置范围内的表采用严格 fail-closed：发现任意不合格表即拒绝整条 pipeline 启动，且不会静默排除该表。
+- 逐表持久化 `BLOCKED` 并继续复制其他合格表是后续能力；在 metadata 和恢复语义完成前不得按目标契约宣称已实现。
+
 ## Database 级契约
 
 一个 pipeline 精确对应一个 PostgreSQL database。一个实例上的多个 database 使用多个 pipeline，因为 publication、logical slot、catalog 和 LSN 都是 database 级边界。
@@ -32,11 +39,11 @@
 
 ### Standalone
 
-支持单 primary。初始快照和 logical replication 都从 primary 执行。
+V3 当前运行时支持单 primary。初始快照和 logical replication 都从 primary 执行。
 
 ### Primary + physical standby
 
-支持一个 primary 和多个物理从库，但它们共同构成一个 source node identity：
+目标契约支持一个 primary 和多个物理从库，但它们共同构成一个 source node identity。V3 runtime 尚未启用该 topology：
 
 - 只消费当前 primary，禁止同时消费 standby。
 - 使用稳定 primary endpoint。
@@ -46,7 +53,7 @@
 
 ### Citus
 
-Citus coordinator 与每个 active worker 都必须：
+本节是 validation-gated 目标契约；V3 尚无可运行的 Citus pipeline。未来 Citus coordinator 与每个 active worker 都必须：
 
 - 使用 PostgreSQL 18 和兼容的 Citus 14.1.x。
 - 设置 `wal_level=logical` 和足够的 slot/walsender。
@@ -94,7 +101,7 @@ Cloudberry 目标表首批固定为 heap，`DISTRIBUTED BY` 使用源 primary ke
 - 需要目标 trigger、rule、RLS、sequence ownership 或外部对象才能保持行语义的表。
 - 无法验证一致 equality/hash/collation 行为的主键。
 
-拒绝一张表默认只把该表置为 `BLOCKED`，其他表继续。publication、slot、node coverage 或 source identity 的全局错误阻塞整个 pipeline。
+当前 V3 拒绝任意一张配置范围内的表时会阻塞整条 pipeline，其他表不会继续；这一行为是保守的 fail-closed，而不是静默跳过。目标行为是在 durable per-table state 完成后只把该表置为 `BLOCKED`、让其他合格表继续。publication、slot、node coverage 或 source identity 的全局错误始终阻塞整个 pipeline。
 
 ## 主键与行变更
 

@@ -1,3 +1,5 @@
 mod bootstrap;
 
-pub use bootstrap::{AdminConfig, BootstrapConfig, ControlConfig, SecurityConfig, ServerConfig};
+pub use bootstrap::{
+    AdminConfig, BootstrapConfig, ControlConfig, EngineConfig, SecurityConfig, ServerConfig,
+};

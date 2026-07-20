@@ -10,7 +10,7 @@ use cloudberry_etl_core::schema::{
     ColumnSchema, GeneratedColumn, IdentityColumn, PgType, PgTypeKind, QualifiedName,
     ReplicaIdentity, TableKind, TableSchema,
 };
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, GenericClient, Row};
 
 use crate::{SourceError, SourceResult, citus::CitusTopology};
 
@@ -50,6 +50,10 @@ pub struct PreflightReport {
     pub wal_level: String,
     pub max_replication_slots: i64,
     pub max_wal_senders: i64,
+    /// Server setting is surfaced so operators can size the non-streaming transaction buffer.
+    pub logical_decoding_work_mem: String,
+    /// `-1` means unlimited slot retention and requires an explicit operational alert.
+    pub max_slot_wal_keep_size: String,
     pub existing_logical_slots: i64,
     pub citus_version: Option<String>,
 }
@@ -60,6 +64,18 @@ pub struct CatalogOptions {
     pub include_schemas: Option<HashSet<String>>,
     pub exclude_schemas: HashSet<String>,
     pub include_partitions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedTable {
+    pub name: QualifiedName,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInventory {
+    pub supported: Vec<TableSchema>,
+    pub rejected: Vec<RejectedTable>,
 }
 
 impl Default for CatalogOptions {
@@ -122,6 +138,8 @@ pub async fn preflight(
     }
     let max_replication_slots = show_i64(client, "max_replication_slots").await?;
     let max_wal_senders = show_i64(client, "max_wal_senders").await?;
+    let logical_decoding_work_mem = show(client, "logical_decoding_work_mem").await?;
+    let max_slot_wal_keep_size = show(client, "max_slot_wal_keep_size").await?;
     if options.require_logical_replication && (max_replication_slots < 1 || max_wal_senders < 1) {
         return Err(SourceError::contract(
             "max_replication_slots and max_wal_senders must both be positive",
@@ -135,8 +153,12 @@ pub async fn preflight(
 
     let identity_row = client
         .query_one(
-            "SELECT system_identifier::text, timeline_id::int8, current_database(), pg_is_in_recovery() \
-             FROM pg_control_system()",
+            r#"SELECT system.system_identifier::text,
+                      checkpoint.timeline_id::int8,
+                      current_database(),
+                      pg_is_in_recovery()
+                 FROM pg_control_system() AS system
+                 CROSS JOIN pg_control_checkpoint() AS checkpoint"#,
             &[],
         )
         .await?;
@@ -163,16 +185,66 @@ pub async fn preflight(
         wal_level,
         max_replication_slots,
         max_wal_senders,
+        logical_decoding_work_mem,
+        max_slot_wal_keep_size,
         existing_logical_slots,
         citus_version,
     })
 }
 
 /// Load all eligible user tables and their strongly typed column schemas.
-pub async fn load_tables(
-    client: &Client,
+pub async fn load_tables<C>(client: &C, options: &CatalogOptions) -> SourceResult<Vec<TableSchema>>
+where
+    C: GenericClient + Sync,
+{
+    let inventory = inspect_tables(client, options).await?;
+    if let Some(rejected) = inventory.rejected.first() {
+        return Err(SourceError::contract(format!(
+            "table {} is not eligible for replication: {}",
+            rejected.name, rejected.reason
+        )));
+    }
+    Ok(inventory.supported)
+}
+
+/// Inspect the whole configured scope without letting one ineligible table hide the others.
+///
+/// Callers that implement whole-database replication should publish only `supported` tables and
+/// persist every `rejected` entry as a blocked table. [`load_tables`] remains strict for callers
+/// that require an all-or-nothing source contract.
+pub async fn inspect_tables<C>(client: &C, options: &CatalogOptions) -> SourceResult<TableInventory>
+where
+    C: GenericClient + Sync,
+{
+    let tables = load_table_candidates(client, options).await?;
+    Ok(classify_tables(tables))
+}
+
+fn classify_tables(tables: Vec<TableSchema>) -> TableInventory {
+    let mut supported = Vec::with_capacity(tables.len());
+    let mut rejected = Vec::new();
+    for table in tables {
+        match table.validate_supported() {
+            Ok(()) => supported.push(table),
+            Err(error) => rejected.push(RejectedTable {
+                name: table.name,
+                reason: error.to_string(),
+            }),
+        }
+    }
+    TableInventory {
+        supported,
+        rejected,
+    }
+}
+
+async fn load_table_candidates<C>(
+    client: &C,
     options: &CatalogOptions,
-) -> SourceResult<Vec<TableSchema>> {
+) -> SourceResult<Vec<TableSchema>>
+where
+    C: GenericClient + Sync,
+{
     let type_descriptors = load_type_descriptors(client).await?;
     let rows = client
         .query(
@@ -189,7 +261,9 @@ pub async fn load_tables(
                     a.attgenerated::text,
                     a.attidentity::text,
                     c.relreplident::text,
-                    CASE WHEN i.indisprimary THEN array_position(i.indkey::int2[], a.attnum)::int4 END AS pk_ordinal,
+                    CASE WHEN i.indisprimary
+                         THEN (array_position(i.indkey::int2[], a.attnum) + 1)::int4
+                    END AS pk_ordinal,
                     coll_ns.nspname AS collation_schema,
                     coll.collname AS collation_name,
                     COALESCE((SELECT partattrs::text FROM pg_partitioned_table p WHERE p.partrelid = c.oid), '{}') AS partition_attrs
@@ -278,11 +352,6 @@ pub async fn load_tables(
         });
     }
 
-    for table in &tables {
-        table
-            .validate_supported()
-            .map_err(|error| SourceError::contract(error.to_string()))?;
-    }
     Ok(tables)
 }
 
@@ -292,8 +361,24 @@ pub async fn load_tables_with_citus(
     options: &CatalogOptions,
     topology: &CitusTopology,
 ) -> SourceResult<Vec<TableSchema>> {
+    load_tables_with_citus_options(
+        client,
+        options,
+        topology,
+        &crate::citus::CitusOptions::default(),
+    )
+    .await
+}
+
+pub async fn load_tables_with_citus_options(
+    client: &Client,
+    options: &CatalogOptions,
+    topology: &CitusTopology,
+    citus_options: &crate::citus::CitusOptions,
+) -> SourceResult<Vec<TableSchema>> {
     let mut tables = load_tables(client, options).await?;
-    crate::citus::apply_table_metadata(client, &mut tables, topology).await?;
+    crate::citus::apply_table_metadata_with_options(client, &mut tables, topology, citus_options)
+        .await?;
     for table in &tables {
         table
             .validate_supported()
@@ -302,7 +387,27 @@ pub async fn load_tables_with_citus(
     Ok(tables)
 }
 
-async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, TypeDescriptor>> {
+async fn load_type_descriptors<C>(client: &C) -> SourceResult<HashMap<u32, TypeDescriptor>>
+where
+    C: GenericClient + Sync,
+{
+    let constraint_rows = client
+        .query(
+            "SELECT contypid::int8, pg_get_constraintdef(oid, true)
+               FROM pg_constraint
+              WHERE contypid <> 0
+              ORDER BY contypid, oid",
+            &[],
+        )
+        .await?;
+    let mut constraints_by_type: HashMap<u32, Vec<String>> = HashMap::new();
+    for row in constraint_rows {
+        let oid = parse_u32_value(row.try_get::<_, i64>(0)?, "domain type oid")?;
+        constraints_by_type
+            .entry(oid)
+            .or_default()
+            .push(row.try_get(1)?);
+    }
     let rows = client
         .query(
             "SELECT t.oid::int8, ns.nspname, t.typname, t.typtype::text,
@@ -328,18 +433,6 @@ async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, Typ
             .try_get::<_, Option<i64>>(5)?
             .map(|value| parse_u32_value(value, "element type oid"))
             .transpose()?;
-        let constraints = client
-            .query(
-                "SELECT pg_get_constraintdef(oid, true)
-                   FROM pg_constraint
-                  WHERE contypid = $1::oid
-                  ORDER BY oid",
-                &[&i64::from(oid)],
-            )
-            .await?
-            .into_iter()
-            .map(|constraint| constraint.try_get(0))
-            .collect::<Result<Vec<String>, _>>()?;
         descriptors.insert(
             oid,
             TypeDescriptor {
@@ -350,7 +443,7 @@ async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, Typ
                 base_oid,
                 element_oid,
                 labels: row.try_get(6)?,
-                constraints,
+                constraints: constraints_by_type.remove(&oid).unwrap_or_default(),
             },
         );
     }
@@ -599,11 +692,52 @@ fn parse_u32_value(value: i64, name: &str) -> SourceResult<u32> {
 
 #[cfg(test)]
 mod tests {
+    use cloudberry_etl_core::schema::{
+        ColumnSchema, GeneratedColumn, IdentityColumn, PgType, PgTypeKind,
+    };
+
     use super::*;
+
+    fn candidate(name: &str, primary_key_ordinal: Option<u16>) -> TableSchema {
+        TableSchema {
+            relation_id: if primary_key_ordinal.is_some() { 1 } else { 2 },
+            generation: 1,
+            name: QualifiedName::new("public", name).unwrap(),
+            kind: TableKind::Ordinary,
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![ColumnSchema {
+                attnum: 1,
+                name: "id".to_owned(),
+                data_type: PgType {
+                    oid: 23,
+                    name: QualifiedName::new("pg_catalog", "int4").unwrap(),
+                    kind: PgTypeKind::Int4,
+                },
+                nullable: false,
+                primary_key_ordinal,
+                generated: GeneratedColumn::None,
+                identity: IdentityColumn::None,
+                collation: None,
+            }],
+            distribution_key: Vec::new(),
+            partition_key: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inventory_keeps_supported_tables_when_another_table_is_rejected() {
+        let inventory = classify_tables(vec![candidate("good", Some(1)), candidate("bad", None)]);
+        assert_eq!(inventory.supported.len(), 1);
+        assert_eq!(inventory.supported[0].name.name, "good");
+        assert_eq!(inventory.rejected.len(), 1);
+        assert_eq!(inventory.rejected[0].name.name, "bad");
+        assert!(inventory.rejected[0].reason.contains("primary key"));
+    }
 
     #[test]
     fn parses_partition_attribute_vectors() {
-        assert_eq!(parse_attnums("{1, 3, -2}").unwrap(), vec![1, 3, -2]);
+        assert_eq!(parse_attnums("{1, 3, 2}").unwrap(), vec![1, 3, 2]);
+        assert!(parse_attnums("{1, 0}").is_err());
         assert!(parse_attnums("1,2").is_err());
     }
 

@@ -7,8 +7,18 @@ pub enum SourceError {
     Postgres(#[from] tokio_postgres::Error),
     #[error("replication query failed: {0}")]
     ReplicationPostgres(#[from] replication_postgres::Error),
+    #[error("TLS initialization failed: {0}")]
+    Tls(#[from] native_tls::Error),
     #[error("replication protocol error: {0}")]
     ReplicationProtocol(String),
+    #[error("invalid replication slot snapshot response: {0}")]
+    InvalidSlotSnapshotResponse(String),
+    #[error("snapshot readers are not ready: {ready} of {expected} registered")]
+    SnapshotReadersPending { ready: usize, expected: usize },
+    #[error("snapshot reader registration is already complete ({expected} readers)")]
+    SnapshotReadersComplete { expected: usize },
+    #[error("snapshot slot guard has already been released")]
+    SnapshotGuardReleased,
     #[error("invalid source contract: {0}")]
     Contract(String),
     #[error("unsupported source: {0}")]

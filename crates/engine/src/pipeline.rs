@@ -9,7 +9,10 @@ use thiserror::Error;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
-use crate::batch::{BatchError, Batcher, TransactionBatch};
+use crate::{
+    batch::{BatchError, Batcher, TransactionBatch},
+    telemetry::PipelineTelemetryHandle,
+};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -17,6 +20,10 @@ pub enum PipelineError {
     Source(String),
     #[error("target apply failed: {0}")]
     Target(String),
+    #[error("schema orchestration is required before replication can continue: {0}")]
+    SchemaBarrier(String),
+    #[error(transparent)]
+    Normalize(#[from] crate::normalize::NormalizeError),
     #[error("source acknowledgement failed: {0}")]
     Acknowledge(String),
     #[error(transparent)]
@@ -88,8 +95,19 @@ impl PipelineMachine {
 pub async fn replicate(
     source: &mut dyn TransactionSource,
     sink: &dyn TransactionSink,
+    batcher: Batcher,
+    cancellation: CancellationToken,
+) -> Result<(), PipelineError> {
+    replicate_with_telemetry(source, sink, batcher, cancellation, None).await
+}
+
+/// Runs replication while reporting durable progress to the runtime registry.
+pub async fn replicate_with_telemetry(
+    source: &mut dyn TransactionSource,
+    sink: &dyn TransactionSink,
     mut batcher: Batcher,
     cancellation: CancellationToken,
+    telemetry: Option<&PipelineTelemetryHandle>,
 ) -> Result<(), PipelineError> {
     let timer = sleep_until(Instant::now() + batcher.max_delay());
     tokio::pin!(timer);
@@ -98,32 +116,82 @@ pub async fn replicate(
         tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                if let Some(batch) = batcher.flush() {
-                    apply_and_ack(source, sink, &batch).await?;
-                }
+                // Cancellation is also used when the lease/fence is lost.  Do not commit the
+                // buffered batch with an ownership token that may no longer be current; the
+                // target checkpoint remains authoritative and the next owner can replay it.
                 return Ok(());
             }
             () = &mut timer, if !batcher.is_empty() => {
-                if let Some(batch) = batcher.flush() {
-                    apply_and_ack(source, sink, &batch).await?;
+                if let Some(batch) = batcher.flush()
+                    && !apply_and_ack_or_cancel(
+                        source,
+                        sink,
+                        &batch,
+                        telemetry,
+                        &cancellation,
+                    )
+                    .await?
+                {
+                    return Ok(());
                 }
                 timer.as_mut().reset(Instant::now() + batcher.max_delay());
             }
             transaction = source.next_transaction() => {
                 let Some(transaction) = transaction? else {
-                    if let Some(batch) = batcher.flush() {
-                        apply_and_ack(source, sink, &batch).await?;
+                    if let Some(batch) = batcher.flush()
+                        && !apply_and_ack_or_cancel(
+                            source,
+                            sink,
+                            &batch,
+                            telemetry,
+                            &cancellation,
+                        )
+                        .await?
+                    {
+                        return Ok(());
                     }
                     return Ok(());
                 };
+                if let Some(telemetry) = telemetry {
+                    telemetry.transaction_received(
+                        transaction.final_position.lsn,
+                        transaction.commit_time,
+                    );
+                }
                 if batcher.is_empty() {
                     timer.as_mut().reset(Instant::now() + batcher.max_delay());
                 }
-                if let Some(batch) = batcher.push(transaction)? {
-                    apply_and_ack(source, sink, &batch).await?;
+                if let Some(batch) = batcher.push(transaction)?
+                    && !apply_and_ack_or_cancel(
+                        source,
+                        sink,
+                        &batch,
+                        telemetry,
+                        &cancellation,
+                    )
+                    .await?
+                {
+                    return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Apply one batch only while ownership is still valid. Dropping an in-flight target apply
+/// future rolls back its database transaction; data and the checkpoint therefore advance
+/// together, or remain unchanged for replay by the next owner.
+async fn apply_and_ack_or_cancel(
+    source: &mut dyn TransactionSource,
+    sink: &dyn TransactionSink,
+    batch: &TransactionBatch,
+    telemetry: Option<&PipelineTelemetryHandle>,
+    cancellation: &CancellationToken,
+) -> Result<bool, PipelineError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Ok(false),
+        result = apply_and_ack(source, sink, batch, telemetry) => result.map(|()| true),
     }
 }
 
@@ -131,11 +199,18 @@ async fn apply_and_ack(
     source: &mut dyn TransactionSource,
     sink: &dyn TransactionSink,
     batch: &TransactionBatch,
+    telemetry: Option<&PipelineTelemetryHandle>,
 ) -> Result<(), PipelineError> {
     sink.apply(batch).await?;
-    source
-        .acknowledge(&batch.final_transaction().final_position)
-        .await
+    let final_position = &batch.final_transaction().final_position;
+    if let Some(telemetry) = telemetry {
+        telemetry.applied(final_position.lsn);
+    }
+    source.acknowledge(final_position).await?;
+    if let Some(telemetry) = telemetry {
+        telemetry.acknowledged(final_position.lsn);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -216,10 +291,10 @@ mod tests {
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut source = FakeSource {
             events: VecDeque::from([transaction(1), transaction(2)]),
-            log: log.clone(),
+            log: std::sync::Arc::clone(&log),
         };
         let sink = FakeSink {
-            log: log.clone(),
+            log: std::sync::Arc::clone(&log),
             fail: false,
         };
 
@@ -234,10 +309,10 @@ mod tests {
         let log = std::sync::Arc::new(Mutex::new(Vec::new()));
         let mut source = FakeSource {
             events: VecDeque::from([transaction(1)]),
-            log: log.clone(),
+            log: std::sync::Arc::clone(&log),
         };
         let sink = FakeSink {
-            log: log.clone(),
+            log: std::sync::Arc::clone(&log),
             fail: true,
         };
 
@@ -247,5 +322,55 @@ mod tests {
                 .is_err()
         );
         assert_eq!(*log.lock().unwrap(), ["apply:0/00000001"]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_buffered_batch_without_apply_or_ack() {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut source = FakeSource {
+            events: VecDeque::from([transaction(1)]),
+            log: std::sync::Arc::clone(&log),
+        };
+        let sink = FakeSink {
+            log: std::sync::Arc::clone(&log),
+            fail: false,
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        replicate(&mut source, &sink, batcher(), cancellation)
+            .await
+            .unwrap();
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_records_source_apply_and_ack_progress() {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut source = FakeSource {
+            events: VecDeque::from([transaction(7)]),
+            log: std::sync::Arc::clone(&log),
+        };
+        let sink = FakeSink { log, fail: false };
+        let telemetry = PipelineTelemetryHandle::new(cloudberry_etl_core::id::PipelineId::new());
+
+        replicate_with_telemetry(
+            &mut source,
+            &sink,
+            batcher(),
+            CancellationToken::new(),
+            Some(&telemetry),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.source_received_lsn, Some(PgLsn::new(7)));
+        assert_eq!(snapshot.source_current_lsn, Some(PgLsn::new(7)));
+        assert_eq!(snapshot.target_checkpoint_lsn, Some(PgLsn::new(7)));
+        assert_eq!(snapshot.estimated_byte_lag, Some(0));
+        assert!(snapshot.last_transaction_at.is_some());
+        assert!(snapshot.last_apply_at.is_some());
+        assert!(snapshot.last_ack_at.is_some());
     }
 }

@@ -28,7 +28,7 @@
 {#if open}
   <div class="modal-layer">
     <button class="modal-backdrop" aria-label="Close dialog" type="button" onclick={onClose}></button>
-    <section class="modal-panel {size}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-panel {size}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <header class="modal-header">
         <div>
           <h2 id="modal-title">{title}</h2>
@@ -39,6 +39,6 @@
         </button>
       </header>
       <div class="modal-content">{@render children()}</div>
-    </section>
+    </div>
   </div>
 {/if}

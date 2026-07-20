@@ -7,12 +7,23 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
 };
+use cloudberry_etl_core::id::{SourceId, TargetId};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MASTER_KEY_BYTES: usize = 32;
+
+#[must_use]
+pub fn source_credential_aad(id: SourceId) -> String {
+    format!("cloudberry-etl:source:{id}")
+}
+
+#[must_use]
+pub fn target_credential_aad(id: TargetId) -> String {
+    format!("cloudberry-etl:target:{id}")
+}
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -134,5 +145,20 @@ mod tests {
     fn rejects_wrong_length_key() {
         let key = SecretString::from(STANDARD.encode([1_u8; 16]));
         assert!(MasterKey::from_base64(&key).is_err());
+    }
+
+    #[test]
+    fn credential_binding_is_stable_and_kind_scoped() {
+        let source = SourceId::new();
+        let target = TargetId::from_uuid(source.as_uuid());
+        assert_eq!(
+            source_credential_aad(source),
+            format!("cloudberry-etl:source:{source}")
+        );
+        assert_eq!(
+            target_credential_aad(target),
+            format!("cloudberry-etl:target:{target}")
+        );
+        assert_ne!(source_credential_aad(source), target_credential_aad(target));
     }
 }

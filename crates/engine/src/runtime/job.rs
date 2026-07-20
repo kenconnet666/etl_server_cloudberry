@@ -1,0 +1,1176 @@
+//! Concrete PostgreSQL 18 to Cloudberry pipeline job.
+
+use std::{str::FromStr as _, sync::Arc};
+
+use async_trait::async_trait;
+use cloudberry_etl_core::{
+    id::PipelineId,
+    lsn::PgLsn,
+    pipeline::{PipelinePhase, SourceTopology},
+};
+use cloudberry_etl_metadata::{
+    crypto::{CryptoError, MasterKey, source_credential_aad, target_credential_aad},
+    model::{PipelineDefinition, PipelineLease, SourceProfile, TargetProfile},
+    store::{ControlStore, StoreError},
+};
+use cloudberry_etl_source_postgres::{
+    SourceError,
+    catalog::{CatalogOptions, PreflightOptions, PreflightReport, TableInventory, preflight},
+    connection::connect_replication,
+    ddl::{DdlInstallSpec, ensure_ddl_capture},
+    publication::{
+        LogicalSlotState, PublicationSpec, drop_logical_slot, ensure_publication,
+        inspect_logical_slot, validate_publication,
+    },
+    snapshot::begin_at_exported_snapshot,
+    snapshot_slot::SnapshotSlotGuard,
+    wal::{ReplicationTransport, SourceNodeIdentity, TransactionAssembler, TransactionLimits},
+};
+use cloudberry_etl_target_cloudberry::{
+    checkpoint::{
+        CheckpointError, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
+        load_node_checkpoint,
+    },
+    migration::{MigrationError, migrate_target_database},
+    snapshot::{
+        QuarantineGcPolicy, SnapshotActivationRequest, SnapshotTargetError, SnapshotTargetPlan,
+        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group,
+        cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables, plan_snapshot_target,
+        validate_active_snapshot_group,
+    },
+};
+use secrecy::{ExposeSecret, SecretString};
+use thiserror::Error;
+use tokio::time::{self, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::{
+    adapters::{
+        AdapterConfigError, CloudberryTransactionSink, DdlScope, PgOutputTransactionSource,
+        TableBinding, TableBindingRegistry,
+    },
+    batch::{BatchError, BatchLimits, Batcher},
+    pipeline::PipelineError,
+    runtime::reconciler::{JobFactoryError, PipelineJobFactory},
+    supervisor::{PipelineJob, SupervisorError},
+    telemetry::PipelineTelemetryHandle,
+};
+
+use super::{
+    EndpointRole, PipelineSettings, PlannedTable, SourceSettings, TablePlanningError,
+    TargetSettings, WalRetentionSettings, connect_sql, plan_tables, replication_names,
+};
+
+const STANDALONE_NODE_ID: i32 = 0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalMonitorOutcome {
+    Cancelled,
+    Rebuild(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalRetentionAssessment {
+    Healthy,
+    Warning(String),
+    Rebuild(String),
+}
+
+#[derive(Debug, Error)]
+enum RuntimeJobError {
+    #[error("source profile is disabled")]
+    SourceDisabled,
+    #[error("target profile is disabled")]
+    TargetDisabled,
+    #[error("pipeline snapshot generation must be positive")]
+    InvalidSnapshotGeneration,
+    #[error("pipeline fencing token must be positive")]
+    InvalidFencingToken,
+    #[error("pipeline lease belongs to a different pipeline")]
+    LeaseMismatch,
+    #[error("source profile {0} does not exist")]
+    MissingSource(String),
+    #[error("target profile {0} does not exist")]
+    MissingTarget(String),
+    #[error("pipeline disappeared while requesting a schema rebuild")]
+    MissingPipelineForRebuild,
+    #[error("{0} topology is validation-gated and cannot run yet")]
+    UnsupportedTopology(&'static str),
+    #[error("source endpoint is a standby; a writable primary endpoint is required")]
+    SourceIsStandby,
+    #[error("source profile expects database `{expected}`, server reported `{actual}`")]
+    SourceDatabaseMismatch { expected: String, actual: String },
+    #[error("source profile is standalone but the endpoint has Citus installed")]
+    UnexpectedCitus,
+    #[error("target profile expects database `{expected}`, server reported `{actual}`")]
+    TargetDatabaseMismatch { expected: String, actual: String },
+    #[error("target endpoint is not Apache Cloudberry 2.1")]
+    UnsupportedTarget,
+    #[error("no source table satisfies the complete source and target contract")]
+    NoEligibleTables,
+    #[error("source table `{table}` is inside the configured scope but unsupported: {reason}")]
+    UnsupportedIncludedTable { table: String, reason: String },
+    #[error("source catalog changed while establishing the initial snapshot boundary")]
+    InitialCatalogChanged,
+    #[error("initial snapshot failed: {original}; unable to clean up slot `{slot}`: {cleanup}")]
+    InitialSnapshotCleanup {
+        original: String,
+        slot: String,
+        cleanup: String,
+    },
+    #[error("logical slot `{slot}` is active while recovery owns no target checkpoint")]
+    ActiveOrphanSlot { slot: String },
+    #[error("logical slot `{slot}` belongs to database {actual:?}, expected `{expected}`")]
+    SlotDatabaseMismatch {
+        slot: String,
+        actual: Option<String>,
+        expected: String,
+    },
+    #[error("logical slot `{slot}` uses unsupported lifecycle options: {reason}")]
+    UnsupportedSlotMode { slot: String, reason: String },
+    #[error("logical slot `{slot}` was invalidated: {reason}")]
+    SlotInvalidated { slot: String, reason: String },
+    #[error("managed publication drifted from its exact runtime contract: {0}")]
+    PublicationDrift(String),
+    #[error("logical slot `{slot}` uses plugin `{plugin}`, expected pgoutput")]
+    WrongSlotPlugin { slot: String, plugin: String },
+    #[error("logical slot `{0}` is missing for an existing target checkpoint")]
+    MissingSlot(String),
+    #[error("source slot confirmed LSN {slot_lsn} is ahead of target checkpoint {target_lsn}")]
+    SlotAheadOfTarget { slot_lsn: PgLsn, target_lsn: PgLsn },
+    #[error("target checkpoint precedes the source slot restart LSN; retained WAL was lost")]
+    WalLost,
+    #[error("source logical slot `{slot}` crossed the WAL retention protection limit: {reason}")]
+    WalRetentionExceeded { slot: String, reason: String },
+    #[error("persisted slot LSN `{0}` is invalid")]
+    InvalidPersistedLsn(String),
+    #[error("target checkpoint source identity no longer matches the PostgreSQL endpoint")]
+    SourceIdentityChanged,
+    #[error("target checkpoint slot `{actual}` does not match configured slot `{expected}`")]
+    CheckpointSlotMismatch { expected: String, actual: String },
+    #[error("pipeline was cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+    #[error(transparent)]
+    Settings(#[from] super::SettingsError),
+    #[error(transparent)]
+    Connect(#[from] super::SqlConnectError),
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    #[error(transparent)]
+    TargetMigration(#[from] MigrationError),
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotTargetError),
+    #[error(transparent)]
+    Planning(#[from] TablePlanningError),
+    #[error(transparent)]
+    Adapter(#[from] AdapterConfigError),
+    #[error(transparent)]
+    Batch(#[from] BatchError),
+    #[error(transparent)]
+    Pipeline(#[from] PipelineError),
+    #[error("target validation query failed: {0}")]
+    TargetDatabase(#[from] tokio_postgres::Error),
+}
+
+pub struct PostgresCloudberryJobFactory {
+    control: Arc<dyn ControlStore>,
+    master_key: Arc<MasterKey>,
+}
+
+impl std::fmt::Debug for PostgresCloudberryJobFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresCloudberryJobFactory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresCloudberryJobFactory {
+    #[must_use]
+    pub fn new(control: Arc<dyn ControlStore>, master_key: Arc<MasterKey>) -> Self {
+        Self {
+            control,
+            master_key,
+        }
+    }
+
+    async fn resolve(
+        &self,
+        pipeline: &PipelineDefinition,
+        lease: &PipelineLease,
+        telemetry: PipelineTelemetryHandle,
+    ) -> Result<PostgresCloudberryJob, RuntimeJobError> {
+        if pipeline.id != lease.pipeline_id {
+            return Err(RuntimeJobError::LeaseMismatch);
+        }
+        let source = self
+            .control
+            .list_sources()
+            .await?
+            .into_iter()
+            .find(|source| source.id == pipeline.source_id)
+            .ok_or_else(|| RuntimeJobError::MissingSource(pipeline.source_id.to_string()))?;
+        let target = self
+            .control
+            .list_targets()
+            .await?
+            .into_iter()
+            .find(|target| target.id == pipeline.target_id)
+            .ok_or_else(|| RuntimeJobError::MissingTarget(pipeline.target_id.to_string()))?;
+        if !source.enabled {
+            return Err(RuntimeJobError::SourceDisabled);
+        }
+        if !target.enabled {
+            return Err(RuntimeJobError::TargetDisabled);
+        }
+        let topology_generation = u64::try_from(pipeline.snapshot_generation)
+            .map_err(|_| RuntimeJobError::InvalidSnapshotGeneration)?;
+        if topology_generation == 0 {
+            return Err(RuntimeJobError::InvalidSnapshotGeneration);
+        }
+        let source_settings = SourceSettings::parse(&source.settings)?;
+        let target_settings = TargetSettings::parse(&target.settings)?;
+        let pipeline_settings = PipelineSettings::parse(&pipeline.settings)?;
+        pipeline_settings.validate_with_source(&source_settings)?;
+        let source_dsn = self.master_key.decrypt(
+            &source.encrypted_dsn,
+            source_credential_aad(source.id).as_bytes(),
+        )?;
+        let target_dsn = self.master_key.decrypt(
+            &target.encrypted_dsn,
+            target_credential_aad(target.id).as_bytes(),
+        )?;
+        Ok(PostgresCloudberryJob {
+            control: Arc::clone(&self.control),
+            pipeline_id: pipeline.id,
+            topology_generation,
+            fence: PipelineFence {
+                pipeline_id: pipeline.id,
+                topology_generation,
+                fencing_token: lease.fencing_token,
+            },
+            source,
+            target,
+            source_settings,
+            target_settings,
+            pipeline_settings,
+            source_dsn,
+            target_dsn,
+            telemetry,
+        })
+    }
+}
+
+#[async_trait]
+impl PipelineJobFactory for PostgresCloudberryJobFactory {
+    async fn create(
+        &self,
+        pipeline: &PipelineDefinition,
+        lease: &PipelineLease,
+        telemetry: PipelineTelemetryHandle,
+    ) -> Result<Arc<dyn PipelineJob>, JobFactoryError> {
+        self.resolve(pipeline, lease, telemetry)
+            .await
+            .map(|job| Arc::new(job) as Arc<dyn PipelineJob>)
+            .map_err(|error| JobFactoryError::new(error.to_string()))
+    }
+}
+
+struct PostgresCloudberryJob {
+    control: Arc<dyn ControlStore>,
+    pipeline_id: PipelineId,
+    topology_generation: u64,
+    fence: PipelineFence,
+    source: SourceProfile,
+    target: TargetProfile,
+    source_settings: SourceSettings,
+    target_settings: TargetSettings,
+    pipeline_settings: PipelineSettings,
+    source_dsn: SecretString,
+    target_dsn: SecretString,
+    telemetry: PipelineTelemetryHandle,
+}
+
+impl std::fmt::Debug for PostgresCloudberryJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresCloudberryJob")
+            .field("pipeline_id", &self.pipeline_id)
+            .field("topology_generation", &self.topology_generation)
+            .field("source_id", &self.source.id)
+            .field("target_id", &self.target.id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PipelineJob for PostgresCloudberryJob {
+    async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
+        self.telemetry.set_phase(PipelinePhase::Validating);
+        let result = match self.source.topology {
+            SourceTopology::Standalone => self.run_standalone(cancellation).await,
+            SourceTopology::PhysicalHa => Err(RuntimeJobError::UnsupportedTopology("physical_ha")),
+            SourceTopology::Citus => Err(RuntimeJobError::UnsupportedTopology("citus")),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(RuntimeJobError::Cancelled) => {
+                self.telemetry.set_phase(PipelinePhase::Stopped);
+                Ok(())
+            }
+            Err(error) => {
+                self.telemetry.mark_failed(error.to_string());
+                Err(SupervisorError::Task(error.to_string()))
+            }
+        }
+    }
+}
+
+struct RuntimeTable {
+    planned: PlannedTable,
+    snapshot_plan: SnapshotTargetPlan,
+}
+
+struct PreparedRun {
+    tables: Vec<RuntimeTable>,
+    checkpoint: NodeCheckpoint,
+}
+
+impl PostgresCloudberryJob {
+    async fn run_standalone(&self, cancellation: CancellationToken) -> Result<(), RuntimeJobError> {
+        let mut source_setup = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
+        let mut target = connect_sql(&self.target_dsn, EndpointRole::Target).await?;
+        let report = preflight(
+            &source_setup,
+            &PreflightOptions {
+                metadata_schema: self.source_settings.metadata_schema.clone(),
+                ..PreflightOptions::default()
+            },
+        )
+        .await?;
+        self.validate_source(&report)?;
+        self.validate_target(&target).await?;
+        migrate_target_database(&mut target).await?;
+        activate_pipeline_fence(&target, self.fence).await?;
+        let stale_groups = cleanup_stale_snapshot_groups(&mut target, self.fence).await?;
+        for group in &stale_groups {
+            tracing::warn!(
+                pipeline_id = %self.pipeline_id,
+                snapshot_group_id = %group.snapshot_group_id,
+                dropped_shadows = group.dropped_shadows.len(),
+                "removed stale loading snapshot group before pipeline start"
+            );
+        }
+        let gc_policy = QuarantineGcPolicy::enabled(
+            self.target_settings.quarantine_retention(),
+            self.target_settings.quarantine_gc_max_tables,
+        )?;
+        let gc = garbage_collect_quarantined_tables(&mut target, self.fence, gc_policy).await?;
+        if !gc.dropped.is_empty() {
+            tracing::info!(
+                pipeline_id = %self.pipeline_id,
+                dropped_quarantines = gc.dropped.len(),
+                "garbage-collected expired quarantined target tables"
+            );
+        }
+        self.install_ddl_capture(&source_setup).await?;
+
+        let names = replication_names(self.pipeline_id, STANDALONE_NODE_ID);
+        let checkpoint_key = CheckpointKey {
+            pipeline_id: self.pipeline_id,
+            topology_generation: self.topology_generation,
+            node_id: STANDALONE_NODE_ID,
+        };
+        let preparation = match load_node_checkpoint(&target, checkpoint_key).await? {
+            Some(stored) => {
+                self.telemetry.set_phase(PipelinePhase::CatchingUp);
+                self.prepare_resume(
+                    &source_setup,
+                    &mut target,
+                    &report,
+                    &names,
+                    stored.checkpoint,
+                )
+                .await
+            }
+            None => {
+                self.telemetry.set_phase(PipelinePhase::Snapshotting);
+                self.prepare_initial_snapshot(
+                    &mut source_setup,
+                    &mut target,
+                    &report,
+                    &names,
+                    cancellation.clone(),
+                )
+                .await
+            }
+        };
+        let prepared = match preparation {
+            Ok(prepared) => prepared,
+            Err(error)
+                if matches!(
+                    error,
+                    RuntimeJobError::MissingSlot(_)
+                        | RuntimeJobError::SlotInvalidated { .. }
+                        | RuntimeJobError::SlotAheadOfTarget { .. }
+                        | RuntimeJobError::WalLost
+                        | RuntimeJobError::WalRetentionExceeded { .. }
+                        | RuntimeJobError::PublicationDrift(_)
+                ) =>
+            {
+                self.request_rebuild(&error.to_string()).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if cancellation.is_cancelled() {
+            return Err(RuntimeJobError::Cancelled);
+        }
+        self.telemetry
+            .checkpoint_initialized(prepared.checkpoint.applied_lsn);
+        let snapshot_generation = i64::try_from(self.topology_generation)
+            .map_err(|_| RuntimeJobError::InvalidSnapshotGeneration)?;
+        let completed_rebuilds = self
+            .control
+            .complete_pipeline_rebuilds(self.pipeline_id, snapshot_generation)
+            .await?;
+        if completed_rebuilds > 0 {
+            tracing::info!(
+                pipeline_id = %self.pipeline_id,
+                snapshot_generation,
+                completed_rebuilds,
+                "snapshot rebuild operations completed"
+            );
+        }
+
+        let replication_client = connect_replication(self.source_dsn.expose_secret()).await?;
+        let transport = ReplicationTransport::start(
+            &replication_client,
+            &names.slot,
+            &prepared.checkpoint.applied_lsn.to_string(),
+            &names.publication,
+        )
+        .await?;
+        let assembler = TransactionAssembler::with_limits(
+            SourceNodeIdentity {
+                node_id: STANDALONE_NODE_ID,
+                system_identifier: report.identity.system_identifier,
+                timeline: report.identity.timeline,
+            },
+            TransactionLimits {
+                max_changes: self.source_settings.transaction.max_changes,
+                max_bytes: self.source_settings.transaction.max_bytes,
+            },
+        )?;
+        let mut source = PgOutputTransactionSource::new_with_telemetry(
+            transport,
+            assembler,
+            prepared.checkpoint.applied_lsn,
+            self.telemetry.clone(),
+        );
+        let registry = TableBindingRegistry::new(
+            prepared
+                .tables
+                .iter()
+                .map(|table| {
+                    TableBinding::new(
+                        table.planned.source.clone(),
+                        table.planned.target.clone(),
+                        table.planned.staging_name.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        let mut ddl_scope = DdlScope::from_lists(
+            self.source_settings.include_schemas.as_deref(),
+            &self.source_settings.exclude_schemas,
+        );
+        ddl_scope.exclude(self.source_settings.metadata_schema.clone());
+        let sink =
+            CloudberryTransactionSink::new(target, self.fence, &names.slot, registry, ddl_scope)?;
+        let batcher = Batcher::new(BatchLimits {
+            max_rows: self.pipeline_settings.batch.max_rows,
+            max_bytes: self.pipeline_settings.batch.max_bytes,
+            max_delay: self.pipeline_settings.batch.max_delay(),
+        })?;
+        self.telemetry.set_phase(PipelinePhase::CatchingUp);
+        self.telemetry.mark_running();
+        let monitor_client = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
+        let outcome = tokio::select! {
+            result = crate::pipeline::replicate_with_telemetry(
+                &mut source,
+                &sink,
+                batcher,
+                cancellation.clone(),
+                Some(&self.telemetry),
+            ) => Ok(result),
+            result = self.monitor_wal_retention(
+                monitor_client,
+                names.slot.clone(),
+                cancellation,
+            ) => Err(result),
+        };
+        drop(source);
+        drop(sink);
+        drop(replication_client);
+        match outcome {
+            Ok(Err(PipelineError::SchemaBarrier(reason))) => {
+                self.telemetry.mark_degraded(reason.clone());
+                self.request_rebuild(&reason).await?;
+                Ok(())
+            }
+            Ok(result) => result.map_err(RuntimeJobError::from),
+            Err(Ok(WalMonitorOutcome::Cancelled)) => Err(RuntimeJobError::Cancelled),
+            Err(Ok(WalMonitorOutcome::Rebuild(reason))) => {
+                self.telemetry.mark_degraded(reason.clone());
+                self.request_rebuild(&reason).await?;
+                Ok(())
+            }
+            Err(Err(error)) => Err(error),
+        }
+    }
+
+    async fn request_rebuild(&self, reason: &str) -> Result<(), RuntimeJobError> {
+        let rebuild = self
+            .control
+            .request_pipeline_rebuild(self.pipeline_id)
+            .await?
+            .ok_or(RuntimeJobError::MissingPipelineForRebuild)?;
+        tracing::warn!(
+            pipeline_id = %self.pipeline_id,
+            operation_id = %rebuild.operation_id,
+            snapshot_generation = rebuild.pipeline.snapshot_generation,
+            %reason,
+            "consistency barrier requested a full snapshot rebuild"
+        );
+        Ok(())
+    }
+
+    async fn monitor_wal_retention(
+        &self,
+        client: tokio_postgres::Client,
+        slot_name: String,
+        cancellation: CancellationToken,
+    ) -> Result<WalMonitorOutcome, RuntimeJobError> {
+        let policy = self.source_settings.wal_retention;
+        let mut ticker = time::interval(policy.check_interval());
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_warning = None::<String>;
+
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(WalMonitorOutcome::Cancelled),
+                _ = ticker.tick() => {
+                    let slot = inspect_logical_slot(&client, &slot_name)
+                        .await?
+                        .ok_or_else(|| RuntimeJobError::WalRetentionExceeded {
+                            slot: slot_name.clone(),
+                            reason: "logical slot disappeared while replication was running".to_owned(),
+                        })?;
+                    match assess_wal_retention(&slot, policy) {
+                        WalRetentionAssessment::Healthy => {
+                            self.telemetry.wal_retention_observed(
+                                slot.retained_wal_bytes,
+                                slot.safe_wal_size,
+                                false,
+                            );
+                            last_warning = None;
+                        }
+                        WalRetentionAssessment::Warning(reason) => {
+                            self.telemetry.wal_retention_observed(
+                                slot.retained_wal_bytes,
+                                slot.safe_wal_size,
+                                true,
+                            );
+                            if last_warning.as_deref() != Some(reason.as_str()) {
+                                tracing::warn!(
+                                    pipeline_id = %self.pipeline_id,
+                                    slot = %slot_name,
+                                    retained_wal_bytes = ?slot.retained_wal_bytes,
+                                    safe_wal_bytes = ?slot.safe_wal_size,
+                                    %reason,
+                                    "source WAL retention is approaching the protection limit"
+                                );
+                                last_warning = Some(reason);
+                            }
+                        }
+                        WalRetentionAssessment::Rebuild(reason) => {
+                            self.telemetry.wal_retention_observed(
+                                slot.retained_wal_bytes,
+                                slot.safe_wal_size,
+                                true,
+                            );
+                            return Ok(WalMonitorOutcome::Rebuild(reason));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_source(&self, report: &PreflightReport) -> Result<(), RuntimeJobError> {
+        if report.identity.database != self.source.database_name {
+            return Err(RuntimeJobError::SourceDatabaseMismatch {
+                expected: self.source.database_name.clone(),
+                actual: report.identity.database.clone(),
+            });
+        }
+        if report.identity.in_recovery {
+            return Err(RuntimeJobError::SourceIsStandby);
+        }
+        if report.citus_version.is_some() {
+            return Err(RuntimeJobError::UnexpectedCitus);
+        }
+        Ok(())
+    }
+
+    async fn validate_target(
+        &self,
+        target: &tokio_postgres::Client,
+    ) -> Result<(), RuntimeJobError> {
+        let row = target
+            .query_one(
+                "SELECT current_database(), version(), current_setting('gp_role', true)",
+                &[],
+            )
+            .await?;
+        let database: String = row.try_get(0)?;
+        let version: String = row.try_get(1)?;
+        let gp_role: Option<String> = row.try_get(2)?;
+        if database != self.target.database_name {
+            return Err(RuntimeJobError::TargetDatabaseMismatch {
+                expected: self.target.database_name.clone(),
+                actual: database,
+            });
+        }
+        let normalized = version.to_ascii_lowercase();
+        if gp_role.is_none() || !normalized.contains("cloudberry") || !normalized.contains("2.1.") {
+            return Err(RuntimeJobError::UnsupportedTarget);
+        }
+        Ok(())
+    }
+
+    async fn install_ddl_capture(
+        &self,
+        source: &tokio_postgres::Client,
+    ) -> Result<(), RuntimeJobError> {
+        let spec = DdlInstallSpec {
+            metadata_schema: self.source_settings.metadata_schema.clone(),
+            trigger_name: format!("pg2cb_ddl_{}", self.source.id.as_uuid().simple()),
+            allow_citus_worker_guard: true,
+        };
+        let installed = ensure_ddl_capture(source, &spec).await?;
+        if installed {
+            tracing::info!(
+                pipeline_id = %self.pipeline_id,
+                trigger = %spec.trigger_name,
+                "source DDL capture installed"
+            );
+        }
+        Ok(())
+    }
+
+    fn catalog_options(&self) -> CatalogOptions {
+        CatalogOptions {
+            metadata_schema: self.source_settings.metadata_schema.clone(),
+            include_schemas: self
+                .source_settings
+                .include_schemas
+                .as_ref()
+                .map(|schemas| schemas.iter().cloned().collect()),
+            exclude_schemas: self
+                .source_settings
+                .exclude_schemas
+                .iter()
+                .cloned()
+                .collect(),
+            // Partition hierarchies remain blocked until root publication identity is verified.
+            include_partitions: false,
+        }
+    }
+
+    fn plan_inventory(
+        &self,
+        inventory: TableInventory,
+    ) -> Result<Vec<RuntimeTable>, RuntimeJobError> {
+        if let Some(rejected) = inventory.rejected.into_iter().next() {
+            return Err(RuntimeJobError::UnsupportedIncludedTable {
+                table: rejected.name.to_string(),
+                reason: rejected.reason.to_string(),
+            });
+        }
+        let snapshot_attempt = u64::try_from(self.fence.fencing_token)
+            .map_err(|_| RuntimeJobError::InvalidFencingToken)?;
+        let planned = plan_tables(
+            self.pipeline_id,
+            snapshot_attempt,
+            &self.source.prefix,
+            &self.source.database_name,
+            &self.target.database_name,
+            &self.pipeline_settings,
+            inventory.supported,
+        )?;
+        let mut accepted = Vec::with_capacity(planned.len());
+        for planned in planned {
+            let mut snapshot_schema = planned.source.clone();
+            snapshot_schema.generation = self.topology_generation;
+            let snapshot_plan = plan_snapshot_target(
+                &snapshot_schema,
+                planned.target.clone(),
+                planned.shadow.clone(),
+            )?;
+            accepted.push(RuntimeTable {
+                planned,
+                snapshot_plan,
+            });
+        }
+        if accepted.is_empty() {
+            Err(RuntimeJobError::NoEligibleTables)
+        } else {
+            Ok(accepted)
+        }
+    }
+
+    async fn ensure_publication(
+        &self,
+        source: &tokio_postgres::Client,
+        publication_name: &str,
+        tables: &[RuntimeTable],
+    ) -> Result<(), RuntimeJobError> {
+        let spec = PublicationSpec::new(
+            publication_name,
+            tables
+                .iter()
+                .map(|table| table.planned.source.name.clone())
+                .collect(),
+        )?;
+        ensure_publication(source, &spec, None).await?;
+        Ok(())
+    }
+
+    async fn prepare_initial_snapshot(
+        &self,
+        source_setup: &mut tokio_postgres::Client,
+        target: &mut tokio_postgres::Client,
+        report: &PreflightReport,
+        names: &super::ReplicationNames,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedRun, RuntimeJobError> {
+        if let Some(existing) = inspect_logical_slot(source_setup, &names.slot).await? {
+            if existing.plugin != "pgoutput" {
+                return Err(RuntimeJobError::WrongSlotPlugin {
+                    slot: names.slot.clone(),
+                    plugin: existing.plugin,
+                });
+            }
+            if existing.active {
+                return Err(RuntimeJobError::ActiveOrphanSlot {
+                    slot: names.slot.clone(),
+                });
+            }
+            if existing.database.as_deref() != Some(self.source.database_name.as_str()) {
+                return Err(RuntimeJobError::SlotDatabaseMismatch {
+                    slot: names.slot.clone(),
+                    actual: existing.database,
+                    expected: self.source.database_name.clone(),
+                });
+            }
+            if existing.temporary || existing.two_phase || existing.failover || existing.synced {
+                return Err(RuntimeJobError::UnsupportedSlotMode {
+                    slot: names.slot.clone(),
+                    reason: format!(
+                        "temporary={}, two_phase={}, failover={}, synced={}",
+                        existing.temporary, existing.two_phase, existing.failover, existing.synced
+                    ),
+                });
+            }
+            // No target checkpoint exists, so this generated slot cannot authorize progress.
+            drop_logical_slot(source_setup, &names.slot).await?;
+        }
+
+        // Publication membership must exist before the slot's consistent point. Otherwise writes
+        // between slot creation and ALTER PUBLICATION can be omitted by pgoutput permanently.
+        let publication_inventory = cloudberry_etl_source_postgres::catalog::inspect_tables(
+            source_setup,
+            &self.catalog_options(),
+        )
+        .await?;
+        let publication_tables = self.plan_inventory(publication_inventory)?;
+        self.ensure_publication(source_setup, &names.publication, &publication_tables)
+            .await?;
+
+        // Keep the newly-created slot until the target activation attempt has started. Before
+        // that point no target checkpoint can refer to it, so every error path must release it;
+        // after that point an ambiguous target commit must be recoverable by resume instead of
+        // risking a checkpoint/slot split-brain.
+        let mut preserve_slot_on_error = false;
+        let result = async {
+            let mut guard =
+                SnapshotSlotGuard::create(self.source_dsn.expose_secret(), &names.slot, 1).await?;
+            let slot_snapshot = guard.snapshot().clone();
+            let mut snapshot_client = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
+            let mut snapshot =
+                begin_at_exported_snapshot(&mut snapshot_client, &slot_snapshot.snapshot_name)
+                    .await?;
+            guard.mark_reader_ready()?;
+            guard.release()?;
+
+            let inventory = snapshot.inspect_tables(&self.catalog_options()).await?;
+            let tables = self.plan_inventory(inventory)?;
+            let catalog_unchanged = publication_tables.len() == tables.len()
+                && publication_tables
+                    .iter()
+                    .zip(&tables)
+                    .all(|(before, at_snapshot)| before.planned == at_snapshot.planned);
+            if !catalog_unchanged {
+                snapshot.rollback().await?;
+                return Err(RuntimeJobError::InitialCatalogChanged);
+            }
+
+            let checkpoint = NodeCheckpoint {
+                key: CheckpointKey {
+                    pipeline_id: self.pipeline_id,
+                    topology_generation: self.topology_generation,
+                    node_id: STANDALONE_NODE_ID,
+                },
+                system_identifier: report.identity.system_identifier,
+                timeline: report.identity.timeline,
+                slot_name: names.slot.clone(),
+                applied_lsn: slot_snapshot.consistent_point,
+            };
+            let snapshot_group_id = Uuid::now_v7();
+            let activation_request = SnapshotActivationRequest {
+                fence: self.fence,
+                snapshot_group_id,
+                tables: tables
+                    .iter()
+                    .map(|table| {
+                        table
+                            .snapshot_plan
+                            .activation_table(&table.planned.schema_fingerprint)
+                    })
+                    .collect(),
+                initial_checkpoints: vec![checkpoint.clone()],
+            };
+            let registration = begin_snapshot_group(target, &activation_request).await?;
+            tracing::info!(
+                pipeline_id = %self.pipeline_id,
+                %snapshot_group_id,
+                ?registration,
+                "snapshot group manifest registered"
+            );
+
+            for table in &tables {
+                if cancellation.is_cancelled() {
+                    snapshot.rollback().await?;
+                    return Err(RuntimeJobError::Cancelled);
+                }
+                let ownership = cloudberry_etl_target_cloudberry::snapshot::SnapshotOwnership {
+                    fence: self.fence,
+                    snapshot_group_id,
+                    schema_fingerprint: table.planned.schema_fingerprint.clone(),
+                };
+                let mut apply =
+                    begin_snapshot_apply(target, table.snapshot_plan.clone(), &ownership).await?;
+                let stream = snapshot.copy_text_table(&table.planned.source).await?;
+                let result = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => None,
+                    result = apply.copy_from_stream(stream) => Some(result),
+                };
+                match result {
+                    Some(result) => {
+                        result?;
+                    }
+                    None => {
+                        apply.rollback().await?;
+                        snapshot.rollback().await?;
+                        return Err(RuntimeJobError::Cancelled);
+                    }
+                }
+                let outcome = apply.commit().await?;
+                tracing::info!(
+                    pipeline_id = %self.pipeline_id,
+                    table = %table.planned.source.name,
+                    ?outcome,
+                    "snapshot table load committed"
+                );
+            }
+
+            // Close the source snapshot before target activation. If activation is ambiguous,
+            // retaining the slot lets the next run discover either the committed checkpoint or
+            // the orphan slot and converge safely.
+            snapshot.commit().await?;
+            preserve_slot_on_error = true;
+            activate_snapshot_group(target, &activation_request).await?;
+            Ok(PreparedRun { tables, checkpoint })
+        }
+        .await;
+
+        if result.is_err()
+            && !preserve_slot_on_error
+            && let Err(cleanup) = drop_logical_slot(source_setup, &names.slot).await
+        {
+            let original = result.as_ref().err().map_or_else(
+                || "unknown initial snapshot failure".to_owned(),
+                ToString::to_string,
+            );
+            return Err(RuntimeJobError::InitialSnapshotCleanup {
+                original,
+                slot: names.slot.clone(),
+                cleanup: cleanup.to_string(),
+            });
+        }
+        result
+    }
+
+    async fn prepare_resume(
+        &self,
+        source: &tokio_postgres::Client,
+        target: &mut tokio_postgres::Client,
+        report: &PreflightReport,
+        names: &super::ReplicationNames,
+        checkpoint: NodeCheckpoint,
+    ) -> Result<PreparedRun, RuntimeJobError> {
+        if checkpoint.system_identifier != report.identity.system_identifier
+            || checkpoint.timeline != report.identity.timeline
+        {
+            return Err(RuntimeJobError::SourceIdentityChanged);
+        }
+        if checkpoint.slot_name != names.slot {
+            return Err(RuntimeJobError::CheckpointSlotMismatch {
+                expected: names.slot.clone(),
+                actual: checkpoint.slot_name,
+            });
+        }
+        let slot = inspect_logical_slot(source, &names.slot)
+            .await?
+            .ok_or_else(|| RuntimeJobError::MissingSlot(names.slot.clone()))?;
+        if slot.plugin != "pgoutput" {
+            return Err(RuntimeJobError::WrongSlotPlugin {
+                slot: names.slot.clone(),
+                plugin: slot.plugin,
+            });
+        }
+        if slot.active {
+            return Err(RuntimeJobError::ActiveOrphanSlot {
+                slot: names.slot.clone(),
+            });
+        }
+        if slot.database.as_deref() != Some(self.source.database_name.as_str()) {
+            return Err(RuntimeJobError::SlotDatabaseMismatch {
+                slot: names.slot.clone(),
+                actual: slot.database,
+                expected: self.source.database_name.clone(),
+            });
+        }
+        if slot.temporary || slot.two_phase || slot.failover || slot.synced {
+            return Err(RuntimeJobError::UnsupportedSlotMode {
+                slot: names.slot.clone(),
+                reason: format!(
+                    "temporary={}, two_phase={}, failover={}, synced={}",
+                    slot.temporary, slot.two_phase, slot.failover, slot.synced
+                ),
+            });
+        }
+        if slot.wal_status.as_deref() == Some("lost") || slot.invalidation_reason.is_some() {
+            return Err(RuntimeJobError::SlotInvalidated {
+                slot: names.slot.clone(),
+                reason: format!(
+                    "wal_status={:?}, invalidation_reason={:?}",
+                    slot.wal_status, slot.invalidation_reason
+                ),
+            });
+        }
+        if slot.restart_lsn.is_none() {
+            return Err(RuntimeJobError::WalLost);
+        }
+        if let Some(confirmed) = parse_optional_lsn(slot.confirmed_flush_lsn)?
+            && confirmed > checkpoint.applied_lsn
+        {
+            return Err(RuntimeJobError::SlotAheadOfTarget {
+                slot_lsn: confirmed,
+                target_lsn: checkpoint.applied_lsn,
+            });
+        }
+        if let Some(restart) = parse_optional_lsn(slot.restart_lsn)?
+            && checkpoint.applied_lsn < restart
+        {
+            return Err(RuntimeJobError::WalLost);
+        }
+
+        let inventory = cloudberry_etl_source_postgres::catalog::inspect_tables(
+            source,
+            &self.catalog_options(),
+        )
+        .await?;
+        let tables = self.plan_inventory(inventory)?;
+        let publication = PublicationSpec::new(
+            &names.publication,
+            tables
+                .iter()
+                .map(|table| table.planned.source.name.clone())
+                .collect(),
+        )?;
+        validate_publication(source, &publication, None)
+            .await
+            .map_err(|error| RuntimeJobError::PublicationDrift(error.to_string()))?;
+        let activation_tables = tables
+            .iter()
+            .map(|table| {
+                table
+                    .snapshot_plan
+                    .activation_table(&table.planned.schema_fingerprint)
+            })
+            .collect::<Vec<_>>();
+        validate_active_snapshot_group(target, self.fence, &activation_tables).await?;
+        Ok(PreparedRun { tables, checkpoint })
+    }
+}
+
+fn parse_optional_lsn(value: Option<String>) -> Result<Option<PgLsn>, RuntimeJobError> {
+    value
+        .map(|value| {
+            PgLsn::from_str(&value).map_err(|_| RuntimeJobError::InvalidPersistedLsn(value))
+        })
+        .transpose()
+}
+
+fn assess_wal_retention(
+    slot: &LogicalSlotState,
+    policy: WalRetentionSettings,
+) -> WalRetentionAssessment {
+    if let Some(reason) = &slot.invalidation_reason {
+        return WalRetentionAssessment::Rebuild(format!(
+            "PostgreSQL invalidated the slot: {reason}"
+        ));
+    }
+    match slot.wal_status.as_deref() {
+        Some("lost") => {
+            return WalRetentionAssessment::Rebuild(
+                "PostgreSQL reports wal_status=lost".to_owned(),
+            );
+        }
+        Some("unreserved") => {
+            return WalRetentionAssessment::Rebuild(
+                "PostgreSQL reports wal_status=unreserved; required WAL is no longer protected"
+                    .to_owned(),
+            );
+        }
+        Some("extended") => {
+            // `extended` means the server has exceeded max_wal_size while retaining the slot's
+            // required files. Keep the pipeline alive only until the configured hard byte limit.
+        }
+        Some("reserved") => {}
+        Some(other) => {
+            return WalRetentionAssessment::Rebuild(format!(
+                "unknown PostgreSQL wal_status `{other}`"
+            ));
+        }
+        None => {
+            return WalRetentionAssessment::Rebuild(
+                "PostgreSQL returned no wal_status for the managed slot".to_owned(),
+            );
+        }
+    }
+
+    if slot
+        .retained_wal_bytes
+        .is_some_and(|bytes| bytes >= policy.rebuild_bytes)
+    {
+        return WalRetentionAssessment::Rebuild(format!(
+            "retained WAL reached configured hard limit of {} bytes",
+            policy.rebuild_bytes
+        ));
+    }
+    if slot
+        .safe_wal_size
+        .is_some_and(|bytes| bytes <= policy.minimum_safe_bytes)
+    {
+        return WalRetentionAssessment::Rebuild(format!(
+            "safe_wal_size reached configured minimum of {} bytes",
+            policy.minimum_safe_bytes
+        ));
+    }
+
+    let retained_warning = slot
+        .retained_wal_bytes
+        .is_some_and(|bytes| bytes >= policy.warning_bytes);
+    let safe_warning = slot
+        .safe_wal_size
+        .is_some_and(|bytes| bytes <= policy.minimum_safe_bytes.saturating_mul(2));
+    if retained_warning || safe_warning || slot.wal_status.as_deref() == Some("extended") {
+        return WalRetentionAssessment::Warning(format!(
+            "retained_wal_bytes={:?}, safe_wal_size={:?}, wal_status={:?}",
+            slot.retained_wal_bytes, slot.safe_wal_size, slot.wal_status
+        ));
+    }
+    WalRetentionAssessment::Healthy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot() -> LogicalSlotState {
+        LogicalSlotState {
+            name: "slot".to_owned(),
+            plugin: "pgoutput".to_owned(),
+            database: Some("source".to_owned()),
+            temporary: false,
+            active: true,
+            confirmed_flush_lsn: Some("0/10".to_owned()),
+            restart_lsn: Some("0/1".to_owned()),
+            retained_wal_bytes: Some(100),
+            safe_wal_size: Some(1_000),
+            wal_status: Some("reserved".to_owned()),
+            invalidation_reason: None,
+            two_phase: false,
+            failover: false,
+            synced: false,
+        }
+    }
+
+    fn policy() -> WalRetentionSettings {
+        WalRetentionSettings {
+            check_interval_seconds: 1,
+            warning_bytes: 100,
+            rebuild_bytes: 200,
+            minimum_safe_bytes: 50,
+        }
+    }
+
+    #[test]
+    fn wal_retention_assessment_is_fail_closed() {
+        assert!(matches!(
+            assess_wal_retention(&slot(), policy()),
+            WalRetentionAssessment::Warning(_)
+        ));
+        let mut hard = slot();
+        hard.retained_wal_bytes = Some(200);
+        assert!(matches!(
+            assess_wal_retention(&hard, policy()),
+            WalRetentionAssessment::Rebuild(_)
+        ));
+        let mut lost = slot();
+        lost.wal_status = Some("lost".to_owned());
+        assert!(matches!(
+            assess_wal_retention(&lost, policy()),
+            WalRetentionAssessment::Rebuild(_)
+        ));
+        let mut unknown = slot();
+        unknown.wal_status = Some("future".to_owned());
+        assert!(matches!(
+            assess_wal_retention(&unknown, policy()),
+            WalRetentionAssessment::Rebuild(_)
+        ));
+    }
+}

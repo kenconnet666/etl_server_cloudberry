@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio_postgres::Client;
 
 const MIGRATION_LOCK_ID: i64 = 0x4350_4745_544c;
+pub const CONTROL_SCHEMA_VERSION: i64 = 2;
 
 const CONTROL_V1: &str = r#"
 CREATE SCHEMA IF NOT EXISTS cloudberry_etl_control;
@@ -93,17 +94,45 @@ CREATE TABLE IF NOT EXISTS cloudberry_etl_control.audit_log (
 );
 "#;
 
+// Keep rebuild epochs independent from immutable configuration revisions.
+const CONTROL_V2: &str = r#"
+ALTER TABLE cloudberry_etl_control.pipelines
+    ADD COLUMN IF NOT EXISTS snapshot_generation bigint NOT NULL DEFAULT 1;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid = 'cloudberry_etl_control.pipelines'::regclass
+           AND conname = 'pipelines_snapshot_generation_positive'
+    ) THEN
+        ALTER TABLE cloudberry_etl_control.pipelines
+            ADD CONSTRAINT pipelines_snapshot_generation_positive
+            CHECK (snapshot_generation > 0);
+    END IF;
+END
+$$;
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_control_schema",
-    sql: CONTROL_V1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_control_schema",
+        sql: CONTROL_V1,
+    },
+    Migration {
+        version: 2,
+        name: "pipeline_snapshot_generation",
+        sql: CONTROL_V2,
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -121,11 +150,13 @@ pub async fn migrate_control_database(client: &mut Client) -> Result<(), Migrati
             .await?;
         transaction
             .batch_execute(
-                "CREATE SCHEMA IF NOT EXISTS cloudberry_etl_control;\
-                 CREATE TABLE IF NOT EXISTS cloudberry_etl_control.schema_migrations (\
-                    version bigint PRIMARY KEY, name text NOT NULL, checksum bytea NOT NULL,\
-                    applied_at timestamptz NOT NULL DEFAULT clock_timestamp()\
-                 );",
+                r#"CREATE SCHEMA IF NOT EXISTS cloudberry_etl_control;
+                   CREATE TABLE IF NOT EXISTS cloudberry_etl_control.schema_migrations (
+                       version bigint PRIMARY KEY,
+                       name text NOT NULL,
+                       checksum bytea NOT NULL,
+                       applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+                   );"#,
             )
             .await?;
 
@@ -157,4 +188,17 @@ pub async fn migrate_control_database(client: &mut Client) -> Result<(), Migrati
         transaction.commit().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exported_schema_version_matches_latest_migration() {
+        assert_eq!(
+            MIGRATIONS.last().map(|migration| migration.version),
+            Some(CONTROL_SCHEMA_VERSION)
+        );
+    }
 }

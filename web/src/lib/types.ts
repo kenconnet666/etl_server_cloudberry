@@ -1,8 +1,25 @@
 export type Id = string;
 
 export type SourceTopology = 'standalone' | 'physical_ha' | 'citus';
-export type RuntimeState = 'running' | 'stopped';
-export type OperationState = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type RuntimeState = 'starting' | 'running' | 'stopped' | 'failed' | 'degraded';
+export type PipelinePhase =
+  | 'draft'
+  | 'validating'
+  | 'snapshotting'
+  | 'catching_up'
+  | 'running'
+  | 'paused'
+  | 'degraded'
+  | 'failed'
+  | 'stopped';
+export type OperationState =
+  | 'requested'
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
 
 export interface Session {
   username: string;
@@ -51,16 +68,43 @@ export interface Pipeline {
   target_id: Id;
   desired_running: boolean;
   config_revision: number;
+  snapshot_generation: number;
   settings: Settings;
   runtime_state: RuntimeState;
+  runtime?: PipelineRuntime | null;
   created_at: string;
   updated_at: string;
 }
 
+export interface PipelineRuntime {
+  pipeline_id: Id;
+  phase: PipelinePhase;
+  state: RuntimeState;
+  source_received_lsn?: string | null;
+  source_current_lsn?: string | null;
+  target_checkpoint_lsn?: string | null;
+  estimated_byte_lag?: number | null;
+  slot_retained_wal_bytes?: number | null;
+  slot_safe_wal_bytes?: number | null;
+  wal_retention_warning: boolean;
+  last_transaction_at?: string | null;
+  last_apply_at?: string | null;
+  last_ack_at?: string | null;
+  started_at?: string | null;
+  stopped_at?: string | null;
+  restart_count: number;
+  last_error?: string | null;
+}
+
 export interface Operation {
   id: Id;
+  pipeline_id: Id | null;
   operation_type: string;
   state: OperationState;
+  detail: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+  runtime?: PipelineRuntime | null;
 }
 
 export interface Overview {

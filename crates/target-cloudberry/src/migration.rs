@@ -60,17 +60,153 @@ USING heap
 DISTRIBUTED BY (target_schema, target_table);
 "#;
 
+pub const TARGET_V2_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.managed_types (
+    type_schema text NOT NULL,
+    type_name text NOT NULL,
+    pipeline_id uuid NOT NULL,
+    definition_checksum bytea NOT NULL CHECK (octet_length(definition_checksum) = 32),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (type_schema, type_name)
+)
+USING heap
+DISTRIBUTED BY (type_schema, type_name);
+"#;
+
+pub const TARGET_V3_SQL: &str = r#"
+ALTER TABLE pg2cb_meta.managed_tables
+    ADD COLUMN IF NOT EXISTS snapshot_group_id uuid;
+
+CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_groups (
+    snapshot_group_id uuid PRIMARY KEY,
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    state text NOT NULL CHECK (state IN ('loading', 'active')),
+    table_count bigint NOT NULL CHECK (table_count > 0),
+    node_count bigint NOT NULL CHECK (node_count > 0),
+    manifest_checksum bytea NOT NULL CHECK (octet_length(manifest_checksum) = 32),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    activated_at timestamptz
+)
+USING heap
+DISTRIBUTED BY (snapshot_group_id);
+
+CREATE INDEX IF NOT EXISTS snapshot_groups_pipeline_generation_idx
+    ON pg2cb_meta.snapshot_groups (pipeline_id, topology_generation);
+
+CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_group_tables (
+    snapshot_group_id uuid NOT NULL,
+    target_schema text NOT NULL,
+    target_table text NOT NULL,
+    shadow_schema text NOT NULL,
+    shadow_table text NOT NULL,
+    source_relation_id bigint NOT NULL CHECK (source_relation_id > 0),
+    table_generation bigint NOT NULL CHECK (table_generation >= 0),
+    schema_fingerprint text NOT NULL CHECK (schema_fingerprint <> ''),
+    PRIMARY KEY (snapshot_group_id, target_schema, target_table),
+    UNIQUE (snapshot_group_id, shadow_schema, shadow_table),
+    UNIQUE (snapshot_group_id, source_relation_id)
+)
+USING heap
+DISTRIBUTED BY (snapshot_group_id);
+
+CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_group_nodes (
+    snapshot_group_id uuid NOT NULL,
+    node_id integer NOT NULL,
+    system_identifier numeric(20, 0) NOT NULL CHECK (system_identifier >= 0),
+    timeline bigint NOT NULL CHECK (timeline > 0 AND timeline <= 4294967295),
+    slot_name text NOT NULL CHECK (slot_name <> ''),
+    consistent_lsn pg_lsn NOT NULL,
+    PRIMARY KEY (snapshot_group_id, node_id)
+)
+USING heap
+DISTRIBUTED BY (snapshot_group_id);
+"#;
+
+pub const TARGET_V4_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_reconciliation_log (
+    snapshot_group_id uuid NOT NULL,
+    original_schema text NOT NULL,
+    original_table text NOT NULL,
+    quarantine_schema text NOT NULL,
+    quarantine_table text NOT NULL,
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    source_relation_id bigint NOT NULL CHECK (source_relation_id > 0),
+    previous_snapshot_group_id uuid,
+    table_generation bigint NOT NULL CHECK (table_generation >= 0),
+    schema_fingerprint text NOT NULL CHECK (schema_fingerprint <> ''),
+    reason text NOT NULL CHECK (reason IN ('replaced', 'stale')),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (snapshot_group_id, original_schema, original_table)
+)
+USING heap
+DISTRIBUTED BY (snapshot_group_id);
+"#;
+
+/// Metadata needed to make destructive cleanup identity-safe.
+///
+/// `relation_oid` is intentionally nullable for databases upgraded from V4.  Cleanup refuses
+/// those legacy rows until a new, identity-bearing activation records the object.  The
+/// reconciliation audit row is retained after a quarantine is dropped and records who performed
+/// the purge.
+pub const TARGET_V5_SQL: &str = r#"
+ALTER TABLE pg2cb_meta.managed_tables
+    ADD COLUMN IF NOT EXISTS relation_oid bigint;
+
+ALTER TABLE pg2cb_meta.snapshot_reconciliation_log
+    ADD COLUMN IF NOT EXISTS quarantine_relation_oid bigint,
+    ADD COLUMN IF NOT EXISTS previous_fencing_token bigint,
+    ADD COLUMN IF NOT EXISTS purged_at timestamptz,
+    ADD COLUMN IF NOT EXISTS purged_by_fencing_token bigint;
+
+CREATE INDEX IF NOT EXISTS managed_tables_pipeline_group_state_idx
+    ON pg2cb_meta.managed_tables (pipeline_id, snapshot_group_id, state);
+
+CREATE INDEX IF NOT EXISTS snapshot_reconciliation_gc_idx
+    ON pg2cb_meta.snapshot_reconciliation_log (pipeline_id, recorded_at, snapshot_group_id);
+
+CREATE INDEX IF NOT EXISTS snapshot_groups_loading_idx
+    ON pg2cb_meta.snapshot_groups (pipeline_id, topology_generation, state, created_at);
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_target_metadata",
-    sql: TARGET_V1_SQL,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_target_metadata",
+        sql: TARGET_V1_SQL,
+    },
+    Migration {
+        version: 2,
+        name: "managed_user_types",
+        sql: TARGET_V2_SQL,
+    },
+    Migration {
+        version: 3,
+        name: "snapshot_group_manifests",
+        sql: TARGET_V3_SQL,
+    },
+    Migration {
+        version: 4,
+        name: "snapshot_reconciliation_log",
+        sql: TARGET_V4_SQL,
+    },
+    Migration {
+        version: 5,
+        name: "identity_safe_snapshot_cleanup",
+        sql: TARGET_V5_SQL,
+    },
+];
 
 const BOOTSTRAP_SQL: &str = r#"
 CREATE SCHEMA IF NOT EXISTS pg2cb_meta;
@@ -144,15 +280,66 @@ mod tests {
         assert!(
             TARGET_V1_SQL.contains("DISTRIBUTED BY (pipeline_id, topology_generation, node_id)")
         );
+        assert!(TARGET_V2_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.managed_types"));
+        assert!(TARGET_V2_SQL.contains(
+            "definition_checksum bytea NOT NULL CHECK (octet_length(definition_checksum) = 32)"
+        ));
+        assert!(TARGET_V2_SQL.contains("DISTRIBUTED BY (type_schema, type_name)"));
+        assert!(TARGET_V3_SQL.contains("ADD COLUMN IF NOT EXISTS snapshot_group_id uuid"));
+        assert!(TARGET_V3_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_groups"));
+        assert!(
+            TARGET_V3_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_group_tables")
+        );
+        assert!(
+            TARGET_V3_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_group_nodes")
+        );
+        assert_eq!(
+            TARGET_V3_SQL
+                .matches("DISTRIBUTED BY (snapshot_group_id)")
+                .count(),
+            3
+        );
+        assert!(
+            TARGET_V4_SQL
+                .contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_reconciliation_log")
+        );
+        assert!(TARGET_V4_SQL.contains("reason IN ('replaced', 'stale')"));
+        assert!(TARGET_V4_SQL.contains("DISTRIBUTED BY (snapshot_group_id)"));
+        assert!(TARGET_V5_SQL.contains("ADD COLUMN IF NOT EXISTS relation_oid bigint"));
+        assert!(TARGET_V5_SQL.contains("ADD COLUMN IF NOT EXISTS purged_at timestamptz"));
+        assert!(TARGET_V5_SQL.contains("quarantine_relation_oid bigint"));
+        assert!(TARGET_V5_SQL.contains("previous_fencing_token bigint"));
+        assert!(TARGET_V5_SQL.contains("purged_by_fencing_token bigint"));
+        assert!(TARGET_V5_SQL.contains("snapshot_reconciliation_gc_idx"));
     }
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 1);
+        assert_eq!(MIGRATIONS.len(), 5);
         assert_eq!(MIGRATIONS[0].version, 1);
+        assert_eq!(MIGRATIONS[1].version, 2);
+        assert_eq!(MIGRATIONS[2].version, 3);
+        assert_eq!(MIGRATIONS[3].version, 4);
+        assert_eq!(MIGRATIONS[4].version, 5);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[1].sql),
+            Sha256::digest(TARGET_V2_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[2].sql),
+            Sha256::digest(TARGET_V3_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[3].sql),
+            Sha256::digest(TARGET_V4_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[4].sql),
+            Sha256::digest(TARGET_V5_SQL)
         );
     }
 }

@@ -1,15 +1,5 @@
 <script lang="ts">
-  import {
-    CirclePause,
-    GitBranch,
-    LoaderCircle,
-    Play,
-    Plus,
-    RefreshCw,
-    RotateCcw,
-    Rows3,
-    ServerCog
-  } from '@lucide/svelte';
+  import { CirclePause, GitBranch, LoaderCircle, Play, Plus, RefreshCw, RotateCcw } from '@lucide/svelte';
 
   import { api, apiErrorMessage } from '../api';
   import ConfirmAction from '../components/ConfirmAction.svelte';
@@ -17,7 +7,7 @@
   import InlineNotice from '../components/InlineNotice.svelte';
   import PipelineDialog from '../components/PipelineDialog.svelte';
   import StatusBadge from '../components/StatusBadge.svelte';
-  import { formatBytes, formatDateTime, formatDuration, formatNumber, truncateMiddle } from '../format';
+  import { formatBytes, formatDateTime, label, truncateMiddle } from '../format';
   import type { Pipeline, Source, Target } from '../types';
 
   let {
@@ -39,18 +29,17 @@
   let dialogOpen = $state(false);
   let confirmRebuild = $state(false);
 
-  let selected = $derived(
-    detail?.id === selectedId ? detail : pipelines.find((pipeline) => pipeline.id === selectedId)
-  );
-  let canPause = $derived(
-    selected ? ['validating', 'snapshotting', 'catching_up', 'running', 'degraded'].includes(selected.phase) : false
-  );
-  let tableCounts = $derived({
-    total: selected?.tables?.length || 0,
-    running: selected?.tables?.filter((table) => table.phase === 'running').length || 0,
-    attention:
-      selected?.tables?.filter((table) => ['rebuild_required', 'blocked', 'quarantined'].includes(table.phase)).length || 0
-  });
+  let selected = $derived(detail?.id === selectedId ? detail : pipelines.find((pipeline) => pipeline.id === selectedId));
+  let selectedSource = $derived(sources.find((source) => source.id === selected?.source_id));
+  let selectedTarget = $derived(targets.find((target) => target.id === selected?.target_id));
+
+  function sourceName(id: string): string {
+    return sources.find((source) => source.id === id)?.name || truncateMiddle(id, 16);
+  }
+
+  function targetName(id: string): string {
+    return targets.find((target) => target.id === id)?.name || truncateMiddle(id, 16);
+  }
 
   async function loadDetail(id: string): Promise<void> {
     detailLoading = true;
@@ -79,9 +68,7 @@
     try {
       [pipelines, sources, targets] = await Promise.all([api.pipelines(), api.sources(), api.targets()]);
       onApiState(true);
-      const nextId = pipelines.some((pipeline) => pipeline.id === selectedId)
-        ? selectedId
-        : pipelines[0]?.id || '';
+      const nextId = pipelines.some((pipeline) => pipeline.id === selectedId) ? selectedId : pipelines[0]?.id || '';
       selectedId = nextId;
       if (nextId) {
         detail = pipelines.find((pipeline) => pipeline.id === nextId);
@@ -102,7 +89,7 @@
     busyAction = action;
     actionError = '';
     try {
-      await api.pipelineAction(selected.id, action);
+      detail = await api.pipelineAction(selected.id, action);
       confirmRebuild = false;
       await load();
       onDataChanged();
@@ -128,7 +115,7 @@
   <div class="page-heading">
     <div><p class="eyebrow">Final-state replication</p><h2>Pipelines</h2></div>
     <div class="page-actions">
-      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh pipelines" aria-label="Refresh pipelines"><RefreshCw class:spin={loading} size={18} /></button>
+      <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh pipelines" aria-label="Refresh pipelines"><RefreshCw class={loading ? 'spin' : undefined} size={18} /></button>
       <button class="button primary" type="button" onclick={() => (dialogOpen = true)}><Plus size={16} /> New pipeline</button>
     </div>
   </div>
@@ -139,16 +126,15 @@
     {#if pipelines.length > 0}
       <div class="table-scroll pipeline-list">
         <table>
-          <thead><tr><th>Pipeline</th><th>Route</th><th>Prefix</th><th>Status</th><th>Lag</th><th>Revision</th><th>Updated</th></tr></thead>
+          <thead><tr><th>Pipeline</th><th>Route</th><th>Runtime</th><th>Desired</th><th>Revision</th><th>Updated</th></tr></thead>
           <tbody>
             {#each pipelines as pipeline}
               <tr class:selected-row={pipeline.id === selectedId}>
                 <td data-label="Pipeline"><button class="table-link" type="button" onclick={() => selectPipeline(pipeline.id)}>{pipeline.name}</button><small class="mono">{truncateMiddle(pipeline.id, 20)}</small></td>
-                <td data-label="Route">{pipeline.source_name || truncateMiddle(pipeline.source_id, 12)}<span class="route-arrow">→</span>{pipeline.target_name || truncateMiddle(pipeline.target_id, 12)}</td>
-                <td data-label="Prefix" class="mono">{pipeline.source_prefix}</td>
-                <td data-label="Status"><StatusBadge value={pipeline.phase} compact /></td>
-                <td data-label="Lag"><strong>{formatBytes(pipeline.lag_bytes)}</strong><small>{formatDuration(pipeline.lag_seconds)}</small></td>
-                <td data-label="Revision">{pipeline.config_revision ?? '—'}</td>
+                <td data-label="Route">{sourceName(pipeline.source_id)}<span class="route-arrow">→</span>{targetName(pipeline.target_id)}</td>
+                <td data-label="Runtime"><StatusBadge value={pipeline.runtime_state} compact /></td>
+                <td data-label="Desired">{pipeline.desired_running ? 'Running' : 'Paused'}</td>
+                <td data-label="Revision">{pipeline.config_revision}</td>
                 <td data-label="Updated">{formatDateTime(pipeline.updated_at)}</td>
               </tr>
             {/each}
@@ -156,7 +142,7 @@
         </table>
       </div>
     {:else if !loading && !error}
-      <EmptyState icon={GitBranch} title="No pipelines" detail="Connect a PostgreSQL source and Cloudberry target, then define a source prefix." actionLabel="Create pipeline" onAction={() => (dialogOpen = true)} />
+      <EmptyState icon={GitBranch} title="No pipelines" detail="Connect a PostgreSQL source and Cloudberry target, then create a route." actionLabel="Create pipeline" onAction={() => (dialogOpen = true)} />
     {/if}
   </section>
 
@@ -164,12 +150,11 @@
     <section class="pipeline-detail" aria-labelledby="pipeline-detail-title">
       <div class="detail-heading">
         <div>
-          <div class="detail-title-row"><h3 id="pipeline-detail-title">{selected.name}</h3><StatusBadge value={selected.phase} /></div>
-          <p>{selected.source_name || selected.source_id} <span>→</span> {selected.target_name || selected.target_id}</p>
-          {#if selected.detail}<small>{selected.detail}</small>{/if}
+          <div class="detail-title-row"><h3 id="pipeline-detail-title">{selected.name}</h3><StatusBadge value={selected.runtime_state} /></div>
+          <p>{sourceName(selected.source_id)} <span>→</span> {targetName(selected.target_id)}</p>
         </div>
         <div class="pipeline-actions">
-          {#if canPause}
+          {#if selected.desired_running}
             <button class="button secondary" type="button" disabled={Boolean(busyAction)} onclick={() => runAction('pause')}><CirclePause size={16} /> {busyAction === 'pause' ? 'Pausing' : 'Pause'}</button>
           {:else}
             <button class="button primary" type="button" disabled={Boolean(busyAction)} onclick={() => runAction('start')}><Play size={16} /> {busyAction === 'start' ? 'Starting' : 'Start'}</button>
@@ -184,60 +169,42 @@
       {#if actionError}<InlineNotice tone="error" title="Pipeline operation failed" detail={actionError} />{/if}
 
       <div class="detail-metrics">
-        <div><span>Apply lag</span><strong>{formatBytes(selected.lag_bytes)}</strong><small>{formatDuration(selected.lag_seconds)}</small></div>
-        <div><span>Node checkpoints</span><strong>{selected.checkpoints?.length || 0}</strong><small>Independent LSN streams</small></div>
-        <div><span>Tables running</span><strong>{tableCounts.running}/{tableCounts.total}</strong><small>{tableCounts.attention} need attention</small></div>
-        <div><span>Namespace prefix</span><strong class="mono">{selected.source_prefix}</strong><small>{selected.target_database || 'Target database not reported'}</small></div>
+        <div><span>Runtime state</span><strong>{label(selected.runtime_state)}</strong><small>Supervisor observation</small></div>
+        <div><span>Desired state</span><strong>{selected.desired_running ? 'Running' : 'Paused'}</strong><small>Control-plane intent</small></div>
+        <div><span>Config revision</span><strong>{selected.config_revision}</strong><small>Monotonic revision</small></div>
+        <div><span>Snapshot generation</span><strong>{selected.snapshot_generation}</strong><small>Rebuild epoch</small></div>
+        <div><span>Last updated</span><strong class="metric-date">{formatDateTime(selected.updated_at)}</strong><small>Control database</small></div>
       </div>
 
-      <section class="detail-section">
-        <div class="section-heading compact"><div><h4><ServerCog size={17} /> Node checkpoints</h4><span>Received, applied, and flushed positions per physical source node</span></div></div>
-        {#if selected.checkpoints && selected.checkpoints.length > 0}
-          <div class="table-scroll">
-            <table>
-              <thead><tr><th>Node</th><th>Slot</th><th>Timeline</th><th>Received LSN</th><th>Applied LSN</th><th>Flushed LSN</th><th>Lag</th></tr></thead>
-              <tbody>
-                {#each selected.checkpoints as checkpoint}
-                  <tr>
-                    <td data-label="Node"><strong>{checkpoint.node_name || `Node ${checkpoint.node_id}`}</strong><small class="mono">{checkpoint.system_identifier}</small></td>
-                    <td data-label="Slot" class="mono">{checkpoint.slot_name}</td>
-                    <td data-label="Timeline">{checkpoint.timeline}</td>
-                    <td data-label="Received LSN" class="mono">{checkpoint.received_lsn}</td>
-                    <td data-label="Applied LSN" class="mono">{checkpoint.applied_lsn}</td>
-                    <td data-label="Flushed LSN" class="mono">{checkpoint.flushed_lsn}</td>
-                    <td data-label="Lag"><strong>{formatBytes(checkpoint.lag_bytes)}</strong><small>{formatDuration(checkpoint.lag_seconds)}</small></td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        {:else}<div class="section-empty">No node checkpoints reported</div>{/if}
+      <section class="detail-section route-details">
+        <div class="section-heading compact"><div><h4>Replication route</h4><span>Namespace and database ownership for this pipeline</span></div></div>
+        <dl class="definition-grid">
+          <div><dt>Source</dt><dd>{selectedSource?.name || selected.source_id}</dd></div>
+          <div><dt>Source topology</dt><dd>{selectedSource ? label(selectedSource.topology) : 'Unavailable'}</dd></div>
+          <div><dt>Source database</dt><dd class="mono">{selectedSource?.database_name || 'Unavailable'}</dd></div>
+          <div><dt>Source prefix</dt><dd class="mono">{selectedSource?.prefix || 'Unavailable'}</dd></div>
+          <div><dt>Target</dt><dd>{selectedTarget?.name || selected.target_id}</dd></div>
+          <div><dt>Target database</dt><dd class="mono">{selectedTarget?.database_name || 'Unavailable'}</dd></div>
+        </dl>
       </section>
 
-      <section class="detail-section">
-        <div class="section-heading compact"><div><h4><Rows3 size={17} /> Table state</h4><span>Snapshot, catch-up, rebuild, and schema generations</span></div></div>
-        {#if selected.tables && selected.tables.length > 0}
-          <div class="table-scroll">
-            <table>
-              <thead><tr><th>Source table</th><th>Target table</th><th>Status</th><th>Rows copied</th><th>Lag</th><th>Generation</th><th>Schema</th><th>Detail</th></tr></thead>
-              <tbody>
-                {#each selected.tables as table}
-                  <tr>
-                    <td data-label="Source table" class="mono">{table.source_name}</td>
-                    <td data-label="Target table" class="mono">{table.target_name}</td>
-                    <td data-label="Status"><StatusBadge value={table.phase} compact /></td>
-                    <td data-label="Rows copied">{formatNumber(table.rows_copied)}</td>
-                    <td data-label="Lag">{formatBytes(table.lag_bytes)}</td>
-                    <td data-label="Generation">{table.generation ?? '—'}</td>
-                    <td data-label="Schema">{table.schema_version ?? '—'}</td>
-                    <td data-label="Detail" class="detail-cell">{table.detail || '—'}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          </div>
-        {:else}<div class="section-empty">No table state reported</div>{/if}
-      </section>
+      {#if selected.runtime}
+        <section class="detail-section runtime-details">
+          <div class="section-heading compact"><div><h4>Runtime telemetry</h4><span>Durable progress observed by the supervisor</span></div></div>
+          <dl class="definition-grid">
+            <div><dt>Replication phase</dt><dd><StatusBadge value={selected.runtime.phase} compact /></dd></div>
+            <div><dt>Source received LSN</dt><dd class="mono">{selected.runtime.source_received_lsn || '—'}</dd></div>
+            <div><dt>Source current LSN</dt><dd class="mono">{selected.runtime.source_current_lsn || '—'}</dd></div>
+            <div><dt>Target checkpoint LSN</dt><dd class="mono">{selected.runtime.target_checkpoint_lsn || '—'}</dd></div>
+            <div><dt>Estimated WAL lag</dt><dd>{formatBytes(selected.runtime.estimated_byte_lag ?? undefined)}</dd></div>
+            <div><dt>Restarts</dt><dd>{selected.runtime.restart_count}</dd></div>
+            <div><dt>Last transaction</dt><dd>{formatDateTime(selected.runtime.last_transaction_at ?? undefined)}</dd></div>
+            <div><dt>Last apply</dt><dd>{formatDateTime(selected.runtime.last_apply_at ?? undefined)}</dd></div>
+            <div><dt>Last acknowledgement</dt><dd>{formatDateTime(selected.runtime.last_ack_at ?? undefined)}</dd></div>
+          </dl>
+          {#if selected.runtime.last_error}<InlineNotice tone="error" title="Last runtime error" detail={selected.runtime.last_error} />{/if}
+        </section>
+      {/if}
     </section>
   {/if}
 </div>
@@ -246,8 +213,8 @@
 <ConfirmAction
   open={confirmRebuild}
   title="Rebuild pipeline"
-  detail={selected ? `Create a new generation for ${selected.name} and resnapshot its tables? Existing target data remains active until the new generation is ready.` : ''}
-  confirmLabel="Start rebuild"
+  detail={selected ? `Request a rebuild for ${selected.name}? This creates a new snapshot generation and the supervisor will reconcile the request.` : ''}
+  confirmLabel="Request rebuild"
   busy={busyAction === 'rebuild'}
   onClose={() => (confirmRebuild = false)}
   onConfirm={() => runAction('rebuild')}
