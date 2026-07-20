@@ -1,0 +1,36 @@
+[package]
+name = "etl-server-cloudberry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "etl-server-cloudberry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+cloudberry-etl-api.workspace = true
+cloudberry-etl-config.workspace = true
+cloudberry-etl-engine.workspace = true
+cloudberry-etl-metadata.workspace = true
+cloudberry-etl-source-postgres.workspace = true
+cloudberry-etl-target-cloudberry.workspace = true
+native-tls.workspace = true
+postgres-native-tls.workspace = true
+rand.workspace = true
+rpassword.workspace = true
+secrecy.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

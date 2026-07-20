@@ -1,0 +1,25 @@
+[package]
+name = "cloudberry-etl-source-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+cloudberry-etl-core.workspace = true
+futures.workspace = true
+postgres-replication.workspace = true
+replication-postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

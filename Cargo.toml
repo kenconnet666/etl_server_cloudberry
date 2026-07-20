@@ -1,6 +1,89 @@
-[package]
-name = "etl_server_cloudberry"
+[workspace]
+resolver = "3"
+members = [
+    "crates/api",
+    "crates/app",
+    "crates/config",
+    "crates/core",
+    "crates/engine",
+    "crates/metadata",
+    "crates/source-postgres",
+    "crates/target-cloudberry",
+]
+default-members = ["crates/app"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
+repository = "https://github.com/kenconnet666/etl_server_cloudberry"
 
-[dependencies]
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["cookie"] }
+base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+http = "1"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+rand = "0.9"
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+replication-postgres = { package = "tokio-postgres", git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+postgres-replication = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
+toml = "0.9"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["catch-panic", "compression-gzip", "cors", "fs", "request-id", "sensitive-headers", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+zeroize = { version = "1", features = ["derive"] }
+rpassword = "7"
+
+cloudberry-etl-api = { path = "crates/api" }
+cloudberry-etl-config = { path = "crates/config" }
+cloudberry-etl-core = { path = "crates/core" }
+cloudberry-etl-engine = { path = "crates/engine" }
+cloudberry-etl-metadata = { path = "crates/metadata" }
+cloudberry-etl-source-postgres = { path = "crates/source-postgres" }
+cloudberry-etl-target-cloudberry = { path = "crates/target-cloudberry" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+clone_on_ref_ptr = "deny"
+dbg_macro = "deny"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+opt-level = 3
+strip = "symbols"
+
+[workspace.metadata.replication-fork]
+repository = "https://github.com/iambriccardo/rust-postgres"
+revision = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38"
+scope = "COPY BOTH transport and pgoutput protocol only"

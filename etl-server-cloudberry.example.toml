@@ -1,0 +1,14 @@
+[server]
+listen = "127.0.0.1:8080"
+secure_cookies = false
+session_ttl_seconds = 28800
+
+[admin]
+username = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$replace_with_hash_password_output$invalid"
+
+[control]
+database_url_env = "ETL_CONTROL_DATABASE_URL"
+
+[security]
+master_key_env = "ETL_MASTER_KEY"

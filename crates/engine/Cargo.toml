@@ -1,0 +1,27 @@
+[package]
+name = "cloudberry-etl-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+cloudberry-etl-core.workspace = true
+cloudberry-etl-metadata.workspace = true
+cloudberry-etl-source-postgres.workspace = true
+cloudberry-etl-target-cloudberry.workspace = true
+futures.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
