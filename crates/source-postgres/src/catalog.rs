@@ -189,18 +189,19 @@ pub async fn load_tables(
                     a.attgenerated::text,
                     a.attidentity::text,
                     c.relreplident::text,
-                    CASE WHEN i.indisprimary THEN array_position(i.indkey, a.attnum)::int4 END AS pk_ordinal,
+                    CASE WHEN i.indisprimary THEN array_position(i.indkey::int2[], a.attnum)::int4 END AS pk_ordinal,
                     coll_ns.nspname AS collation_schema,
                     coll.collname AS collation_name,
                     COALESCE((SELECT partattrs::text FROM pg_partitioned_table p WHERE p.partrelid = c.oid), '{}') AS partition_attrs
                FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-               LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary AND i.indisvalid AND i.indisready
+               LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+                                      AND i.indisvalid AND i.indisready AND i.indimmediate
                LEFT JOIN pg_collation coll ON coll.oid = a.attcollation AND a.attcollation <> 0
                LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
               WHERE c.relkind IN ('r', 'p')
-                AND NOT c.relpersistence = 't'
+                AND c.relpersistence = 'p'
               ORDER BY c.oid, a.attnum",
             &[],
         )
@@ -304,14 +305,14 @@ pub async fn load_tables_with_citus(
 async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, TypeDescriptor>> {
     let rows = client
         .query(
-            "SELECT t.oid::int8, ns.nspname, t.typname, t.typtype::text, t.typcategory::text,
+            "SELECT t.oid::int8, ns.nspname, t.typname, t.typtype::text,
                     NULLIF(t.typbasetype, 0)::int8, NULLIF(t.typelem, 0)::int8,
                     COALESCE(array_agg(e.enumlabel ORDER BY e.enumsortorder)
                              FILTER (WHERE e.enumlabel IS NOT NULL), ARRAY[]::text[])
                FROM pg_type t
                JOIN pg_namespace ns ON ns.oid = t.typnamespace
                LEFT JOIN pg_enum e ON e.enumtypid = t.oid
-              GROUP BY t.oid, ns.nspname, t.typname, t.typtype, t.typcategory,
+              GROUP BY t.oid, ns.nspname, t.typname, t.typtype,
                        t.typbasetype, t.typelem",
             &[],
         )
@@ -320,11 +321,11 @@ async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, Typ
     for row in rows {
         let oid = parse_u32_value(row.try_get::<_, i64>(0)?, "type oid")?;
         let base_oid = row
-            .try_get::<_, Option<i64>>(5)?
+            .try_get::<_, Option<i64>>(4)?
             .map(|value| parse_u32_value(value, "base type oid"))
             .transpose()?;
         let element_oid = row
-            .try_get::<_, Option<i64>>(6)?
+            .try_get::<_, Option<i64>>(5)?
             .map(|value| parse_u32_value(value, "element type oid"))
             .transpose()?;
         let constraints = client
@@ -348,7 +349,7 @@ async fn load_type_descriptors(client: &Client) -> SourceResult<HashMap<u32, Typ
                 typtype: row.try_get(3)?,
                 base_oid,
                 element_oid,
-                labels: row.try_get(7)?,
+                labels: row.try_get(6)?,
                 constraints,
             },
         );

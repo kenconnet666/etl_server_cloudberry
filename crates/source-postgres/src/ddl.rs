@@ -236,7 +236,14 @@ pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessa
 }
 
 fn validate_schema(value: &str) -> SourceResult<()> {
-    if value.is_empty() || value.contains('\0') || value.len() > 63 {
+    if value.is_empty()
+        || value.contains('\0')
+        || value.len() > 63
+        || value == "pg_catalog"
+        || value == "information_schema"
+        || value.starts_with("pg_toast")
+        || value.starts_with("pg_temp")
+    {
         return Err(SourceError::InvalidIdentifier(value.to_owned()));
     }
     Ok(())

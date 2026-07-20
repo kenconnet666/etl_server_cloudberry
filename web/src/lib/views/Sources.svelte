@@ -6,7 +6,7 @@
   import InlineNotice from '../components/InlineNotice.svelte';
   import SourceDialog from '../components/SourceDialog.svelte';
   import StatusBadge from '../components/StatusBadge.svelte';
-  import { formatDateTime, label } from '../format';
+  import { formatDateTime, label, truncateMiddle } from '../format';
   import type { Source } from '../types';
 
   let {
@@ -19,6 +19,11 @@
   let loading = $state(true);
   let error = $state('');
   let dialogOpen = $state(false);
+
+  function endpoint(source: Source): string {
+    const connection = source.settings.connection;
+    return connection?.host ? `${connection.host}:${connection.port ?? 5432}` : 'Not recorded';
+  }
 
   async function load(): Promise<void> {
     loading = true;
@@ -60,17 +65,16 @@
     {#if sources.length > 0}
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Name</th><th>Topology</th><th>Endpoint</th><th>Database</th><th>Version</th><th>Nodes</th><th>Health</th><th>Updated</th></tr></thead>
+          <thead><tr><th>Name</th><th>Prefix</th><th>Topology</th><th>Endpoint</th><th>Database</th><th>State</th><th>Updated</th></tr></thead>
           <tbody>
             {#each sources as source}
               <tr>
-                <td data-label="Name"><strong>{source.name}</strong><small class="mono">{source.id}</small></td>
+                <td data-label="Name"><strong>{source.name}</strong><small class="mono">{truncateMiddle(source.id, 20)}</small></td>
+                <td data-label="Prefix" class="mono">{source.prefix}</td>
                 <td data-label="Topology">{label(source.topology)}</td>
-                <td data-label="Endpoint" class="mono">{source.host}:{source.port}</td>
-                <td data-label="Database">{source.database}</td>
-                <td data-label="Version">{source.citus_version ? `Citus ${source.citus_version}` : source.postgres_version ? `PostgreSQL ${source.postgres_version}` : '—'}</td>
-                <td data-label="Nodes">{source.node_count ?? (source.topology === 'citus' ? '—' : 1)}</td>
-                <td data-label="Health"><StatusBadge value={source.health} compact />{#if source.detail}<small>{source.detail}</small>{/if}</td>
+                <td data-label="Endpoint" class="mono">{endpoint(source)}</td>
+                <td data-label="Database">{source.database_name}</td>
+                <td data-label="State"><StatusBadge value={source.enabled ? 'enabled' : 'disabled'} compact /></td>
                 <td data-label="Updated">{formatDateTime(source.updated_at)}</td>
               </tr>
             {/each}
@@ -78,7 +82,7 @@
         </table>
       </div>
     {:else if !loading && !error}
-      <EmptyState icon={Database} title="No PostgreSQL sources" detail="Add a PostgreSQL 18 or Citus coordinator connection." actionLabel="Add source" onAction={() => (dialogOpen = true)} />
+      <EmptyState icon={Database} title="No PostgreSQL sources" detail="Add a PostgreSQL 18, physical HA, or Citus source connection." actionLabel="Add source" onAction={() => (dialogOpen = true)} />
     {/if}
   </section>
 </div>

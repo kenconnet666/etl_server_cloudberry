@@ -5,7 +5,7 @@
   import EmptyState from '../components/EmptyState.svelte';
   import InlineNotice from '../components/InlineNotice.svelte';
   import StatusBadge from '../components/StatusBadge.svelte';
-  import { formatDateTime, label } from '../format';
+  import { label, truncateMiddle } from '../format';
   import type { Operation } from '../types';
 
   let { refreshVersion, onApiState }: { refreshVersion: number; onApiState: (online: boolean) => void } = $props();
@@ -35,7 +35,7 @@
 
 <div class="page-content">
   <div class="page-heading">
-    <div><p class="eyebrow">Lifecycle history</p><h2>Operations</h2></div>
+    <div><p class="eyebrow">Active workload</p><h2>Operations</h2></div>
     <button class="icon-button" type="button" disabled={loading} onclick={load} title="Refresh operations" aria-label="Refresh operations"><RefreshCw class:spin={loading} size={18} /></button>
   </div>
 
@@ -45,28 +45,20 @@
     {#if operations.length > 0}
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Operation</th><th>Pipeline</th><th>Status</th><th>Progress</th><th>Started</th><th>Finished</th><th>Detail</th></tr></thead>
+          <thead><tr><th>Operation</th><th>Pipeline ID</th><th>Status</th></tr></thead>
           <tbody>
             {#each operations as operation}
               <tr>
-                <td data-label="Operation"><strong>{label(operation.kind)}</strong><small class="mono">{operation.id}</small></td>
-                <td data-label="Pipeline">{operation.pipeline_name || operation.pipeline_id || 'System'}</td>
+                <td data-label="Operation"><strong>{label(operation.operation_type)}</strong></td>
+                <td data-label="Pipeline ID" class="mono">{truncateMiddle(operation.id, 32)}</td>
                 <td data-label="Status"><StatusBadge value={operation.state} compact /></td>
-                <td data-label="Progress">
-                  {#if operation.progress !== undefined}
-                    <div class="progress-cell"><progress max="100" value={operation.progress}></progress><span>{Math.round(operation.progress)}%</span></div>
-                  {:else}—{/if}
-                </td>
-                <td data-label="Started">{formatDateTime(operation.started_at || operation.created_at)}</td>
-                <td data-label="Finished">{formatDateTime(operation.finished_at)}</td>
-                <td data-label="Detail" class="detail-cell">{operation.detail || '—'}</td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
     {:else if !loading && !error}
-      <EmptyState icon={History} title="No operations" detail="Pipeline lifecycle and reconciliation work will appear here." />
+      <EmptyState icon={History} title="No active operations" detail="Running replication pipelines will appear here." />
     {/if}
   </section>
 </div>
