@@ -71,7 +71,7 @@ async fn canonical_composite_pk_pages_drive_direct_range_copy() -> SourceResult<
         assert!(first.materialized_bytes <= limits.max_page_bytes);
 
         let first_copy = {
-            let range = first.copy_range(None)?;
+            let range = first.copy_range()?;
             assert_eq!(range.start_exclusive(), None);
             assert_eq!(range.end_inclusive(), Some(key("a", "2").as_slice()));
             let stream = session.copy_text_pk_range(&schema, &range).await?;
@@ -89,7 +89,7 @@ async fn canonical_composite_pk_pages_drive_direct_range_copy() -> SourceResult<
         assert_eq!(second.rows[0].key, key("a", "10"));
         assert_eq!(second.rows[1].key, key("b", "1"));
         let second_copy = {
-            let range = second.copy_range(Some(&start))?;
+            let range = second.copy_range()?;
             assert_eq!(range.start_exclusive(), Some(start.key()));
             assert_eq!(range.end_inclusive(), None);
             let stream = session.copy_text_pk_range(&schema, &range).await?;

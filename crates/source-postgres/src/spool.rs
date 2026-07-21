@@ -573,6 +573,11 @@ impl SpoolJournal {
             .usage
             .store(scan_used_bytes(&journal.directory)?, Ordering::Relaxed);
         journal.validate_committed_manifests()?;
+        // Reclaim disk from topology generations this identity has already superseded. A lower
+        // generation is definitionally dead: a new generation only exists after a fresh snapshot,
+        // and the slot always replays under the current generation. Best-effort so a cleanup error
+        // never blocks the data path.
+        remove_superseded_generations(root.as_ref(), identity);
         Ok(journal)
     }
 
@@ -981,6 +986,39 @@ impl SpoolWriter {
     #[cfg(test)]
     pub(crate) fn inject_next_finish_capacity_failure(&mut self) {
         self.fail_next_finish_capacity = true;
+    }
+}
+
+/// Removes spool directories for topology generations older than `identity`'s current one.
+///
+/// The on-disk layout is `root/<pipeline_id>/<topology_generation>/<identity_dir>`. Once a pipeline
+/// advances to a new generation the older generation's spool can never replay again, so its
+/// directory is dead weight. This is best-effort: any I/O error is logged and skipped rather than
+/// propagated, because failing here must not stop a healthy pipeline from starting.
+fn remove_superseded_generations(root: &Path, identity: SpoolIdentity) {
+    let pipeline_root = root.join(identity.pipeline_id.to_string());
+    let entries = match fs::read_dir(&pipeline_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(%error, path = %pipeline_root.display(), "spool generation scan failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_older_generation = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u64>().ok())
+            .is_some_and(|generation| generation < identity.topology_generation);
+        if is_older_generation && entry.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                tracing::warn!(%error, path = %path.display(), "spool generation cleanup failed");
+            } else {
+                tracing::info!(path = %path.display(), "removed superseded spool generation");
+            }
+        }
     }
 }
 
@@ -1418,6 +1456,32 @@ mod tests {
         let reset = SpoolJournal::open_after_wal_replay_verified(&root, identity, limits).unwrap();
         assert_eq!(reset.used_bytes().unwrap(), 0);
         assert!(fs::read_dir(reset.directory()).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opening_a_new_generation_removes_superseded_generations() {
+        let root = temp_root();
+        let base = identity();
+
+        // Generation 1 writes a committed transaction to disk.
+        let gen1 = SpoolJournal::open(&root, base, SpoolLimits::default()).unwrap();
+        let mut writer = gen1.begin(1, PgLsn::new(1)).unwrap();
+        writer.append(&change(1)).unwrap();
+        writer.finish(PgLsn::new(2), PgLsn::new(3)).unwrap();
+        let gen1_dir = gen1.directory().to_owned();
+        assert!(gen1_dir.exists());
+
+        // Advancing to generation 2 must reclaim generation 1's directory tree.
+        let gen2_identity = SpoolIdentity {
+            topology_generation: 2,
+            ..base
+        };
+        let gen2 = SpoolJournal::open(&root, gen2_identity, SpoolLimits::default()).unwrap();
+        assert!(gen2.directory().exists());
+        let gen1_generation_root = gen1_dir.parent().unwrap();
+        assert!(!gen1_generation_root.exists());
+
         let _ = fs::remove_dir_all(root);
     }
 

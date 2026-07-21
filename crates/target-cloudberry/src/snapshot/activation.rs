@@ -920,7 +920,8 @@ mod tests {
             shadow: pending_shadow,
             previous_active: None,
         };
-        let identities = activation_progress_identities(&[table.clone()], &[pending]).unwrap();
+        let identities =
+            activation_progress_identities(std::slice::from_ref(&table), &[pending]).unwrap();
         assert_eq!(identities[0].table, table);
         assert_eq!(identities[0].shadow_relation_oid, 16_384);
 
