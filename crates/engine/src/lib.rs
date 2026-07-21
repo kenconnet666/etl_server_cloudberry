@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod batch;
+pub mod completion;
 pub mod normalize;
 pub mod pipeline;
 pub mod reconcile;
