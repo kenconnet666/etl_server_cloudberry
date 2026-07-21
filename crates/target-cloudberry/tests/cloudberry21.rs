@@ -14,18 +14,15 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyError, ApplyRequest, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
-        StageOperation, StagingRow, TableApplyBatch, execute_apply, execute_ledgered_completion,
+        ApplyError, ApplyRequest, DataChunkDisposition, LedgeredDataChunkOutcome,
+        LedgeredDataChunkRequest, StageOperation, StagingRow, TableApplyBatch, execute_apply,
         execute_ledgered_data_chunk, plan_apply,
     },
     checkpoint::{
         AdvanceOutcome, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
         load_node_checkpoint,
     },
-    chunk::{
-        DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest,
-        prepare_transaction_completion,
-    },
+    chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
     migration::migrate_target_database,
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyMode,
@@ -597,7 +594,11 @@ async fn run_test(
     };
     assert!(matches!(
         execute_ledgered_data_chunk(client, &data_chunk).await?,
-        LedgeredDataChunkOutcome::Applied { next_seq: 1, .. }
+        LedgeredDataChunkOutcome::Completed {
+            next_seq: 1,
+            disposition: DataChunkDisposition::Applied { .. },
+            checkpoint: AdvanceOutcome::Advanced { previous_lsn }
+        } if previous_lsn == PgLsn::new(100)
     ));
     assert_eq!(
         row(client, target_schema, 1).await?,
@@ -605,22 +606,13 @@ async fn run_test(
     );
     assert!(matches!(
         execute_ledgered_data_chunk(client, &data_chunk).await?,
-        LedgeredDataChunkOutcome::AlreadyCommitted { next_seq: 1 }
+        LedgeredDataChunkOutcome::AlreadyCheckpointed { applied_lsn }
+            if applied_lsn == manifest.key.end_lsn
     ));
     let checkpoint = load_node_checkpoint(client, chunk.checkpoint.key)
         .await?
-        .expect("ledgered data chunk must not remove the existing checkpoint");
-    assert_eq!(checkpoint.checkpoint.applied_lsn, PgLsn::new(100));
-
-    let transaction = client.transaction().await?;
-    let completion = prepare_transaction_completion(&transaction, fence, &manifest).await?;
-    let outcome = execute_ledgered_completion(transaction, completion, &chunk.checkpoint).await?;
-    assert_eq!(
-        outcome,
-        AdvanceOutcome::Advanced {
-            previous_lsn: PgLsn::new(100)
-        }
-    );
+        .expect("final chunk must publish its checkpoint");
+    assert_eq!(checkpoint.checkpoint.applied_lsn, PgLsn::new(110));
     assert_eq!(ledger_counts(client, manifest.key).await?, (0, 0));
 
     // A lost COMMIT response can replay this request after the receipts were retired. The target

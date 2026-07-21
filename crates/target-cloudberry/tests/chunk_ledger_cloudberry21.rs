@@ -4,7 +4,11 @@ use std::error::Error;
 
 use cloudberry_etl_core::{id::PipelineId, lsn::PgLsn};
 use cloudberry_etl_target_cloudberry::{
-    apply::{ApplyError, execute_ledgered_completion, execute_register_manifest},
+    apply::{
+        ApplyError, DataChunkDisposition, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
+        LedgeredEmptyTransactionOutcome, execute_ledgered_data_chunk,
+        execute_ledgered_empty_transaction, execute_register_manifest,
+    },
     checkpoint::{
         AdvanceOutcome, CheckpointError, CheckpointKey, NodeCheckpoint, PipelineFence,
         activate_pipeline_fence, load_node_checkpoint,
@@ -85,12 +89,23 @@ async fn cloudberry21_chunk_ledger_replays_and_completes_exactly() -> Result<(),
     transaction.commit().await?;
     assert_eq!(ledger_counts(&client, manifest.key).await?, (1, 2));
 
+    // A restart may use different chunk limits. Although the requested 0..1 range does not match
+    // the historical 0..2 receipt, durable progress already covers the manifest, so this same
+    // target transaction must publish the checkpoint and retire the old ledger.
     let first_checkpoint = checkpoint(&manifest);
-    let transaction = client.transaction().await?;
-    let completion = prepare_transaction_completion(&transaction, fence, &manifest).await?;
+    let resumed = LedgeredDataChunkRequest {
+        fence,
+        manifest: manifest.clone(),
+        chunk: chunk(0, 1, 0x44),
+        tables: Vec::new(),
+    };
     assert_eq!(
-        execute_ledgered_completion(transaction, completion, &first_checkpoint).await?,
-        AdvanceOutcome::Inserted
+        execute_ledgered_data_chunk(&mut client, &resumed).await?,
+        LedgeredDataChunkOutcome::Completed {
+            next_seq: manifest.record_count,
+            disposition: DataChunkDisposition::ResumeAt,
+            checkpoint: AdvanceOutcome::Inserted,
+        }
     );
 
     let stored = load_node_checkpoint(&client, first_checkpoint.key)
@@ -130,30 +145,102 @@ async fn cloudberry21_chunk_ledger_replays_and_completes_exactly() -> Result<(),
     empty_manifest.xid = 7;
     empty_manifest.record_count = 0;
     empty_manifest.manifest_digest = [0xE0; 32];
-    assert_eq!(
-        execute_register_manifest(&mut client, fence, &empty_manifest).await?,
-        ProgressRegistration::Registered
-    );
-    assert_eq!(
-        execute_register_manifest(&mut client, fence, &empty_manifest).await?,
-        ProgressRegistration::Existing { next_seq: 0 }
-    );
     let empty_checkpoint = checkpoint(&empty_manifest);
-    let transaction = client.transaction().await?;
-    let completion = prepare_transaction_completion(&transaction, fence, &empty_manifest).await?;
     assert_eq!(
-        execute_ledgered_completion(transaction, completion, &empty_checkpoint).await?,
-        AdvanceOutcome::Advanced {
-            previous_lsn: manifest.key.end_lsn
+        execute_ledgered_empty_transaction(&mut client, fence, &empty_manifest).await?,
+        LedgeredEmptyTransactionOutcome::Completed {
+            checkpoint: AdvanceOutcome::Advanced {
+                previous_lsn: manifest.key.end_lsn
+            }
         }
+    );
+    assert_eq!(
+        load_node_checkpoint(&client, empty_checkpoint.key)
+            .await?
+            .expect("empty transaction must publish its checkpoint")
+            .checkpoint,
+        empty_checkpoint
     );
     assert_eq!(ledger_counts(&client, empty_manifest.key).await?, (0, 0));
     assert_eq!(
-        execute_register_manifest(&mut client, fence, &empty_manifest).await?,
-        ProgressRegistration::AlreadyCheckpointed {
+        execute_ledgered_empty_transaction(&mut client, fence, &empty_manifest).await?,
+        LedgeredEmptyTransactionOutcome::AlreadyCheckpointed {
             applied_lsn: empty_manifest.key.end_lsn
         }
     );
+
+    // Recover a final receipt that committed before the old separate completion transaction.
+    let mut exact_manifest = manifest.clone();
+    exact_manifest.key.end_lsn = PgLsn::new(manifest.key.end_lsn.as_u64() + 2);
+    exact_manifest.xid = 8;
+    exact_manifest.record_count = 1;
+    exact_manifest.manifest_digest = [0xE1; 32];
+    let exact = chunk(0, 1, 0x51);
+    let transaction = client.transaction().await?;
+    let PrepareDataChunkOutcome::Apply(prepared) =
+        prepare_data_chunk(&transaction, fence, &exact_manifest, exact).await?
+    else {
+        panic!("new exact chunk must be ready to apply");
+    };
+    record_data_chunk(&transaction, prepared).await?;
+    transaction.commit().await?;
+    assert_eq!(
+        execute_ledgered_data_chunk(
+            &mut client,
+            &LedgeredDataChunkRequest {
+                fence,
+                manifest: exact_manifest.clone(),
+                chunk: exact,
+                tables: Vec::new(),
+            }
+        )
+        .await?,
+        LedgeredDataChunkOutcome::Completed {
+            next_seq: 1,
+            disposition: DataChunkDisposition::AlreadyCommitted,
+            checkpoint: AdvanceOutcome::Advanced {
+                previous_lsn: empty_manifest.key.end_lsn
+            },
+        }
+    );
+    assert_eq!(ledger_counts(&client, exact_manifest.key).await?, (0, 0));
+
+    // The normal multi-chunk path uses one target transaction per chunk. The final call includes
+    // its DML receipt, checkpoint advancement, and retirement.
+    let mut multi_manifest = manifest.clone();
+    multi_manifest.key.end_lsn = PgLsn::new(manifest.key.end_lsn.as_u64() + 3);
+    multi_manifest.xid = 9;
+    multi_manifest.record_count = 2;
+    multi_manifest.manifest_digest = [0xE2; 32];
+    let first_request = LedgeredDataChunkRequest {
+        fence,
+        manifest: multi_manifest.clone(),
+        chunk: chunk(0, 1, 0x61),
+        tables: Vec::new(),
+    };
+    assert!(matches!(
+        execute_ledgered_data_chunk(&mut client, &first_request).await?,
+        LedgeredDataChunkOutcome::InProgress {
+            next_seq: 1,
+            disposition: DataChunkDisposition::Applied { .. }
+        }
+    ));
+    assert_eq!(ledger_counts(&client, multi_manifest.key).await?, (1, 1));
+    let final_request = LedgeredDataChunkRequest {
+        fence,
+        manifest: multi_manifest.clone(),
+        chunk: chunk(1, 2, 0x62),
+        tables: Vec::new(),
+    };
+    assert!(matches!(
+        execute_ledgered_data_chunk(&mut client, &final_request).await?,
+        LedgeredDataChunkOutcome::Completed {
+            next_seq: 2,
+            disposition: DataChunkDisposition::Applied { .. },
+            checkpoint: AdvanceOutcome::Advanced { previous_lsn }
+        } if previous_lsn == exact_manifest.key.end_lsn
+    ));
+    assert_eq!(ledger_counts(&client, multi_manifest.key).await?, (0, 0));
 
     cleanup(&client, fence.pipeline_id).await;
     connection_task.abort();

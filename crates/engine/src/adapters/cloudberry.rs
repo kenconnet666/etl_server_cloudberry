@@ -16,15 +16,12 @@ use cloudberry_etl_source_postgres::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyPlan, ApplyPlanError, ApplyRequest, LedgeredDataChunkOutcome,
-        LedgeredDataChunkRequest, TableApplyBatch, execute_ledgered_completion,
-        execute_ledgered_data_chunk, execute_register_manifest, plan_apply,
+        ApplyPlan, ApplyPlanError, ApplyRequest, DataChunkDisposition, LedgeredDataChunkOutcome,
+        LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome, TableApplyBatch,
+        execute_ledgered_data_chunk, execute_ledgered_empty_transaction, plan_apply,
     },
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
-    chunk::{
-        DataChunkIdentity, ProgressRegistration, TransactionChunkKey, TransactionChunkManifest,
-        prepare_transaction_completion,
-    },
+    chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -289,25 +286,6 @@ fn build_chunk_tables(
     )
 }
 
-fn transaction_checkpoint(
-    fence: PipelineFence,
-    slot_name: &str,
-    transaction: &CommittedTransaction,
-) -> NodeCheckpoint {
-    let position = &transaction.final_position;
-    NodeCheckpoint {
-        key: CheckpointKey {
-            pipeline_id: fence.pipeline_id,
-            topology_generation: fence.topology_generation,
-            node_id: position.node_id,
-        },
-        system_identifier: position.system_identifier,
-        timeline: position.timeline,
-        slot_name: slot_name.to_owned(),
-        applied_lsn: position.lsn,
-    }
-}
-
 fn transaction_manifest(
     fence: PipelineFence,
     slot_name: &str,
@@ -447,22 +425,23 @@ impl CloudberryTransactionSink {
             .stats()
             .map_err(|error| PipelineError::Source(error.to_string()))?;
         let manifest = transaction_manifest(self.fence, &self.slot_name, transaction, stats);
-        let checkpoint = transaction_checkpoint(self.fence, &self.slot_name, transaction);
-        let registration = execute_register_manifest(client, self.fence, &manifest)
-            .await
-            .map_err(|error| PipelineError::Target(error.to_string()))?;
-        let mut next_seq = match registration {
-            ProgressRegistration::Registered => 0,
-            ProgressRegistration::Existing { next_seq } => next_seq,
-            ProgressRegistration::AlreadyCheckpointed { .. } => return Ok(()),
-        };
-        validate_persisted_sequence(manifest.record_count, next_seq)?;
+        if manifest.record_count == 0 {
+            return match execute_ledgered_empty_transaction(client, self.fence, &manifest)
+                .await
+                .map_err(|error| PipelineError::Target(error.to_string()))?
+            {
+                LedgeredEmptyTransactionOutcome::Completed { .. }
+                | LedgeredEmptyTransactionOutcome::AlreadyCheckpointed { .. } => Ok(()),
+            };
+        }
+
+        let mut next_seq = 0;
 
         let mut chunks = transaction
             .change_source
             .chunks_from(next_seq, self.chunk_limits)
             .map_err(|error| PipelineError::Source(error.to_string()))?;
-        while next_seq < manifest.record_count {
+        loop {
             let chunk = chunks
                 .next()
                 .transpose()
@@ -494,24 +473,29 @@ impl CloudberryTransactionSink {
             let outcome = execute_ledgered_data_chunk(client, &request)
                 .await
                 .map_err(|error| PipelineError::Target(error.to_string()))?;
-            let durable_next = match outcome {
-                LedgeredDataChunkOutcome::Applied { next_seq, .. } if next_seq == chunk.end_seq => {
-                    next_seq
-                }
-                LedgeredDataChunkOutcome::Applied {
-                    next_seq: unexpected,
+            let (durable_next, disposition, completed) = match outcome {
+                LedgeredDataChunkOutcome::InProgress {
+                    next_seq,
+                    disposition,
+                } => (next_seq, disposition, false),
+                LedgeredDataChunkOutcome::Completed {
+                    next_seq,
+                    disposition,
                     ..
-                } => {
-                    return Err(PipelineError::Target(format!(
-                        "target recorded chunk {}..{} at unexpected sequence {unexpected}",
-                        chunk.start_seq, chunk.end_seq
-                    )));
-                }
-                LedgeredDataChunkOutcome::AlreadyCommitted { next_seq }
-                | LedgeredDataChunkOutcome::ResumeAt { next_seq } => next_seq,
+                } => (next_seq, disposition, true),
                 LedgeredDataChunkOutcome::AlreadyCheckpointed { .. } => return Ok(()),
             };
-            validate_resume_sequence(next_seq, manifest.record_count, durable_next)?;
+            validate_chunk_step(
+                next_seq,
+                manifest.record_count,
+                chunk.end_seq,
+                durable_next,
+                disposition,
+                completed,
+            )?;
+            if completed {
+                return Ok(());
+            }
             if durable_next != chunk.end_seq {
                 chunks = transaction
                     .change_source
@@ -520,19 +504,29 @@ impl CloudberryTransactionSink {
             }
             next_seq = durable_next;
         }
-
-        let target_transaction = client
-            .transaction()
-            .await
-            .map_err(|error| PipelineError::Target(error.to_string()))?;
-        let completion = prepare_transaction_completion(&target_transaction, self.fence, &manifest)
-            .await
-            .map_err(|error| PipelineError::Target(error.to_string()))?;
-        execute_ledgered_completion(target_transaction, completion, &checkpoint)
-            .await
-            .map_err(|error| PipelineError::Target(error.to_string()))?;
-        Ok(())
     }
+}
+
+fn validate_chunk_step(
+    previous: u64,
+    record_count: u64,
+    requested_end: u64,
+    next_seq: u64,
+    disposition: DataChunkDisposition,
+    completed: bool,
+) -> Result<(), PipelineError> {
+    validate_resume_sequence(previous, record_count, next_seq)?;
+    if matches!(disposition, DataChunkDisposition::Applied { .. }) && next_seq != requested_end {
+        return Err(PipelineError::Target(format!(
+            "target recorded chunk ending at {requested_end} at unexpected sequence {next_seq}"
+        )));
+    }
+    if completed != (next_seq == record_count) {
+        return Err(PipelineError::Target(format!(
+            "target completion state does not match sequence {next_seq} of {record_count} records"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_resume_sequence(
@@ -551,16 +545,6 @@ fn validate_resume_sequence(
         )));
     }
     Ok(())
-}
-
-fn validate_persisted_sequence(record_count: u64, next_seq: u64) -> Result<(), PipelineError> {
-    if next_seq > record_count {
-        Err(PipelineError::Target(format!(
-            "target resume sequence {next_seq} exceeds manifest record count {record_count}"
-        )))
-    } else {
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -790,7 +774,7 @@ mod tests {
         let stats = committed.change_source.stats().unwrap();
         let fence = fence();
         let manifest = transaction_manifest(fence, "slot", &committed, stats);
-        let checkpoint = transaction_checkpoint(fence, "slot", &committed);
+        let checkpoint = manifest.node_checkpoint();
         let whole = committed
             .change_source
             .chunks_from(
@@ -937,11 +921,6 @@ mod tests {
 
     #[test]
     fn target_resume_sequence_must_be_bounded_and_monotonic() {
-        assert!(validate_persisted_sequence(0, 0).is_ok());
-        assert!(validate_persisted_sequence(0, 1).is_err());
-        assert!(validate_persisted_sequence(3, 0).is_ok());
-        assert!(validate_persisted_sequence(3, 3).is_ok());
-        assert!(validate_persisted_sequence(3, 4).is_err());
         assert!(validate_resume_sequence(0, 3, 3).is_ok());
         assert!(validate_resume_sequence(0, 3, 0).is_err());
         assert!(validate_resume_sequence(1, 3, 2).is_ok());
@@ -949,6 +928,21 @@ mod tests {
         assert!(validate_resume_sequence(1, 3, 1).is_err());
         assert!(validate_resume_sequence(2, 3, 1).is_err());
         assert!(validate_resume_sequence(2, 3, 4).is_err());
+    }
+
+    #[test]
+    fn target_step_completion_matches_the_durable_record_boundary() {
+        let applied = DataChunkDisposition::Applied {
+            stats: cloudberry_etl_target_cloudberry::apply::ApplyStats::default(),
+        };
+        assert!(validate_chunk_step(0, 3, 1, 1, applied, false).is_ok());
+        assert!(validate_chunk_step(0, 3, 1, 2, applied, false).is_err());
+        assert!(
+            validate_chunk_step(1, 3, 3, 3, DataChunkDisposition::AlreadyCommitted, true).is_ok()
+        );
+        assert!(validate_chunk_step(0, 3, 1, 3, DataChunkDisposition::ResumeAt, true).is_ok());
+        assert!(validate_chunk_step(0, 3, 1, 3, DataChunkDisposition::ResumeAt, false).is_err());
+        assert!(validate_chunk_step(0, 3, 1, 1, DataChunkDisposition::ResumeAt, true).is_err());
     }
 
     #[test]

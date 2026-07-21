@@ -582,7 +582,7 @@ async fn manifest_checkpoint_reached_locked(
     transaction: &Transaction<'_>,
     manifest: &TransactionChunkManifest,
 ) -> Result<Option<PgLsn>, ChunkLedgerError> {
-    let checkpoint = checkpoint_for_manifest(manifest);
+    let checkpoint = manifest.node_checkpoint();
     let current = load_node_checkpoint_locked(transaction, checkpoint.key).await?;
     if checkpoint_reached(current.as_ref(), &checkpoint)? {
         Ok(current.map(|stored| stored.checkpoint.applied_lsn))
@@ -805,20 +805,6 @@ fn ensure_checkpoint_matches(
         });
     }
     Ok(())
-}
-
-fn checkpoint_for_manifest(manifest: &TransactionChunkManifest) -> NodeCheckpoint {
-    NodeCheckpoint {
-        key: CheckpointKey {
-            pipeline_id: manifest.key.pipeline_id,
-            topology_generation: manifest.key.topology_generation,
-            node_id: manifest.key.node_id,
-        },
-        system_identifier: manifest.system_identifier,
-        timeline: manifest.timeline,
-        slot_name: manifest.slot_name.clone(),
-        applied_lsn: manifest.key.end_lsn,
-    }
 }
 
 fn progress_from_row(row: Row) -> Result<StoredProgress, ChunkLedgerError> {
@@ -1118,17 +1104,12 @@ mod tests {
         progress.next_seq = 30;
         assert!(ensure_complete(&progress).is_ok());
 
-        let mut checkpoint = NodeCheckpoint {
-            key: crate::checkpoint::CheckpointKey {
-                pipeline_id: manifest.key.pipeline_id,
-                topology_generation: manifest.key.topology_generation,
-                node_id: manifest.key.node_id,
-            },
-            system_identifier: manifest.system_identifier,
-            timeline: manifest.timeline,
-            slot_name: manifest.slot_name.clone(),
-            applied_lsn: manifest.key.end_lsn,
-        };
+        let mut checkpoint = manifest.node_checkpoint();
+        assert_eq!(checkpoint.key.pipeline_id, fence.pipeline_id);
+        assert_eq!(checkpoint.key.node_id, manifest.key.node_id);
+        assert_eq!(checkpoint.system_identifier, manifest.system_identifier);
+        assert_eq!(checkpoint.timeline, manifest.timeline);
+        assert_eq!(checkpoint.slot_name, manifest.slot_name);
         assert!(ensure_checkpoint_matches(&manifest, &checkpoint).is_ok());
         checkpoint.applied_lsn = PgLsn::new(manifest.key.end_lsn.as_u64() + 1);
         assert!(matches!(

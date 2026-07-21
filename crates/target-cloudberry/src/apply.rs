@@ -19,8 +19,8 @@ use crate::{
     chunk::{
         ChunkLedgerError, DataChunkIdentity, PrepareDataChunkOutcome,
         PreparedTransactionCompletion, ProgressRegistration, TransactionChunkManifest,
-        complete_transaction_checkpoint, prepare_data_chunk, record_data_chunk,
-        register_transaction_progress,
+        complete_transaction_checkpoint, prepare_data_chunk, prepare_transaction_completion,
+        record_data_chunk, register_transaction_progress,
     },
     copy::{CopyEncodeError, encode_row},
     schema::{CreateTablePlan, SchemaError, plan_create_table, quote_identifier_list},
@@ -61,6 +61,8 @@ pub enum ApplyError {
     DuplicateStagingName(String),
     #[error("Cloudberry rejected an invalid or non-collapsed staging batch for {0}")]
     InvalidBatch(String),
+    #[error("empty transaction apply received a manifest with {record_count} records")]
+    NonEmptyManifest { record_count: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,16 +156,41 @@ pub struct ApplyStats {
     pub inserted_rows: u64,
 }
 
-/// Result of reconciling one requested data chunk with durable target progress.
+/// How one requested data chunk related to the durable target prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataChunkDisposition {
+    Applied { stats: ApplyStats },
+    AlreadyCommitted,
+    ResumeAt,
+}
+
+/// Result of one bounded target transaction.
+///
+/// `InProgress` always names a prefix before the manifest end. `Completed` is returned only after
+/// the checkpoint and ledger retirement committed with the final chunk (or a replay that found an
+/// already complete durable prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgeredDataChunkOutcome {
-    /// The chunk receipt and its user-table DML committed atomically.
-    Applied { next_seq: u64, stats: ApplyStats },
-    /// The exact same immutable chunk was already committed.
-    AlreadyCommitted { next_seq: u64 },
-    /// Durable progress is inside or beyond a differently partitioned request.
-    ResumeAt { next_seq: u64 },
+    InProgress {
+        next_seq: u64,
+        disposition: DataChunkDisposition,
+    },
+    Completed {
+        next_seq: u64,
+        disposition: DataChunkDisposition,
+        checkpoint: AdvanceOutcome,
+    },
     /// The target checkpoint already covers this transaction and no DML ran.
+    AlreadyCheckpointed {
+        applied_lsn: cloudberry_etl_core::lsn::PgLsn,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgeredEmptyTransactionOutcome {
+    Completed {
+        checkpoint: AdvanceOutcome,
+    },
     AlreadyCheckpointed {
         applied_lsn: cloudberry_etl_core::lsn::PgLsn,
     },
@@ -215,7 +242,6 @@ pub async fn execute_ledgered_data_chunk(
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
     validate_tables(&request.tables)?;
     let transaction = client.transaction().await?;
-    lock_pipeline_fence(&transaction, request.fence).await?;
     let prepared = prepare_data_chunk(
         &transaction,
         request.fence,
@@ -228,22 +254,111 @@ pub async fn execute_ledgered_data_chunk(
             let next_seq = prepared.next_seq();
             record_data_chunk(&transaction, prepared).await?;
             let stats = apply_tables(&transaction, &request.tables).await?;
-            transaction.commit().await?;
-            Ok(LedgeredDataChunkOutcome::Applied { next_seq, stats })
+            finish_ledgered_data_chunk(
+                transaction,
+                request,
+                next_seq,
+                DataChunkDisposition::Applied { stats },
+            )
+            .await
         }
         PrepareDataChunkOutcome::AlreadyCommitted { next_seq } => {
-            transaction.rollback().await?;
-            Ok(LedgeredDataChunkOutcome::AlreadyCommitted { next_seq })
+            finish_ledgered_data_chunk(
+                transaction,
+                request,
+                next_seq,
+                DataChunkDisposition::AlreadyCommitted,
+            )
+            .await
         }
         PrepareDataChunkOutcome::ResumeAt { next_seq } => {
-            transaction.rollback().await?;
-            Ok(LedgeredDataChunkOutcome::ResumeAt { next_seq })
+            finish_ledgered_data_chunk(
+                transaction,
+                request,
+                next_seq,
+                DataChunkDisposition::ResumeAt,
+            )
+            .await
         }
         PrepareDataChunkOutcome::AlreadyCheckpointed { applied_lsn } => {
             transaction.rollback().await?;
             Ok(LedgeredDataChunkOutcome::AlreadyCheckpointed { applied_lsn })
         }
     }
+}
+
+/// Commits a zero-record manifest, its checkpoint, and immediate ledger retirement atomically.
+pub async fn execute_ledgered_empty_transaction(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
+    if manifest.record_count != 0 {
+        return Err(ApplyError::NonEmptyManifest {
+            record_count: manifest.record_count,
+        });
+    }
+
+    let transaction = client.transaction().await?;
+    match register_transaction_progress(&transaction, fence, manifest).await? {
+        ProgressRegistration::AlreadyCheckpointed { applied_lsn } => {
+            transaction.rollback().await?;
+            Ok(LedgeredEmptyTransactionOutcome::AlreadyCheckpointed { applied_lsn })
+        }
+        ProgressRegistration::Registered | ProgressRegistration::Existing { next_seq: 0 } => {
+            let completion = prepare_transaction_completion(&transaction, fence, manifest).await?;
+            let checkpoint = manifest.node_checkpoint();
+            let checkpoint =
+                complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;
+            transaction.commit().await?;
+            Ok(LedgeredEmptyTransactionOutcome::Completed { checkpoint })
+        }
+        ProgressRegistration::Existing { next_seq } => Err(ApplyError::ChunkLedger(
+            ChunkLedgerError::InvalidPersistedValue {
+                field: "next_seq",
+                value: next_seq.to_string(),
+            },
+        )),
+    }
+}
+
+async fn finish_ledgered_data_chunk(
+    transaction: Transaction<'_>,
+    request: &LedgeredDataChunkRequest,
+    next_seq: u64,
+    disposition: DataChunkDisposition,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    if next_seq > request.manifest.record_count {
+        return Err(ApplyError::ChunkLedger(
+            ChunkLedgerError::InvalidPersistedValue {
+                field: "next_seq",
+                value: next_seq.to_string(),
+            },
+        ));
+    }
+    if next_seq == request.manifest.record_count {
+        let completion =
+            prepare_transaction_completion(&transaction, request.fence, &request.manifest).await?;
+        let checkpoint = request.manifest.node_checkpoint();
+        let checkpoint =
+            complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;
+        transaction.commit().await?;
+        return Ok(LedgeredDataChunkOutcome::Completed {
+            next_seq,
+            disposition,
+            checkpoint,
+        });
+    }
+
+    if matches!(disposition, DataChunkDisposition::Applied { .. }) {
+        transaction.commit().await?;
+    } else {
+        transaction.rollback().await?;
+    }
+    Ok(LedgeredDataChunkOutcome::InProgress {
+        next_seq,
+        disposition,
+    })
 }
 
 /// Durably registers an immutable manifest without applying a data chunk.
