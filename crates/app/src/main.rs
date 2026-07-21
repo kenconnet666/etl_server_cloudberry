@@ -132,8 +132,12 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     ensure_control_database_migrated(&client).await?;
     drop(client);
 
-    let control_pool = build_control_pool(&control_dsn)?;
-    let control: Arc<dyn ControlStore> = Arc::new(PostgresControlStore::new(control_pool));
+    let control_pool = build_control_pool(&control_dsn, "pg2cb-control", 8)?;
+    let lease_pool = build_control_pool(&control_dsn, "pg2cb-control-lease", 4)?;
+    let control: Arc<dyn ControlStore> = Arc::new(PostgresControlStore::with_lease_pool(
+        control_pool,
+        lease_pool,
+    ));
     let master_key = Arc::new(MasterKey::from_base64(&config.master_key()?)?);
     let supervisor = Arc::new(PipelineSupervisor::new());
     let state = AppState {
@@ -142,6 +146,7 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
         supervisor: Arc::clone(&supervisor),
         connection_tester: Arc::new(PostgresConnectionTester),
         metrics_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        connection_test_gate: Arc::new(tokio::sync::Semaphore::new(4)),
     };
     let auth = AuthState::new(
         config.admin.username.clone(),
@@ -178,19 +183,72 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     let shutdown = CancellationToken::new();
     let reconciler_shutdown = shutdown.clone();
     let reconciler_task = tokio::spawn(async move { reconciler.run(reconciler_shutdown).await });
+    let signal_task = tokio::spawn(shutdown_signal(shutdown.clone()));
     tracing::info!(listen = %config.server.listen, "management server started");
-    let server_result = axum::serve(
+    let server_shutdown = shutdown.clone();
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown.clone()))
+    .with_graceful_shutdown(async move { server_shutdown.cancelled().await });
+    let result = supervise_service(
+        shutdown,
+        std::future::IntoFuture::into_future(server),
+        reconciler_task,
+    )
     .await;
-    shutdown.cancel();
-    reconciler_task
-        .await
-        .context("pipeline reconciler task terminated unexpectedly")?;
-    server_result?;
-    Ok(())
+    signal_task.abort();
+    let _ = signal_task.await;
+    result
+}
+
+async fn supervise_service<S>(
+    shutdown: CancellationToken,
+    server: S,
+    mut reconciler_task: tokio::task::JoinHandle<()>,
+) -> Result<()>
+where
+    S: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        server_result = &mut server => {
+            let shutdown_requested = shutdown.is_cancelled();
+            shutdown.cancel();
+            reconciler_task
+                .await
+                .context("pipeline reconciler task terminated unexpectedly")?;
+            server_result?;
+            if shutdown_requested {
+                Ok(())
+            } else {
+                bail!("management server exited unexpectedly")
+            }
+        }
+        reconciler_result = &mut reconciler_task => {
+            let shutdown_requested = shutdown.is_cancelled();
+            shutdown.cancel();
+            let server_result = server.await;
+            match reconciler_result {
+                Ok(()) if shutdown_requested => {
+                    server_result?;
+                    Ok(())
+                }
+                Ok(()) => {
+                    if let Err(error) = server_result {
+                        tracing::warn!(%error, "management server shutdown returned an error");
+                    }
+                    bail!("pipeline reconciler exited unexpectedly")
+                }
+                Err(error) => {
+                    if let Err(server_error) = server_result {
+                        tracing::warn!(%server_error, "management server shutdown returned an error");
+                    }
+                    Err(error).context("pipeline reconciler task terminated unexpectedly")
+                }
+            }
+        }
+    }
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
@@ -221,10 +279,11 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 }
 
 async fn connect_database(dsn: &SecretString) -> Result<Client> {
-    let config: PgConfig = dsn
+    let mut config: PgConfig = dsn
         .expose_secret()
         .parse()
         .context("invalid PostgreSQL connection string")?;
+    config.connect_timeout(Duration::from_secs(5));
     let connector = TlsConnector::builder()
         .build()
         .context("failed to initialize TLS")?;
@@ -240,11 +299,12 @@ async fn connect_database(dsn: &SecretString) -> Result<Client> {
     Ok(client)
 }
 
-fn build_control_pool(dsn: &SecretString) -> Result<Pool> {
+fn build_control_pool(dsn: &SecretString, application_name: &str, max_size: usize) -> Result<Pool> {
     let mut pg_config: PgConfig = dsn
         .expose_secret()
         .parse()
         .context("invalid PostgreSQL connection string")?;
+    pg_config.application_name(application_name);
     configure_control_session(&mut pg_config);
     let connector = TlsConnector::builder()
         .build()
@@ -257,7 +317,7 @@ fn build_control_pool(dsn: &SecretString) -> Result<Pool> {
         },
     );
     Pool::builder(manager)
-        .max_size(8)
+        .max_size(max_size)
         .runtime(Runtime::Tokio1)
         .wait_timeout(Some(Duration::from_secs(5)))
         .create_timeout(Some(Duration::from_secs(5)))
@@ -382,4 +442,75 @@ impl ConnectionTester for PostgresConnectionTester {
 fn sanitize_connection_error(error: anyhow::Error) -> String {
     tracing::warn!(error = %error, "connection test failed");
     "connection failed; verify address, credentials, TLS, and server settings".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn unexpected_reconciler_exit_cancels_the_server_and_returns_an_error() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_stopped = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&server_stopped);
+        let server = async move {
+            server_shutdown.cancelled().await;
+            stopped.store(true, Ordering::SeqCst);
+            Ok::<(), std::io::Error>(())
+        };
+        let reconciler = tokio::spawn(async {});
+
+        let error = supervise_service(shutdown.clone(), server, reconciler)
+            .await
+            .expect_err("unexpected reconciler exit must fail the service");
+
+        assert!(shutdown.is_cancelled());
+        assert!(server_stopped.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("reconciler exited unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn reconciler_panic_cancels_the_server_and_returns_an_error() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = async move {
+            server_shutdown.cancelled().await;
+            Ok::<(), std::io::Error>(())
+        };
+        let reconciler = tokio::spawn(async { panic!("reconciler test panic") });
+
+        let error = supervise_service(shutdown.clone(), server, reconciler)
+            .await
+            .expect_err("reconciler panic must fail the service");
+
+        assert!(shutdown.is_cancelled());
+        assert!(
+            error
+                .to_string()
+                .contains("reconciler task terminated unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_allows_both_tasks_to_exit_cleanly() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let reconciler_shutdown = shutdown.clone();
+        let server = async move {
+            server_shutdown.cancelled().await;
+            Ok::<(), std::io::Error>(())
+        };
+        let reconciler = tokio::spawn(async move { reconciler_shutdown.cancelled().await });
+        shutdown.cancel();
+
+        supervise_service(shutdown, server, reconciler)
+            .await
+            .expect("requested shutdown succeeds");
+    }
 }

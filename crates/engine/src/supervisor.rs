@@ -45,6 +45,9 @@ pub struct PipelineTaskOutcome {
 
 #[derive(Default)]
 pub struct PipelineSupervisor {
+    /// Serializes lifecycle transitions so a stopping/reaping task cannot race a replacement
+    /// start and overwrite the replacement's telemetry.
+    lifecycle: Mutex<()>,
     pipelines: Mutex<HashMap<PipelineId, ManagedPipeline>>,
     telemetry: Mutex<HashMap<PipelineId, PipelineTelemetryHandle>>,
 }
@@ -66,6 +69,7 @@ impl PipelineSupervisor {
         pipeline_id: PipelineId,
         job: Arc<dyn PipelineJob>,
     ) -> Result<(), SupervisorError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let finished = {
             let mut pipelines = self.pipelines.lock().await;
             match pipelines.get(&pipeline_id) {
@@ -135,6 +139,7 @@ impl PipelineSupervisor {
     }
 
     pub async fn stop(&self, pipeline_id: PipelineId) -> Result<(), SupervisorError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let managed = self
             .pipelines
             .lock()
@@ -155,6 +160,7 @@ impl PipelineSupervisor {
         pipeline_id: PipelineId,
         timeout: Duration,
     ) -> Result<(), SupervisorError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let managed = self
             .pipelines
             .lock()
@@ -183,6 +189,7 @@ impl PipelineSupervisor {
     }
 
     pub async fn stop_all(&self) -> Result<(), SupervisorError> {
+        let _lifecycle = self.lifecycle.lock().await;
         let managed: Vec<_> = self.pipelines.lock().await.drain().collect();
         for (_, pipeline) in &managed {
             pipeline.cancellation.cancel();
@@ -210,6 +217,7 @@ impl PipelineSupervisor {
     }
 
     pub async fn reap_finished(&self) -> Vec<PipelineTaskOutcome> {
+        let _lifecycle = self.lifecycle.lock().await;
         let finished = {
             let mut pipelines = self.pipelines.lock().await;
             let ids: Vec<_> = pipelines
@@ -282,6 +290,15 @@ mod tests {
 
     struct StuckJob;
 
+    struct DelayedStopJob {
+        cancelled: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    struct SignalWaitJob {
+        started: Arc<tokio::sync::Notify>,
+    }
+
     #[async_trait]
     impl PipelineJob for WaitJob {
         async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
@@ -302,6 +319,25 @@ mod tests {
     impl PipelineJob for StuckJob {
         async fn run(&self, _cancellation: CancellationToken) -> Result<(), SupervisorError> {
             pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PipelineJob for DelayedStopJob {
+        async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
+            cancellation.cancelled().await;
+            self.cancelled.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PipelineJob for SignalWaitJob {
+        async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
+            self.started.notify_one();
+            cancellation.cancelled().await;
             Ok(())
         }
     }
@@ -355,5 +391,52 @@ mod tests {
             Err(SupervisorError::StopTimeout { pipeline_id, .. }) if pipeline_id == id
         ));
         assert!(supervisor.running().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serializes_replacement_until_the_previous_task_has_stopped() {
+        let supervisor = Arc::new(PipelineSupervisor::new());
+        let id = PipelineId::new();
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        supervisor
+            .start(
+                id,
+                Arc::new(DelayedStopJob {
+                    cancelled: Arc::clone(&cancelled),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let stop_supervisor = Arc::clone(&supervisor);
+        let stop_task = tokio::spawn(async move { stop_supervisor.stop(id).await });
+        cancelled.notified().await;
+
+        let replacement_started = Arc::new(tokio::sync::Notify::new());
+        let start_supervisor = Arc::clone(&supervisor);
+        let start_signal = Arc::clone(&replacement_started);
+        let replacement_task = tokio::spawn(async move {
+            start_supervisor
+                .start(
+                    id,
+                    Arc::new(SignalWaitJob {
+                        started: start_signal,
+                    }),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), replacement_started.notified())
+                .await
+                .is_err()
+        );
+
+        release.notify_one();
+        stop_task.await.unwrap().unwrap();
+        replacement_task.await.unwrap().unwrap();
+        replacement_started.notified().await;
+        supervisor.stop(id).await.unwrap();
     }
 }

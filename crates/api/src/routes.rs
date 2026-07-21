@@ -33,6 +33,7 @@ use crate::{
 use cloudberry_etl_engine::telemetry::PipelineRuntimeSnapshot;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(state: AppState, auth: AuthState) -> Router {
     let auth_middleware = middleware::from_fn_with_state(auth.clone(), require_session);
@@ -278,12 +279,9 @@ struct OverviewResponse {
 }
 
 async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
-    let (sources, targets, pipelines) = tokio::try_join!(
-        state.control.list_sources(),
-        state.control.list_targets(),
-        state.control.list_pipelines()
-    )
-    .map_err(store_error)?;
+    let sources = state.control.list_sources().await.map_err(store_error)?;
+    let targets = state.control.list_targets().await.map_err(store_error)?;
+    let pipelines = state.control.list_pipelines().await.map_err(store_error)?;
     Ok(Json(OverviewResponse {
         sources: sources.len(),
         targets: targets.len(),
@@ -533,24 +531,34 @@ async fn test_source(
     State(state): State<AppState>,
     Json(request): Json<TestConnectionRequest>,
 ) -> Result<Json<ConnectionReport>, ApiError> {
-    state
-        .connection_tester
-        .test_source(&request.dsn)
-        .await
-        .map(Json)
-        .map_err(ApiError::bad_request)
+    let _permit = Arc::clone(&state.connection_test_gate)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::unavailable("connection test capacity is exhausted"))?;
+    tokio::time::timeout(
+        CONNECTION_TEST_TIMEOUT,
+        state.connection_tester.test_source(&request.dsn),
+    )
+    .await
+    .map_err(|_| ApiError::unavailable("source connection test timed out"))?
+    .map(Json)
+    .map_err(ApiError::bad_request)
 }
 
 async fn test_target(
     State(state): State<AppState>,
     Json(request): Json<TestConnectionRequest>,
 ) -> Result<Json<ConnectionReport>, ApiError> {
-    state
-        .connection_tester
-        .test_target(&request.dsn)
-        .await
-        .map(Json)
-        .map_err(ApiError::bad_request)
+    let _permit = Arc::clone(&state.connection_test_gate)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::unavailable("connection test capacity is exhausted"))?;
+    tokio::time::timeout(
+        CONNECTION_TEST_TIMEOUT,
+        state.connection_tester.test_target(&request.dsn),
+    )
+    .await
+    .map_err(|_| ApiError::unavailable("target connection test timed out"))?
+    .map(Json)
+    .map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -946,6 +954,7 @@ mod tests {
                 supervisor: Arc::new(PipelineSupervisor::new()),
                 connection_tester: Arc::new(NoopConnectionTester),
                 metrics_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+                connection_test_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             },
             id,
             control,
@@ -1007,6 +1016,26 @@ mod tests {
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rejects_connection_tests_when_the_bounded_worker_set_is_busy() {
+        let (state, _, _) = command_state();
+        let _permit = Arc::clone(&state.connection_test_gate)
+            .acquire_owned()
+            .await
+            .expect("connection test gate is open");
+        let request = TestConnectionRequest {
+            dsn: SecretString::from("postgresql://unused.invalid/test"),
+        };
+
+        let error = test_source(State(state), Json(request))
+            .await
+            .expect_err("excess connection test is rejected");
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

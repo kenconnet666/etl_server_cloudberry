@@ -1,10 +1,14 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{CoreError, CoreResult};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// PostgreSQL stores at most `NAMEDATALEN - 1` bytes for an identifier. Cloudberry inherits the
+/// same limit. Counting UTF-8 bytes here prevents the server from silently truncating a name.
+pub const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct QualifiedName {
     pub schema: String,
     pub name: String,
@@ -19,6 +23,22 @@ impl QualifiedName {
         validate_identifier(&value.schema)?;
         validate_identifier(&value.name)?;
         Ok(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for QualifiedName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            schema: String,
+            name: String,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(fields.schema, fields.name).map_err(serde::de::Error::custom)
     }
 }
 
@@ -214,7 +234,7 @@ impl TableSchema {
 }
 
 pub fn validate_identifier(value: &str) -> CoreResult<()> {
-    if value.is_empty() || value.contains('\0') {
+    if value.is_empty() || value.contains('\0') || value.len() > POSTGRES_IDENTIFIER_MAX_BYTES {
         return Err(CoreError::InvalidIdentifier(value.to_owned()));
     }
     Ok(())
@@ -272,5 +292,33 @@ mod tests {
             .map(|column| column.name.as_str())
             .collect();
         assert_eq!(names, ["id", "tenant_id"]);
+    }
+
+    #[test]
+    fn identifiers_are_limited_by_utf8_bytes() {
+        let ascii_limit = "a".repeat(POSTGRES_IDENTIFIER_MAX_BYTES);
+        let utf8_limit = "界".repeat(POSTGRES_IDENTIFIER_MAX_BYTES / 3);
+
+        assert!(validate_identifier(&ascii_limit).is_ok());
+        assert!(validate_identifier(&utf8_limit).is_ok());
+        assert!(validate_identifier(&format!("{ascii_limit}a")).is_err());
+        assert!(validate_identifier(&format!("{utf8_limit}界")).is_err());
+        assert!(validate_identifier("").is_err());
+        assert!(validate_identifier("invalid\0name").is_err());
+    }
+
+    #[test]
+    fn qualified_name_deserialization_preserves_identifier_invariants() {
+        let valid = serde_json::json!({
+            "schema": "界".repeat(21),
+            "name": "a".repeat(63),
+        });
+        assert!(serde_json::from_value::<QualifiedName>(valid).is_ok());
+
+        let truncated_by_postgres = serde_json::json!({
+            "schema": "public",
+            "name": "界".repeat(22),
+        });
+        assert!(serde_json::from_value::<QualifiedName>(truncated_by_postgres).is_err());
     }
 }

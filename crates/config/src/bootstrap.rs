@@ -145,10 +145,10 @@ impl EngineConfig {
             ));
         }
         if self.lease_renew_interval_seconds == 0
-            || self.lease_renew_interval_seconds >= self.lease_ttl_seconds
+            || self.lease_renew_interval_seconds > self.lease_ttl_seconds / 3
         {
             return Err(ConfigError::Invalid(
-                "engine.lease_renew_interval_seconds must be greater than zero and shorter than engine.lease_ttl_seconds"
+                "engine.lease_renew_interval_seconds must be greater than zero and no more than one third of engine.lease_ttl_seconds"
                     .into(),
             ));
         }
@@ -260,10 +260,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lease_renewal_at_or_after_expiry() {
+    fn rejects_lease_renewal_without_two_intervals_of_safety_margin() {
         let config = CONFIG.replace(
             "lease_renew_interval_seconds = 10",
-            "lease_renew_interval_seconds = 30",
+            "lease_renew_interval_seconds = 11",
         );
         assert!(BootstrapConfig::from_toml(&config).is_err());
     }

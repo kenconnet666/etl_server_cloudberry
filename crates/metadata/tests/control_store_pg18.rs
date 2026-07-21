@@ -47,20 +47,10 @@ async fn desired_state_and_rebuild_have_independent_revisions() -> Result<(), Bo
     let mut pool_config: tokio_postgres::Config = dsn.parse()?;
     pool_config.application_name(&application_name);
     configure_control_session(&mut pool_config);
-    let manager = Manager::from_config(
-        pool_config,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Verified,
-        },
-    );
-    let pool = Pool::builder(manager)
-        .max_size(1)
-        .runtime(Runtime::Tokio1)
-        .wait_timeout(Some(Duration::from_secs(5)))
-        .create_timeout(Some(Duration::from_secs(5)))
-        .recycle_timeout(Some(Duration::from_secs(5)))
-        .build()?;
+    let mut lease_pool_config = pool_config.clone();
+    lease_pool_config.application_name(format!("{application_name}-lease"));
+    let pool = build_test_pool(pool_config)?;
+    let lease_pool = build_test_pool(lease_pool_config)?;
     let session = pool.get().await?;
     let row = session
         .query_one(
@@ -74,10 +64,17 @@ async fn desired_state_and_rebuild_have_independent_revisions() -> Result<(), Bo
     assert_eq!(row.get::<_, &str>(1), "2s");
     assert_eq!(row.get::<_, &str>(2), "5s");
     drop(session);
-    let store = PostgresControlStore::new(pool);
-    let result = AssertUnwindSafe(run_test(&store, &audit_client, &ids, &application_name))
-        .catch_unwind()
-        .await;
+    let general_pool = pool.clone();
+    let store = PostgresControlStore::with_lease_pool(pool, lease_pool);
+    let result = AssertUnwindSafe(run_test(
+        &store,
+        &general_pool,
+        &audit_client,
+        &ids,
+        &application_name,
+    ))
+    .catch_unwind()
+    .await;
     cleanup(&audit_client, &ids).await;
     connection_task.abort();
     audit_task.abort();
@@ -85,6 +82,23 @@ async fn desired_state_and_rebuild_have_independent_revisions() -> Result<(), Bo
         Ok(result) => result,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+fn build_test_pool(config: tokio_postgres::Config) -> Result<Pool, deadpool_postgres::BuildError> {
+    let manager = Manager::from_config(
+        config,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Verified,
+        },
+    );
+    Ok(Pool::builder(manager)
+        .max_size(1)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(Duration::from_secs(5)))
+        .create_timeout(Some(Duration::from_secs(5)))
+        .recycle_timeout(Some(Duration::from_secs(5)))
+        .build()?)
 }
 
 struct TestIds {
@@ -107,11 +121,25 @@ impl TestIds {
 
 async fn run_test(
     store: &PostgresControlStore,
+    general_pool: &Pool,
     audit_client: &Client,
     ids: &TestIds,
     application_name: &str,
 ) -> Result<(), Box<dyn Error>> {
     store.check_readiness().await?;
+    let session = general_pool.get().await?;
+    session
+        .batch_execute("SET default_transaction_read_only = on")
+        .await?;
+    drop(session);
+    let read_only_result = store.check_readiness().await;
+    let session = general_pool.get().await?;
+    session
+        .batch_execute("SET default_transaction_read_only = off")
+        .await?;
+    drop(session);
+    assert!(matches!(read_only_result, Err(StoreError::ReadOnly)));
+
     let now = Utc::now();
     store
         .put_source(&SourceProfile {
@@ -155,11 +183,16 @@ async fn run_test(
     };
     store.put_pipeline(&pipeline).await?;
 
+    // Exhaust the ordinary control pool. Lease operations must still use their reserved pool.
+    let held_general_connection = general_pool.get().await?;
     let first_holder = Uuid::new_v4();
-    let first_lease = store
-        .try_acquire_lease(ids.pipeline, first_holder, Duration::from_secs(30))
-        .await?
-        .expect("first holder acquires lease");
+    let first_lease = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.try_acquire_lease(ids.pipeline, first_holder, Duration::from_secs(30)),
+    )
+    .await??
+    .expect("first holder acquires lease despite ordinary pool exhaustion");
+    drop(held_general_connection);
     store.release_lease(&first_lease).await?;
 
     let backend_pid: i32 = audit_client

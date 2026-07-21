@@ -272,4 +272,61 @@ mod tests {
         assert!(first[0].shadow.name.len() <= 63);
         assert!(first[0].staging_name.len() <= 63);
     }
+
+    #[test]
+    fn rejects_explicit_utf8_names_that_postgres_would_truncate() {
+        let result = PipelineSettings::parse(&json!({
+            "table_mappings": [{
+                "source": {"schema": "public", "name": "items"},
+                "target": {"schema": "mapped", "name": "界".repeat(22)}
+            }]
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_mapping_shortens_long_composite_schema_deterministically() {
+        let pipeline = PipelineId::new();
+        let prefix = SourcePrefix::new("p".repeat(24)).unwrap();
+        let source_database = "d".repeat(63);
+        let source = table(1, &"s".repeat(63), "items");
+
+        let first = plan_tables(
+            pipeline,
+            1,
+            &prefix,
+            &source_database,
+            "analytics",
+            &PipelineSettings::default(),
+            vec![source.clone()],
+        )
+        .unwrap();
+        let second = plan_tables(
+            pipeline,
+            1,
+            &prefix,
+            &source_database,
+            "analytics",
+            &PipelineSettings::default(),
+            vec![source],
+        )
+        .unwrap();
+
+        assert_eq!(first[0].target, second[0].target);
+        assert!(first[0].target.schema.len() <= 63);
+
+        let invalid_target_database = "界".repeat(22);
+        let error = plan_tables(
+            pipeline,
+            1,
+            &prefix,
+            &source_database,
+            &invalid_target_database,
+            &PipelineSettings::default(),
+            vec![table(1, "public", "items")],
+        )
+        .unwrap_err();
+        assert!(matches!(error, TablePlanningError::DefaultMapping(_)));
+    }
 }

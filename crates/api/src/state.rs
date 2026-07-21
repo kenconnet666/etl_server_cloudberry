@@ -29,6 +29,7 @@ pub struct AppState {
     pub supervisor: Arc<PipelineSupervisor>,
     pub connection_tester: Arc<dyn ConnectionTester>,
     pub metrics_gate: Arc<Semaphore>,
+    pub connection_test_gate: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {

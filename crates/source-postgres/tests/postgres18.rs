@@ -15,7 +15,7 @@ use cloudberry_etl_core::{
 use cloudberry_etl_source_postgres::{
     SourceResult,
     catalog::{CatalogOptions, PreflightOptions, load_tables, preflight},
-    ddl::{DdlInstallSpec, ensure_ddl_capture},
+    ddl::{DDL_CAPTURE_MARKER, DdlInstallSpec, ensure_ddl_capture},
     publication::{
         PublicationSpec, create_logical_slot, drop_logical_slot, ensure_publication,
         inspect_publication,
@@ -173,6 +173,95 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
         .await?
         .try_get(0)?;
     assert_eq!(capture_objects, 2);
+
+    // A marker alone is not an integrity proof.  Replacing a function body or its
+    // configuration must force a repair even when the old comment remains.
+    execute_internal_ddl(
+        client,
+        &format!(
+            r#"CREATE OR REPLACE FUNCTION {}.emit_ddl_event()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $pg2cb_tampered$
+BEGIN
+    RETURN;
+END;
+$pg2cb_tampered$;
+ALTER FUNCTION {}.emit_ddl_event() RESET ALL;
+COMMENT ON FUNCTION {}.emit_ddl_event() IS '{}';"#,
+            quote_identifier(&objects.metadata_schema),
+            quote_identifier(&objects.metadata_schema),
+            quote_identifier(&objects.metadata_schema),
+            DDL_CAPTURE_MARKER,
+        ),
+    )
+    .await?;
+    assert!(
+        ensure_ddl_capture(client, &install).await?,
+        "same-marker function body/config drift must be repaired"
+    );
+    assert!(!ensure_ddl_capture(client, &install).await?);
+
+    // Event trigger filters and disabled states are catalog definitions too; neither may
+    // be treated as equivalent to the unfiltered, enabled installer output.
+    execute_internal_ddl(
+        client,
+        &format!(
+            r#"DROP EVENT TRIGGER {};
+CREATE EVENT TRIGGER {} ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE')
+    EXECUTE FUNCTION {}.emit_ddl_event();
+COMMENT ON EVENT TRIGGER {} IS '{}';"#,
+            quote_identifier(&objects.trigger_name),
+            quote_identifier(&objects.trigger_name),
+            quote_identifier(&objects.metadata_schema),
+            quote_identifier(&objects.trigger_name),
+            DDL_CAPTURE_MARKER,
+        ),
+    )
+    .await?;
+    assert!(
+        ensure_ddl_capture(client, &install).await?,
+        "event trigger tag drift must be repaired"
+    );
+    assert!(!ensure_ddl_capture(client, &install).await?);
+
+    client
+        .batch_execute(&format!(
+            "ALTER EVENT TRIGGER {} DISABLE",
+            quote_identifier(&objects.trigger_name)
+        ))
+        .await?;
+    assert!(
+        ensure_ddl_capture(client, &install).await?,
+        "disabled event trigger must be repaired"
+    );
+    assert!(!ensure_ddl_capture(client, &install).await?);
+
+    // An incompatible audit relation is rejected after the transactional installer rather
+    // than being reported as installed while inserts would still fail.
+    execute_internal_ddl(
+        client,
+        &format!(
+            "ALTER TABLE {}.ddl_audit ADD COLUMN integrity_probe integer",
+            quote_identifier(&objects.metadata_schema)
+        ),
+    )
+    .await?;
+    assert!(
+        ensure_ddl_capture(client, &install).await.is_err(),
+        "audit table drift must fail closed"
+    );
+    execute_internal_ddl(
+        client,
+        &format!(
+            "ALTER TABLE {}.ddl_audit DROP COLUMN integrity_probe",
+            quote_identifier(&objects.metadata_schema)
+        ),
+    )
+    .await?;
+    assert!(!ensure_ddl_capture(client, &install).await?);
 
     let missing_table = QualifiedName::new(
         objects.business_schema.clone(),
@@ -475,6 +564,28 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
         })
     }));
     Ok(())
+}
+
+async fn execute_internal_ddl(client: &Client, ddl: &str) -> SourceResult<()> {
+    client.batch_execute("BEGIN").await?;
+    let result = async {
+        client
+            .batch_execute("SELECT set_config('pg2cb.internal_ddl', 'on', true)")
+            .await?;
+        client.batch_execute(ddl).await?;
+        Ok::<(), cloudberry_etl_source_postgres::SourceError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            client.batch_execute("COMMIT").await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
 }
 
 async fn cleanup(client: &Client, objects: &TestObjects) {

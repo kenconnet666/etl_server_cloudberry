@@ -39,6 +39,8 @@ pub enum StoreError {
     StaleRevision,
     #[error("control database schema version {actual} is incompatible; expected {expected}")]
     IncompatibleSchemaVersion { expected: i64, actual: i64 },
+    #[error("control database is read-only")]
+    ReadOnly,
 }
 
 const CONTROL_SESSION_OPTIONS: &str = "-c statement_timeout=5000 \
@@ -101,16 +103,31 @@ pub trait ControlStore: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PostgresControlStore {
     pool: Pool,
+    lease_pool: Pool,
 }
 
 impl PostgresControlStore {
     #[must_use]
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            lease_pool: pool.clone(),
+            pool,
+        }
+    }
+
+    /// Uses a separately sized pool for lease operations so control-plane traffic cannot delay
+    /// fencing renewal. Both pools must connect to the same control database and role.
+    #[must_use]
+    pub fn with_lease_pool(pool: Pool, lease_pool: Pool) -> Self {
+        Self { pool, lease_pool }
     }
 
     async fn client(&self) -> Result<PoolClient, StoreError> {
         Ok(self.pool.get().await?)
+    }
+
+    async fn lease_client(&self) -> Result<PoolClient, StoreError> {
+        Ok(self.lease_pool.get().await?)
     }
 }
 
@@ -118,19 +135,23 @@ impl PostgresControlStore {
 impl ControlStore for PostgresControlStore {
     async fn check_readiness(&self) -> Result<(), StoreError> {
         let client = self.client().await?;
-        let actual: i64 = client
+        let row = client
             .query_one(
-                "SELECT COALESCE(max(version), 0) \
+                "SELECT COALESCE(max(version), 0), \
+                        current_setting('transaction_read_only')::boolean \
                    FROM cloudberry_etl_control.schema_migrations",
                 &[],
             )
-            .await?
-            .get(0);
+            .await?;
+        let actual: i64 = row.get(0);
         if actual != CONTROL_SCHEMA_VERSION {
             return Err(StoreError::IncompatibleSchemaVersion {
                 expected: CONTROL_SCHEMA_VERSION,
                 actual,
             });
+        }
+        if row.get::<_, bool>(1) {
+            return Err(StoreError::ReadOnly);
         }
         Ok(())
     }
@@ -431,7 +452,7 @@ impl ControlStore for PostgresControlStore {
         holder_id: Uuid,
         ttl: Duration,
     ) -> Result<Option<PipelineLease>, StoreError> {
-        let client = self.client().await?;
+        let client = self.lease_client().await?;
         let ttl_seconds = duration_seconds(ttl)?;
         let row = client
             .query_opt(
@@ -456,7 +477,7 @@ impl ControlStore for PostgresControlStore {
         lease: &PipelineLease,
         ttl: Duration,
     ) -> Result<Option<PipelineLease>, StoreError> {
-        let client = self.client().await?;
+        let client = self.lease_client().await?;
         let ttl_seconds = duration_seconds(ttl)?;
         let row = client
             .query_opt(
@@ -478,7 +499,7 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn release_lease(&self, lease: &PipelineLease) -> Result<(), StoreError> {
-        let client = self.client().await?;
+        let client = self.lease_client().await?;
         client
             .execute(
                 r#"UPDATE cloudberry_etl_control.pipeline_leases

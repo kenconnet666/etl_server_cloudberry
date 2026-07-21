@@ -12,13 +12,19 @@ use cloudberry_etl_metadata::{
     model::{PipelineDefinition, PipelineLease},
     store::ControlStore,
 };
+use futures::{StreamExt, stream};
 use thiserror::Error;
-use tokio::time::{self, Instant, MissedTickBehavior};
+use tokio::{
+    sync::watch,
+    time::{self, Instant, MissedTickBehavior},
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::supervisor::{PipelineJob, PipelineSupervisor, SupervisorError};
 use crate::telemetry::PipelineTelemetryHandle;
+
+const MAX_CONCURRENT_LEASE_RENEWALS: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum ReconcilerConfigError {
@@ -28,7 +34,7 @@ pub enum ReconcilerConfigError {
     ZeroLeaseTtl,
     #[error("reconciler lease renewal interval must be greater than zero")]
     ZeroRenewInterval,
-    #[error("lease renewal interval must be shorter than lease TTL")]
+    #[error("lease renewal interval must not exceed one third of lease TTL")]
     RenewalTooLate,
     #[error("initial restart backoff must be greater than zero")]
     ZeroInitialBackoff,
@@ -72,7 +78,7 @@ impl ReconcilerConfig {
         if self.lease_renew_interval.is_zero() {
             return Err(ReconcilerConfigError::ZeroRenewInterval);
         }
-        if self.lease_renew_interval >= self.lease_ttl {
+        if self.lease_renew_interval > self.lease_ttl / 3 {
             return Err(ReconcilerConfigError::RenewalTooLate);
         }
         if self.restart_backoff_initial.is_zero() {
@@ -115,6 +121,110 @@ pub trait PipelineJobFactory: Send + Sync + 'static {
         lease: &PipelineLease,
         telemetry: PipelineTelemetryHandle,
     ) -> Result<Arc<dyn PipelineJob>, JobFactoryError>;
+}
+
+struct LeaseGuardedJob {
+    inner: Arc<dyn PipelineJob>,
+    lease_cancellation: CancellationToken,
+}
+
+#[async_trait]
+impl PipelineJob for LeaseGuardedJob {
+    async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
+        let inner = self.inner.run(cancellation.clone());
+        tokio::pin!(inner);
+        tokio::select! {
+            biased;
+            () = self.lease_cancellation.cancelled() => {
+                cancellation.cancel();
+                Err(SupervisorError::Task("pipeline lease safety deadline reached".into()))
+            }
+            result = &mut inner => result,
+        }
+    }
+}
+
+struct LeaseDeadlineGuard {
+    deadline: watch::Sender<Instant>,
+    job_cancellation: CancellationToken,
+}
+
+impl LeaseDeadlineGuard {
+    fn new(
+        pipeline_id: PipelineId,
+        request_started: Instant,
+        ttl: Duration,
+        safety_margin: Duration,
+    ) -> Self {
+        let stop_at = lease_stop_at(request_started, ttl, safety_margin);
+        let (deadline, receiver) = watch::channel(stop_at);
+        let job_cancellation = CancellationToken::new();
+        tokio::spawn(watch_lease_deadline(
+            pipeline_id,
+            receiver,
+            job_cancellation.clone(),
+        ));
+        Self {
+            deadline,
+            job_cancellation,
+        }
+    }
+
+    fn job_cancellation(&self) -> CancellationToken {
+        self.job_cancellation.clone()
+    }
+
+    fn rearm(&self, request_started: Instant, ttl: Duration, safety_margin: Duration) -> bool {
+        if self.expired() {
+            return false;
+        }
+        let stop_at = lease_stop_at(request_started, ttl, safety_margin);
+        self.deadline.send(stop_at).is_ok() && !self.expired()
+    }
+
+    fn expired(&self) -> bool {
+        self.job_cancellation.is_cancelled() || Instant::now() >= *self.deadline.borrow()
+    }
+
+    fn stop_at(&self) -> Instant {
+        *self.deadline.borrow()
+    }
+}
+
+impl Drop for LeaseDeadlineGuard {
+    fn drop(&mut self) {
+        self.job_cancellation.cancel();
+    }
+}
+
+fn lease_stop_at(request_started: Instant, ttl: Duration, safety_margin: Duration) -> Instant {
+    request_started + ttl - safety_margin
+}
+
+async fn watch_lease_deadline(
+    pipeline_id: PipelineId,
+    mut deadline: watch::Receiver<Instant>,
+    job_cancellation: CancellationToken,
+) {
+    loop {
+        let stop_at = *deadline.borrow();
+        tokio::select! {
+            biased;
+            changed = deadline.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = time::sleep_until(stop_at) => {
+                tracing::error!(
+                    pipeline_id = %pipeline_id,
+                    "pipeline reached its conservative lease safety deadline"
+                );
+                job_cancellation.cancel();
+                return;
+            }
+        }
+    }
 }
 
 pub struct PipelineReconciler {
@@ -228,32 +338,67 @@ impl PipelineReconciler {
     }
 
     async fn renew_leases(&self, runtime: &mut RuntimeState) {
-        let due: Vec<_> = runtime
+        let mut due: Vec<_> = runtime
             .owned
             .iter()
             .filter_map(|(pipeline_id, owned)| {
-                (Instant::now() >= owned.next_renewal)
-                    .then_some((*pipeline_id, owned.lease.clone()))
+                (Instant::now() >= owned.next_renewal).then_some((
+                    owned.deadline.stop_at(),
+                    *pipeline_id,
+                    owned.lease.clone(),
+                ))
             })
             .collect();
+        due.sort_unstable_by_key(|(stop_at, _, _)| *stop_at);
+        let store = Arc::clone(&self.store);
+        let lease_ttl = self.config.lease_ttl;
+        let mut renewals = stream::iter(due.into_iter().map(move |(_, pipeline_id, lease)| {
+            let store = Arc::clone(&store);
+            async move {
+                let request_started = Instant::now();
+                let result = store.renew_lease(&lease, lease_ttl).await;
+                (pipeline_id, lease, request_started, result)
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_LEASE_RENEWALS);
+        let mut lost = Vec::new();
 
-        for (pipeline_id, lease) in due {
-            match self.store.renew_lease(&lease, self.config.lease_ttl).await {
+        while let Some((pipeline_id, lease, request_started, result)) = renewals.next().await {
+            match result {
                 Ok(Some(renewed)) => {
-                    if let Some(owned) = runtime.owned.get_mut(&pipeline_id) {
+                    let rearmed = runtime.owned.get_mut(&pipeline_id).is_some_and(|owned| {
+                        if !owned.deadline.rearm(
+                            request_started,
+                            self.config.lease_ttl,
+                            self.config.lease_renew_interval,
+                        ) {
+                            return false;
+                        }
                         owned.lease = renewed;
-                        owned.next_renewal = Instant::now() + self.config.lease_renew_interval;
+                        owned.next_renewal = request_started + self.config.lease_renew_interval;
+                        true
+                    });
+                    if !rearmed {
+                        tracing::error!(
+                            pipeline_id = %pipeline_id,
+                            "lease renewal completed after the local safety deadline"
+                        );
+                        lost.push((pipeline_id, lease));
                     }
                 }
                 Ok(None) => {
                     tracing::error!(pipeline_id = %pipeline_id, "pipeline lease was lost");
-                    self.lease_lost(runtime, pipeline_id, lease).await;
+                    lost.push((pipeline_id, lease));
                 }
                 Err(error) => {
                     tracing::error!(pipeline_id = %pipeline_id, %error, "pipeline lease renewal failed");
-                    self.lease_lost(runtime, pipeline_id, lease).await;
+                    lost.push((pipeline_id, lease));
                 }
             }
+        }
+
+        for (pipeline_id, lease) in lost {
+            self.lease_lost(runtime, pipeline_id, lease).await;
         }
     }
 
@@ -340,6 +485,7 @@ impl PipelineReconciler {
     }
 
     async fn start_pipeline(&self, runtime: &mut RuntimeState, definition: &PipelineDefinition) {
+        let acquire_started = Instant::now();
         let lease = match self
             .store
             .try_acquire_lease(definition.id, self.holder_id, self.config.lease_ttl)
@@ -353,6 +499,21 @@ impl PipelineReconciler {
                 return;
             }
         };
+        let deadline = LeaseDeadlineGuard::new(
+            definition.id,
+            acquire_started,
+            self.config.lease_ttl,
+            self.config.lease_renew_interval,
+        );
+        if deadline.expired() {
+            tracing::error!(
+                pipeline_id = %definition.id,
+                "lease acquisition completed after the local safety deadline"
+            );
+            self.release(&lease).await;
+            runtime.record_failure(definition.id, Instant::now(), &self.config);
+            return;
+        }
 
         let telemetry = self.supervisor.telemetry_for(definition.id).await;
         let job = match self.factory.create(definition, &lease, telemetry).await {
@@ -364,6 +525,19 @@ impl PipelineReconciler {
                 return;
             }
         };
+        if deadline.expired() {
+            tracing::error!(
+                pipeline_id = %definition.id,
+                "pipeline job creation exceeded the local lease safety deadline"
+            );
+            self.release(&lease).await;
+            runtime.record_failure(definition.id, Instant::now(), &self.config);
+            return;
+        }
+        let job: Arc<dyn PipelineJob> = Arc::new(LeaseGuardedJob {
+            inner: job,
+            lease_cancellation: deadline.job_cancellation(),
+        });
 
         if let Err(error) = self.supervisor.start(definition.id, job).await {
             tracing::error!(pipeline_id = %definition.id, %error, "failed to start pipeline job");
@@ -379,7 +553,8 @@ impl PipelineReconciler {
                 config_revision: definition.config_revision,
                 snapshot_generation: definition.snapshot_generation,
                 started_at: Instant::now(),
-                next_renewal: Instant::now() + self.config.lease_renew_interval,
+                next_renewal: acquire_started + self.config.lease_renew_interval,
+                deadline,
             },
         );
         runtime.mark_started(definition.id);
@@ -434,6 +609,7 @@ struct OwnedPipeline {
     snapshot_generation: i64,
     started_at: Instant,
     next_renewal: Instant,
+    deadline: LeaseDeadlineGuard,
 }
 
 #[derive(Default)]
@@ -486,7 +662,7 @@ mod tests {
         model::{PipelineDefinition, PipelineLease, SourceProfile, TargetProfile},
         store::{ControlStore, StoreError},
     };
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     use super::*;
 
@@ -496,6 +672,9 @@ mod tests {
         leases: Mutex<HashMap<PipelineId, PipelineLease>>,
         fence: AtomicI64,
         renew_enabled: AtomicBool,
+        renew_blocked: AtomicBool,
+        renew_started: Notify,
+        renew_release: Notify,
         release_count: AtomicUsize,
     }
 
@@ -622,6 +801,10 @@ mod tests {
             lease: &PipelineLease,
             ttl: Duration,
         ) -> Result<Option<PipelineLease>, StoreError> {
+            if self.renew_blocked.load(Ordering::SeqCst) {
+                self.renew_started.notify_one();
+                self.renew_release.notified().await;
+            }
             if !self.renew_enabled.load(Ordering::SeqCst) {
                 return Ok(None);
             }
@@ -775,6 +958,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn blocked_renewal_stops_the_job_before_the_lease_ttl() {
+        let pipeline = pipeline(true);
+        let store = FakeStore::with_pipelines(vec![pipeline]);
+        let factory = SharedFactory::new([JobKind::Wait]);
+        let supervisor = Arc::new(PipelineSupervisor::new());
+        let reconciler = PipelineReconciler::new(
+            Arc::clone(&store) as Arc<dyn ControlStore>,
+            Arc::clone(&supervisor),
+            Arc::clone(&factory) as Arc<dyn PipelineJobFactory>,
+            config(),
+        )
+        .unwrap();
+        let test_started = Instant::now();
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { reconciler.run(task_shutdown).await });
+
+        wait_for(&factory.created, 1).await;
+        store.renew_blocked.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(21)).await;
+        store.renew_started.notified().await;
+
+        tokio::time::advance(Duration::from_millis(58)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(supervisor.running().await.len(), 1);
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..100 {
+            if supervisor.running().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(supervisor.running().await.is_empty());
+        assert!(Instant::now() < test_started + config().lease_ttl);
+
+        store.renew_blocked.store(false, Ordering::SeqCst);
+        store.renew_release.notify_one();
+        wait_for(&store.release_count, 1).await;
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pause_stops_job_and_releases_lease() {
         let pipeline = pipeline(true);
         let pipeline_id = pipeline.id;
@@ -903,13 +1130,34 @@ mod tests {
         assert!(supervisor.running().await.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn successful_renewal_rearms_the_lease_watchdog() {
+        let pipeline_id = PipelineId::new();
+        let ttl = Duration::from_millis(100);
+        let margin = Duration::from_millis(20);
+        let guard = LeaseDeadlineGuard::new(pipeline_id, Instant::now(), ttl, margin);
+        let job_cancellation = guard.job_cancellation();
+
+        tokio::time::advance(Duration::from_millis(70)).await;
+        assert!(guard.rearm(Instant::now(), ttl, margin));
+        tokio::time::advance(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+        assert!(!job_cancellation.is_cancelled());
+
+        tokio::time::advance(Duration::from_millis(61)).await;
+        tokio::task::yield_now().await;
+        assert!(job_cancellation.is_cancelled());
+    }
+
     #[test]
     fn rejects_unsafe_lease_configuration() {
         let mut invalid = config();
-        invalid.lease_renew_interval = invalid.lease_ttl;
+        invalid.lease_renew_interval = invalid.lease_ttl / 3 + Duration::from_millis(1);
         assert!(matches!(
             invalid.validate(),
             Err(ReconcilerConfigError::RenewalTooLate)
         ));
+        invalid.lease_renew_interval = invalid.lease_ttl / 3;
+        assert!(invalid.validate().is_ok());
     }
 }
