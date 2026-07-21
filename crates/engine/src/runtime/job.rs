@@ -26,7 +26,7 @@ use cloudberry_etl_source_postgres::{
         LogicalSlotState, PublicationSpec, drop_logical_slot, ensure_publication,
         inspect_logical_slot, validate_publication,
     },
-    snapshot::begin_at_exported_snapshot,
+    snapshot::{SnapshotCursor, SnapshotPageLimits, SnapshotSession, begin_at_exported_snapshot},
     snapshot_slot::SnapshotSlotGuard,
     spool::{ChunkLimits, SpoolError, SpoolIdentity, SpoolJournal, SpoolLimits},
     wal::{ReplicationTransport, SourceNodeIdentity, TransactionAssembler, TransactionLimits},
@@ -39,7 +39,7 @@ use cloudberry_etl_target_cloudberry::{
     migration::{MigrationError, migrate_target_database},
     snapshot::{
         QuarantineGcPolicy, SnapshotActivationRequest, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group,
+        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_pages, begin_snapshot_group,
         cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables, plan_snapshot_target,
         validate_active_snapshot_group,
     },
@@ -358,6 +358,22 @@ struct RuntimeTable {
 struct PreparedRun {
     tables: Vec<RuntimeTable>,
     checkpoint: NodeCheckpoint,
+}
+
+/// Bridge a source canonical PK key into the target's durable text cursor.
+///
+/// Canonical snapshot keys are produced through PostgreSQL's text output with a
+/// UTF-8 client encoding, so each key column is valid UTF-8 and maps losslessly
+/// to the `Vec<String>` cursor that the target digests. A non-UTF-8 key would
+/// violate the canonical contract and is rejected rather than silently lossy.
+fn cursor_to_text(key: &[bytes::Bytes]) -> Result<Vec<String>, SourceError> {
+    key.iter()
+        .map(|value| {
+            std::str::from_utf8(value).map(str::to_owned).map_err(|_| {
+                SourceError::Contract("canonical snapshot key is not valid UTF-8".to_owned())
+            })
+        })
+        .collect()
 }
 
 impl PostgresCloudberryJob {
@@ -806,6 +822,137 @@ impl PostgresCloudberryJob {
         Ok(())
     }
 
+    /// Load one table into its shadow using bounded PK pages.
+    ///
+    /// The source pager reads one `LIMIT+1` canonical PK page, derives a
+    /// `(start, end]` range, and streams it directly through PostgreSQL COPY. The
+    /// target driver copies that page and advances a durable cursor in its own
+    /// transaction, so an ambiguous per-page commit is reconciled on the next
+    /// call via `SnapshotPageApplyOutcome::ResumeAt` within this same live
+    /// source snapshot. A process crash instead discards the whole loading group
+    /// (a fresh run gets a new slot/group and restarts from the table head), so
+    /// the durable cursor is only ever resumed against the session that wrote it.
+    ///
+    /// Tables without a usable primary key fall back to a single whole-table
+    /// COPY because the bounded cursor contract requires PK columns to prove
+    /// forward progress.
+    async fn load_table_snapshot(
+        &self,
+        target: &mut tokio_postgres::Client,
+        snapshot: &mut SnapshotSession<'_>,
+        table: &RuntimeTable,
+        ownership: &cloudberry_etl_target_cloudberry::snapshot::SnapshotOwnership,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RuntimeJobError> {
+        let schema = &table.planned.source;
+        if schema.primary_key().is_empty() {
+            return self
+                .load_table_whole(target, snapshot, table, ownership, cancellation)
+                .await;
+        }
+
+        let limits = SnapshotPageLimits {
+            row_limit: self.pipeline_settings.batch.max_rows,
+            max_page_bytes: self.pipeline_settings.batch.max_bytes,
+        };
+        let mut loader =
+            begin_snapshot_pages(target, table.snapshot_plan.clone(), ownership).await?;
+        if loader.is_completed() {
+            tracing::info!(
+                pipeline_id = %self.pipeline_id,
+                table = %schema.name,
+                "snapshot table already complete; skipping load"
+            );
+            return Ok(());
+        }
+
+        // Re-derive the in-session source cursor from the durable target cursor. An empty durable
+        // cursor means the scan restarts at the table head. A non-empty one only reappears within
+        // this same live snapshot, so the source pager can trust it as a page boundary.
+        let mut cursor: Option<SnapshotCursor> = None;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(RuntimeJobError::Cancelled);
+            }
+            let page = snapshot
+                .read_canonical_pk_page(schema, cursor.as_ref(), limits)
+                .await?;
+            let has_more = page.has_more;
+            let next_cursor_bytes = page.next_cursor();
+            let next_cursor = match &next_cursor_bytes {
+                Some(cursor) => cursor_to_text(cursor.key())?,
+                // An empty tail keeps the current durable cursor rather than inventing one.
+                None => loader.cursor().to_vec(),
+            };
+            let range = page.copy_range()?;
+            let completed = !has_more;
+
+            let stream = snapshot.copy_text_pk_range(schema, &range).await?;
+            let outcome = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(RuntimeJobError::Cancelled),
+                outcome = loader.apply_page(target, next_cursor, completed, stream) => outcome?,
+            };
+            tracing::debug!(
+                pipeline_id = %self.pipeline_id,
+                table = %schema.name,
+                ?outcome,
+                has_more,
+                "snapshot page applied"
+            );
+
+            if completed {
+                break;
+            }
+            // Advance the source pager. On a reconciled lost commit the target cursor already
+            // moved past this page, but re-reading the same boundary is safe and idempotent.
+            cursor = next_cursor_bytes;
+        }
+        tracing::info!(
+            pipeline_id = %self.pipeline_id,
+            table = %schema.name,
+            "snapshot table load committed via bounded pages"
+        );
+        Ok(())
+    }
+
+    /// Whole-table COPY fallback for tables without a primary key. Preparation,
+    /// COPY and completion all commit in a single target transaction.
+    async fn load_table_whole(
+        &self,
+        target: &mut tokio_postgres::Client,
+        snapshot: &mut SnapshotSession<'_>,
+        table: &RuntimeTable,
+        ownership: &cloudberry_etl_target_cloudberry::snapshot::SnapshotOwnership,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RuntimeJobError> {
+        let mut apply =
+            begin_snapshot_apply(target, table.snapshot_plan.clone(), ownership).await?;
+        let stream = snapshot.copy_text_table(&table.planned.source).await?;
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => None,
+            result = apply.copy_from_stream(stream) => Some(result),
+        };
+        match result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                apply.rollback().await?;
+                return Err(RuntimeJobError::Cancelled);
+            }
+        }
+        let outcome = apply.commit().await?;
+        tracing::info!(
+            pipeline_id = %self.pipeline_id,
+            table = %table.planned.source.name,
+            ?outcome,
+            "snapshot table load committed"
+        );
+        Ok(())
+    }
+
     async fn prepare_initial_snapshot(
         &self,
         source_setup: &mut tokio_postgres::Client,
@@ -928,31 +1075,16 @@ impl PostgresCloudberryJob {
                     snapshot_group_id,
                     schema_fingerprint: table.planned.schema_fingerprint.clone(),
                 };
-                let mut apply =
-                    begin_snapshot_apply(target, table.snapshot_plan.clone(), &ownership).await?;
-                let stream = snapshot.copy_text_table(&table.planned.source).await?;
-                let result = tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => None,
-                    result = apply.copy_from_stream(stream) => Some(result),
-                };
-                match result {
-                    Some(result) => {
-                        result?;
-                    }
-                    None => {
-                        apply.rollback().await?;
-                        snapshot.rollback().await?;
-                        return Err(RuntimeJobError::Cancelled);
-                    }
+                if let Err(error) = self
+                    .load_table_snapshot(target, &mut snapshot, table, &ownership, &cancellation)
+                    .await
+                {
+                    // The source snapshot transaction is still open on error; close it so the
+                    // repeatable-read holdback is released before we propagate. Slot retention is
+                    // still governed by preserve_slot_on_error below.
+                    let _ = snapshot.rollback().await;
+                    return Err(error);
                 }
-                let outcome = apply.commit().await?;
-                tracing::info!(
-                    pipeline_id = %self.pipeline_id,
-                    table = %table.planned.source.name,
-                    ?outcome,
-                    "snapshot table load committed"
-                );
             }
 
             // Close the source snapshot before target activation. If activation is ambiguous,
