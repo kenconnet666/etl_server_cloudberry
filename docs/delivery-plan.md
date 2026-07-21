@@ -1,37 +1,7 @@
 # 完整形态交付计划
 
-## 开发交接（2026-07-21）
-
-远程工作分支：`origin/codex/phase1-durable-cdc`。换机后执行：
-
-```text
-git fetch origin
-git switch --track origin/codex/phase1-durable-cdc
-```
-
-本轮已经落地：
-
-- versioned binary transaction spool；内存越过水位后透明 spill，checkpoint 成功后、ACK 前清理；
-- spool 使用量 O(1) 计数，实际 append/rotate/manifest ENOSPC 保留原消息并进入 `RESOURCE_WAIT`，等待期间每 10 秒只发送 durable LSN heartbeat；
-- target stable manifest、半开 chunk range/digest、持久 `next_seq`、receipt 与 DML 同事务；
-- 单 chunk 事务只提交 1 次、N chunk 只提交 N 次、空事务只提交 1 次；final chunk、checkpoint 与 ledger retirement 原子完成，提交响应丢失时由 checkpoint fast path 跳过重复 DML；
-- CDC apply 在 receipt/DML 前按稳定顺序锁定受管表，验证 pipeline、source relation、table generation、portable schema fingerprint、active state、fence 和实际 relation OID；
-- 每 node 的 transaction end LSN 跨 batch 严格递增；相同 LSN fail closed；
-- PK delete/reuse、move chain 和 temporary-key swap 不再依赖 chunk 大小；
-- reconciliation 已有 source-derived `(start, end]` page/range、schema/type-domain digest、严格 canonical row 校验、行/字节预算和 bounded exact diff 原语；它仍是 validation-gated 纯原语，不代表 repair runner 已实现；
-- CI 覆盖 `master`、Web check/test/build，以及真实 PG18 metadata/source/snapshot 门禁。
-
-已验证：workspace 235 项单测通过，8 项外部数据库门禁按设计 ignored；workspace all-targets/all-features Clippy 零 warning；Web check/build 和 12 项测试通过；真实 Cloudberry 2.1 typed apply/snapshot 2 项及 chunk ledger 1 项通过。此前真实 PG18 source/snapshot 3 项证据仍有效，本次没有重新启动 PG18 容器。
-
-下一位开发者首先处理：
-
-1. 把 source snapshot 改为复合 PK keyset page：固定 typed PK order、`LIMIT + 1` lookahead、显式 cursor 和行/字节预算；真实 PG18 覆盖首页、中间页、尾页、空表、quoted identifier 与复合 PK。
-2. 增加 target V7 per-table snapshot progress，使 shadow COPY 与 cursor 同事务。该进度只用于同一存活 `SnapshotSession`/S0 内的 target commit ambiguity 和完整性校验；它不是跨进程 MVCC 恢复点。
-3. source pager 与 target progress 合流后改 runtime 为 bounded snapshot：进程仍持有原 S0 时可按 exact group/progress 继续；进程崩溃、S0 消失后不得在 fresh S1 中沿旧 cursor 续传，必须在新 fence 下验证并清理旧 loading group/slot，以新 slot、S1 和 L1 从表头重拉。
-4. 先实现 read-only fence-first consistency runner 和 canonical source/target reader；发现差异时进入受影响表的 shadow rebuild。active table 原地 repair 必须等到“repair 后从旧 checkpoint 重放 WAL”对 PK move/delete/reuse/swap 的证明和故障矩阵成立后才能解锁。
-5. 补 final chunk 双连接并发、真实 commit ambiguity 和 Phase 1 source/spool/target/checkpoint/ACK kill-point E2E。
-
-测试容器不是交付状态的一部分；本轮结束时会停止 `pg2cb-it-pg18` 和 `pg2cb-it-cb21`，不会操作 `ducklake-*`。用户曾在会话中暴露 GitHub PAT，该令牌没有写入仓库或 Git 配置，仍应在 GitHub 立即撤销并重新生成。
+> 当前进度、换机步骤与"下一位优先处理"见 [HANDOFF.md](HANDOFF.md)。本文只维护
+> 长期不变的目标约束、运行模型与阶段边界。
 
 ## 目标约束
 

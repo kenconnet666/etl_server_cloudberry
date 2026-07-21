@@ -21,7 +21,8 @@ The project is intentionally scoped to PostgreSQL as the source and
 Cloudberry as the destination. See [docs/architecture.md](docs/architecture.md)
 and [docs/source-contract.md](docs/source-contract.md) before deploying a
 pipeline. The phased implementation and old-path removal gates are tracked in
-[docs/delivery-plan.md](docs/delivery-plan.md).
+[docs/delivery-plan.md](docs/delivery-plan.md). Current progress and the
+next-machine checklist live in [docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## Workspace
 
