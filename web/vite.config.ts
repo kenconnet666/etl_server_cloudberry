@@ -1,11 +1,11 @@
-import { svelte } from '@sveltejs/vite-plugin-svelte';
+import vue from '@vitejs/plugin-vue';
 import { defineConfig, loadEnv } from 'vite';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_');
 
   return {
-    plugins: [svelte()],
+    plugins: [vue()],
     server: {
       host: '127.0.0.1',
       port: 5173,

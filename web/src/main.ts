@@ -1,8 +1,12 @@
-import { mount } from 'svelte';
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import router from './router'
+import App from './App.vue'
+import './app.css'
 
-import App from './App.svelte';
-import './app.css';
+const app = createApp(App)
 
-mount(App, {
-  target: document.getElementById('app')!
-});
+app.use(createPinia())
+app.use(router)
+
+app.mount('#app')
