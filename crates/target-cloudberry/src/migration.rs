@@ -174,6 +174,49 @@ CREATE INDEX IF NOT EXISTS snapshot_groups_loading_idx
     ON pg2cb_meta.snapshot_groups (pipeline_id, topology_generation, state, created_at);
 "#;
 
+/// Durable progress for source transactions applied in bounded target chunks.
+///
+/// The progress row is the immutable source transaction manifest plus the first sequence that has
+/// not committed on the target.  Individual chunk identities are retained separately so a replay
+/// can distinguish an exact committed chunk from a request whose boundaries or bytes changed.
+pub const TARGET_V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.transaction_chunk_progress (
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    node_id integer NOT NULL,
+    end_lsn pg_lsn NOT NULL,
+    system_identifier numeric(20, 0) NOT NULL CHECK (system_identifier >= 0),
+    timeline bigint NOT NULL CHECK (timeline > 0 AND timeline <= 4294967295),
+    slot_name text NOT NULL CHECK (slot_name <> ''),
+    xid bigint NOT NULL CHECK (xid > 0 AND xid <= 4294967295),
+    manifest_version integer NOT NULL CHECK (manifest_version > 0 AND manifest_version <= 65535),
+    record_count bigint NOT NULL CHECK (record_count >= 0),
+    manifest_digest bytea NOT NULL CHECK (octet_length(manifest_digest) = 32),
+    next_seq bigint NOT NULL CHECK (next_seq >= 0 AND next_seq <= record_count),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (pipeline_id, topology_generation, node_id, end_lsn)
+)
+USING heap
+DISTRIBUTED BY (pipeline_id, topology_generation, node_id);
+
+CREATE TABLE IF NOT EXISTS pg2cb_meta.transaction_committed_chunks (
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    node_id integer NOT NULL,
+    end_lsn pg_lsn NOT NULL,
+    start_seq bigint NOT NULL CHECK (start_seq >= 0),
+    end_seq bigint NOT NULL CHECK (end_seq > start_seq),
+    chunk_digest bytea NOT NULL CHECK (octet_length(chunk_digest) = 32),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    committed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (pipeline_id, topology_generation, node_id, end_lsn, start_seq)
+)
+USING heap
+DISTRIBUTED BY (pipeline_id, topology_generation, node_id);
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -205,6 +248,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "identity_safe_snapshot_cleanup",
         sql: TARGET_V5_SQL,
+    },
+    Migration {
+        version: 6,
+        name: "durable_transaction_chunk_ledger",
+        sql: TARGET_V6_SQL,
     },
 ];
 
@@ -311,16 +359,47 @@ mod tests {
         assert!(TARGET_V5_SQL.contains("previous_fencing_token bigint"));
         assert!(TARGET_V5_SQL.contains("purged_by_fencing_token bigint"));
         assert!(TARGET_V5_SQL.contains("snapshot_reconciliation_gc_idx"));
+        assert!(
+            TARGET_V6_SQL
+                .contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.transaction_chunk_progress")
+        );
+        assert!(
+            TARGET_V6_SQL
+                .contains("PRIMARY KEY (pipeline_id, topology_generation, node_id, end_lsn)")
+        );
+        assert!(TARGET_V6_SQL.contains("system_identifier numeric(20, 0)"));
+        assert!(TARGET_V6_SQL.contains("manifest_version integer NOT NULL"));
+        assert!(TARGET_V6_SQL.contains("record_count bigint NOT NULL"));
+        assert!(
+            TARGET_V6_SQL.contains(
+                "manifest_digest bytea NOT NULL CHECK (octet_length(manifest_digest) = 32)"
+            )
+        );
+        assert!(
+            TARGET_V6_SQL
+                .contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.transaction_committed_chunks")
+        );
+        assert!(
+            TARGET_V6_SQL
+                .contains("chunk_digest bytea NOT NULL CHECK (octet_length(chunk_digest) = 32)")
+        );
+        assert_eq!(
+            TARGET_V6_SQL
+                .matches("DISTRIBUTED BY (pipeline_id, topology_generation, node_id)")
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 5);
+        assert_eq!(MIGRATIONS.len(), 6);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[1].version, 2);
         assert_eq!(MIGRATIONS[2].version, 3);
         assert_eq!(MIGRATIONS[3].version, 4);
         assert_eq!(MIGRATIONS[4].version, 5);
+        assert_eq!(MIGRATIONS[5].version, 6);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
@@ -340,6 +419,10 @@ mod tests {
         assert_eq!(
             Sha256::digest(MIGRATIONS[4].sql),
             Sha256::digest(TARGET_V5_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[5].sql),
+            Sha256::digest(TARGET_V6_SQL)
         );
     }
 }

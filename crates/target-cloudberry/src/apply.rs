@@ -9,12 +9,18 @@ use cloudberry_etl_core::{
 };
 use futures::SinkExt;
 use thiserror::Error;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Transaction};
 
 use crate::{
     checkpoint::{
         AdvanceOutcome, CheckpointError, NodeCheckpoint, PipelineFence, advance_node_checkpoint,
         lock_pipeline_fence,
+    },
+    chunk::{
+        ChunkLedgerError, DataChunkIdentity, PrepareDataChunkOutcome,
+        PreparedTransactionCompletion, ProgressRegistration, TransactionChunkManifest,
+        complete_transaction_checkpoint, prepare_data_chunk, record_data_chunk,
+        register_transaction_progress,
     },
     copy::{CopyEncodeError, encode_row},
     schema::{CreateTablePlan, SchemaError, plan_create_table, quote_identifier_list},
@@ -35,6 +41,8 @@ pub enum ApplyError {
     Database(#[from] tokio_postgres::Error),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
+    #[error(transparent)]
+    ChunkLedger(#[from] ChunkLedgerError),
     #[error(transparent)]
     Copy(#[from] CopyEncodeError),
     #[error("staging row has {actual} data cells, expected {expected}")]
@@ -127,6 +135,35 @@ pub struct ApplyRequest {
     pub tables: Vec<TableApplyBatch>,
 }
 
+/// One bounded part of an immutable source transaction.
+#[derive(Debug, Clone)]
+pub struct LedgeredDataChunkRequest {
+    pub fence: PipelineFence,
+    pub manifest: TransactionChunkManifest,
+    pub chunk: DataChunkIdentity,
+    pub tables: Vec<TableApplyBatch>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyStats {
+    pub staged_rows: u64,
+    pub deleted_rows: u64,
+    pub moved_rows: u64,
+    pub updated_rows: u64,
+    pub inserted_rows: u64,
+}
+
+/// Result of reconciling one requested data chunk with durable target progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgeredDataChunkOutcome {
+    /// The chunk receipt and its user-table DML committed atomically.
+    Applied { next_seq: u64, stats: ApplyStats },
+    /// The exact same immutable chunk was already committed.
+    AlreadyCommitted { next_seq: u64 },
+    /// Durable progress is inside or beyond a differently partitioned request.
+    ResumeAt { next_seq: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub staged_rows: u64,
@@ -148,64 +185,86 @@ pub async fn execute_apply(
     validate_request(request)?;
     let transaction = client.transaction().await?;
     lock_pipeline_fence(&transaction, request.fence).await?;
-
-    let mut outcome = ApplyOutcome {
-        staged_rows: 0,
-        deleted_rows: 0,
-        moved_rows: 0,
-        updated_rows: 0,
-        inserted_rows: 0,
-        checkpoint: AdvanceOutcome::Unchanged,
-    };
-
-    for table in &request.tables {
-        if table.rows.is_empty() {
-            continue;
-        }
-        transaction
-            .batch_execute(&table.plan.create_staging_sql)
-            .await?;
-        let sink = transaction.copy_in(&table.plan.copy_sql).await?;
-        let mut sink = std::pin::pin!(sink);
-        for row in &table.rows {
-            let encoded = encode_staging_row(&table.plan, row)?;
-            sink.send(Bytes::from(encoded)).await?;
-        }
-        let copied = sink.finish().await?;
-        outcome.staged_rows = outcome.staged_rows.saturating_add(copied);
-
-        let invalid: bool = transaction
-            .query_one(&table.plan.validation_sql, &[])
-            .await?
-            .try_get("invalid_batch")?;
-        if invalid {
-            return Err(ApplyError::InvalidBatch(
-                table.plan.table.target.to_string(),
-            ));
-        }
-        outcome.deleted_rows = outcome
-            .deleted_rows
-            .saturating_add(transaction.execute(&table.plan.delete_sql, &[]).await?);
-        outcome.moved_rows = outcome
-            .moved_rows
-            .saturating_add(transaction.execute(&table.plan.move_sql, &[]).await?);
-        outcome.deleted_rows = outcome.deleted_rows.saturating_add(
-            transaction
-                .execute(&table.plan.delete_moved_sql, &[])
-                .await?,
-        );
-        if let Some(update_sql) = &table.plan.update_sql {
-            outcome.updated_rows = outcome
-                .updated_rows
-                .saturating_add(transaction.execute(update_sql, &[]).await?);
-        }
-        outcome.inserted_rows = outcome
-            .inserted_rows
-            .saturating_add(transaction.execute(&table.plan.insert_sql, &[]).await?);
-    }
-
-    outcome.checkpoint =
+    let stats = apply_tables(&transaction, &request.tables).await?;
+    let checkpoint =
         advance_node_checkpoint(&transaction, request.fence, &request.checkpoint).await?;
+    transaction.commit().await?;
+    Ok(ApplyOutcome {
+        staged_rows: stats.staged_rows,
+        deleted_rows: stats.deleted_rows,
+        moved_rows: stats.moved_rows,
+        updated_rows: stats.updated_rows,
+        inserted_rows: stats.inserted_rows,
+        checkpoint,
+    })
+}
+
+/// Applies a bounded source-transaction chunk with its durable receipt.
+///
+/// The receipt and user-table DML commit in one target transaction. Replays and
+/// repartitioned requests return the durable resume position without executing
+/// the supplied table batches.
+pub async fn execute_ledgered_data_chunk(
+    client: &mut Client,
+    request: &LedgeredDataChunkRequest,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    validate_tables(&request.tables)?;
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, request.fence).await?;
+    let prepared = prepare_data_chunk(
+        &transaction,
+        request.fence,
+        &request.manifest,
+        request.chunk,
+    )
+    .await?;
+    match prepared {
+        PrepareDataChunkOutcome::Apply(prepared) => {
+            let next_seq = prepared.next_seq();
+            record_data_chunk(&transaction, prepared).await?;
+            let stats = apply_tables(&transaction, &request.tables).await?;
+            transaction.commit().await?;
+            Ok(LedgeredDataChunkOutcome::Applied { next_seq, stats })
+        }
+        PrepareDataChunkOutcome::AlreadyCommitted { next_seq } => {
+            transaction.rollback().await?;
+            Ok(LedgeredDataChunkOutcome::AlreadyCommitted { next_seq })
+        }
+        PrepareDataChunkOutcome::ResumeAt { next_seq } => {
+            transaction.rollback().await?;
+            Ok(LedgeredDataChunkOutcome::ResumeAt { next_seq })
+        }
+    }
+}
+
+/// Durably registers an immutable manifest without applying a data chunk.
+///
+/// Empty source transactions use this path before preparing their completion;
+/// non-empty manifests are normally registered atomically with their first data
+/// chunk by [`execute_ledgered_data_chunk`].
+pub async fn execute_register_manifest(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+) -> Result<ProgressRegistration, ApplyError> {
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let registration = register_transaction_progress(&transaction, fence, manifest).await?;
+    transaction.commit().await?;
+    Ok(registration)
+}
+
+/// Publishes a checkpoint after the ledger proved the full manifest committed.
+///
+/// `completion` must have been prepared using this same caller-owned
+/// transaction. Consuming the transaction here keeps completion validation and
+/// checkpoint publication in one atomic target operation.
+pub async fn execute_ledgered_completion(
+    transaction: Transaction<'_>,
+    completion: PreparedTransactionCompletion,
+    checkpoint: &NodeCheckpoint,
+) -> Result<AdvanceOutcome, ApplyError> {
+    let outcome = complete_transaction_checkpoint(&transaction, completion, checkpoint).await?;
     transaction.commit().await?;
     Ok(outcome)
 }
@@ -281,8 +340,12 @@ pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>,
 }
 
 fn validate_request(request: &ApplyRequest) -> Result<(), ApplyError> {
+    validate_tables(&request.tables)
+}
+
+fn validate_tables(tables: &[TableApplyBatch]) -> Result<(), ApplyError> {
     let mut staging_names = HashSet::new();
-    for table in &request.tables {
+    for table in tables {
         if !staging_names.insert(&table.plan.staging_name) {
             return Err(ApplyError::DuplicateStagingName(
                 table.plan.staging_name.clone(),
@@ -290,6 +353,59 @@ fn validate_request(request: &ApplyRequest) -> Result<(), ApplyError> {
         }
     }
     Ok(())
+}
+
+async fn apply_tables(
+    transaction: &Transaction<'_>,
+    tables: &[TableApplyBatch],
+) -> Result<ApplyStats, ApplyError> {
+    let mut stats = ApplyStats::default();
+    for table in tables {
+        if table.rows.is_empty() {
+            continue;
+        }
+        transaction
+            .batch_execute(&table.plan.create_staging_sql)
+            .await?;
+        let sink = transaction.copy_in(&table.plan.copy_sql).await?;
+        let mut sink = std::pin::pin!(sink);
+        for row in &table.rows {
+            let encoded = encode_staging_row(&table.plan, row)?;
+            sink.send(Bytes::from(encoded)).await?;
+        }
+        let copied = sink.finish().await?;
+        stats.staged_rows = stats.staged_rows.saturating_add(copied);
+
+        let invalid: bool = transaction
+            .query_one(&table.plan.validation_sql, &[])
+            .await?
+            .try_get("invalid_batch")?;
+        if invalid {
+            return Err(ApplyError::InvalidBatch(
+                table.plan.table.target.to_string(),
+            ));
+        }
+        stats.deleted_rows = stats
+            .deleted_rows
+            .saturating_add(transaction.execute(&table.plan.delete_sql, &[]).await?);
+        stats.moved_rows = stats
+            .moved_rows
+            .saturating_add(transaction.execute(&table.plan.move_sql, &[]).await?);
+        stats.deleted_rows = stats.deleted_rows.saturating_add(
+            transaction
+                .execute(&table.plan.delete_moved_sql, &[])
+                .await?,
+        );
+        if let Some(update_sql) = &table.plan.update_sql {
+            stats.updated_rows = stats
+                .updated_rows
+                .saturating_add(transaction.execute(update_sql, &[]).await?);
+        }
+        stats.inserted_rows = stats
+            .inserted_rows
+            .saturating_add(transaction.execute(&table.plan.insert_sql, &[]).await?);
+    }
+    Ok(stats)
 }
 
 /// Plans a typed temporary staging table and colocated current-state apply SQL.

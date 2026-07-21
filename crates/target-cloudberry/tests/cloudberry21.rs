@@ -13,10 +13,18 @@ use cloudberry_etl_core::{
     },
 };
 use cloudberry_etl_target_cloudberry::{
-    apply::{ApplyRequest, StageOperation, StagingRow, TableApplyBatch, execute_apply, plan_apply},
+    apply::{
+        ApplyRequest, LedgeredDataChunkOutcome, LedgeredDataChunkRequest, StageOperation,
+        StagingRow, TableApplyBatch, execute_apply, execute_ledgered_completion,
+        execute_ledgered_data_chunk, plan_apply,
+    },
     checkpoint::{
         AdvanceOutcome, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
         load_node_checkpoint,
+    },
+    chunk::{
+        DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest,
+        prepare_transaction_completion,
     },
     migration::migrate_target_database,
     snapshot::{
@@ -552,6 +560,68 @@ async fn run_test(
         Some(("before".into(), 10))
     );
 
+    let chunk = request(
+        fence,
+        &plan,
+        110,
+        StagingRow {
+            operation: StageOperation::Upsert,
+            cells: vec![text("1"), text("chunk"), text("11")],
+            old_key: None,
+        },
+    );
+    let manifest = TransactionChunkManifest {
+        key: TransactionChunkKey {
+            pipeline_id,
+            topology_generation: 1,
+            node_id: 0,
+            end_lsn: chunk.checkpoint.applied_lsn,
+        },
+        system_identifier: chunk.checkpoint.system_identifier,
+        timeline: chunk.checkpoint.timeline,
+        slot_name: chunk.checkpoint.slot_name.clone(),
+        xid: 110,
+        manifest_version: 1,
+        record_count: 1,
+        manifest_digest: [0x11; 32],
+    };
+    let data_chunk = LedgeredDataChunkRequest {
+        fence,
+        manifest: manifest.clone(),
+        chunk: DataChunkIdentity {
+            start_seq: 0,
+            end_seq: 1,
+            digest: [0x22; 32],
+        },
+        tables: chunk.tables.clone(),
+    };
+    assert!(matches!(
+        execute_ledgered_data_chunk(client, &data_chunk).await?,
+        LedgeredDataChunkOutcome::Applied { next_seq: 1, .. }
+    ));
+    assert_eq!(
+        row(client, target_schema, 1).await?,
+        Some(("chunk".into(), 11))
+    );
+    assert!(matches!(
+        execute_ledgered_data_chunk(client, &data_chunk).await?,
+        LedgeredDataChunkOutcome::AlreadyCommitted { next_seq: 1 }
+    ));
+    let checkpoint = load_node_checkpoint(client, chunk.checkpoint.key)
+        .await?
+        .expect("ledgered data chunk must not remove the existing checkpoint");
+    assert_eq!(checkpoint.checkpoint.applied_lsn, PgLsn::new(100));
+
+    let transaction = client.transaction().await?;
+    let completion = prepare_transaction_completion(&transaction, fence, &manifest).await?;
+    let outcome = execute_ledgered_completion(transaction, completion, &chunk.checkpoint).await?;
+    assert_eq!(
+        outcome,
+        AdvanceOutcome::Advanced {
+            previous_lsn: PgLsn::new(100)
+        }
+    );
+
     let moved = request(
         fence,
         &plan,
@@ -566,13 +636,13 @@ async fn run_test(
     assert_eq!(
         outcome.checkpoint,
         AdvanceOutcome::Advanced {
-            previous_lsn: PgLsn::new(100)
+            previous_lsn: PgLsn::new(110)
         }
     );
     assert_eq!(row(client, target_schema, 1).await?, None);
     assert_eq!(
         row(client, target_schema, 2).await?,
-        Some(("before".into(), 20))
+        Some(("chunk".into(), 20))
     );
 
     let deleted = request(
