@@ -14,18 +14,21 @@ git switch --track origin/codex/phase1-durable-cdc
 - versioned binary transaction spool；内存越过水位后透明 spill，checkpoint 成功后、ACK 前清理；
 - spool 使用量 O(1) 计数，实际 append/rotate/manifest ENOSPC 保留原消息并进入 `RESOURCE_WAIT`，等待期间每 10 秒只发送 durable LSN heartbeat；
 - target stable manifest、半开 chunk range/digest、持久 `next_seq`、receipt 与 DML 同事务；
-- completion 后同一 target transaction 推进 checkpoint 并回收 receipts/progress；提交响应丢失时由严格 identity 的 checkpoint fast path 跳过重复 DML；
+- 单 chunk 事务只提交 1 次、N chunk 只提交 N 次、空事务只提交 1 次；final chunk、checkpoint 与 ledger retirement 原子完成，提交响应丢失时由 checkpoint fast path 跳过重复 DML；
+- CDC apply 在 receipt/DML 前按稳定顺序锁定受管表，验证 pipeline、source relation、table generation、portable schema fingerprint、active state、fence 和实际 relation OID；
 - 每 node 的 transaction end LSN 跨 batch 严格递增；相同 LSN fail closed；
 - PK delete/reuse、move chain 和 temporary-key swap 不再依赖 chunk 大小；
+- reconciliation 已有 source-derived `(start, end]` page/range、schema/type-domain digest、严格 canonical row 校验、行/字节预算和 bounded exact diff 原语；它仍是 validation-gated 纯原语，不代表 repair runner 已实现；
 - CI 覆盖 `master`、Web check/test/build，以及真实 PG18 metadata/source/snapshot 门禁。
 
-已验证：workspace 全量测试通过，其中 source unit 44 项、target unit 56 项、engine 81 项；真实 PG18 source/snapshot 3 项；真实 Cloudberry 2.1 chunk ledger 回收/重放 1 项；PK graph 的 3 项 Cloudberry ignored tests；API/config 与 Web check/test/build。
+已验证：workspace 235 项单测通过，8 项外部数据库门禁按设计 ignored；workspace all-targets/all-features Clippy 零 warning；Web check/build 和 12 项测试通过；真实 Cloudberry 2.1 typed apply/snapshot 2 项及 chunk ledger 1 项通过。此前真实 PG18 source/snapshot 3 项证据仍有效，本次没有重新启动 PG18 容器。
 
 下一位开发者首先处理：
 
-1. 合并 target commit 快路径。当前普通事务仍是 manifest、chunk、completion 三阶段提交；目标是单 chunk 1 次、N chunk N 次、空事务 1 次。final 调用必须同时处理 `Applied`、`AlreadyCommitted` 和 `ResumeAt == record_count`，并原子完成 checkpoint/retirement。
-2. 为快路径补单 chunk、多 chunk、空事务、final commit 响应丢失、改 chunk 大小恢复和并发双提交测试。
-3. 执行完整 workspace Clippy、全部 Cloudberry opt-in tests，再按 Phase 1 kill-point 矩阵推进 snapshot/reconciliation。
+1. 把 source snapshot 改为复合 PK keyset page：固定 typed PK order、`LIMIT + 1` lookahead、显式 cursor 和行/字节预算；真实 PG18 覆盖首页、中间页、尾页、空表、quoted identifier 与复合 PK。
+2. 增加 target V7 per-table snapshot progress，使 shadow COPY 与 cursor 同事务；同 generation 的新 token 必须严格 adoption 已有 loading group，不能启动时无条件删除后重来。
+3. source pager 与 target progress 合流后改 runtime 为可恢复 bounded snapshot，再实现 fence-first repair session、canonical source/target reader 和 reconciliation state；在此之前不能启动自动 repair runner。
+4. 补 final chunk 双连接并发、真实 commit ambiguity 和 Phase 1 source/spool/target/checkpoint/ACK kill-point E2E。
 
 测试容器不是交付状态的一部分；本轮结束时会停止 `pg2cb-it-pg18` 和 `pg2cb-it-cb21`，不会操作 `ducklake-*`。用户曾在会话中暴露 GitHub PAT，该令牌没有写入仓库或 Git 配置，仍应在 GitHub 立即撤销并重新生成。
 

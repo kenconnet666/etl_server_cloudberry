@@ -2,7 +2,9 @@
 
 > 状态：设计文档。本文不表示 reconciliation/repair 已经实现，也不解锁
 > Physical HA 或 Citus 数据面。当前实现只提供 `crates/engine/src/reconcile.rs`
-> 中的摘要原语；下面的 target/source session API 是后续实现契约。
+> 中 validation-gated 的 page/range、digest 和 bounded diff 纯原语；它不获取 fence、
+> 不建立 source snapshot、不写 target，也不持久化 cursor。下面的 target/source session API
+> 仍是后续实现契约。
 
 ## 目标与边界
 
@@ -24,22 +26,26 @@
 
 可以直接复用的部分：
 
-- `engine::reconcile::CanonicalRow`、`ChunkDigest`、SHA-256 长度前缀编码和错误类型。
+- `engine::reconcile::Page`、source-derived `KeyRange`、`PageLimits` 以及 source/target reader
+  契约；target 不能再独立选择自己的 LIMIT 区间。
+- `DigestContext`、schema/type-domain SHA-256 编码、canonical row 校验和 bounded merge diff；
+  `Binary`、`UnchangedToast`、NULL key、arity/顺序错误和预算超限都会 fail closed。
 - `TableSchema::primary_key`、`runtime::planning::PlannedTable`、schema fingerprint。
 - `target-cloudberry::apply::plan_apply` 生成的 `ApplyPlan`、`StageOperation`、
   `StagingRow`、COPY 编码和 staging SQL。
-- `target-cloudberry::checkpoint::lock_pipeline_fence`。CDC apply 已经在同一个
-  `pipeline_state` 行锁上串行化。
+- `target-cloudberry::managed::lock_active_apply_table(s)`。CDC apply 已经先锁
+  `pipeline_state`，再验证受管表 identity/fence/relation OID 并锁实际 relation；repair session
+  应复用相同锁顺序，但还必须增加实际列/PK 结构校验。
 - `source-postgres::snapshot` 的 repeatable-read/read-only 会话和固定文本输出设置。
 - `PipelineTelemetryHandle`、job 的 `CancellationToken`、WAL retention monitor，以及
   `PostgresCloudberryJob::request_rebuild`。
 
 不能直接复用的部分：
 
-- 当前 `ChunkReader::read_chunk(start_after)` 没有 `limit`、结束 key、耗尽标记或 schema
-  context；`compare_chunk` 并行读取两端各自的 LIMIT。只要一端缺行，两端就会比较不同的
-  key 区间，不能用于真实 repair。
-- `digest_rows` 没有 schema/type domain separator，key 也没有显式的 Cell/null 语义。
+- 没有真实 source/target page reader。尤其缺少 PG typed keyset SQL、物化前字节预算、
+  catalog admission 后的 typed PK comparator 和跨 PG18/Cloudberry canonical text golden matrix。
+- 现有纯原语不携带 target fence、checkpoint、source identity/timeline、table generation 或
+  snapshot lifetime，不能单独作为 authoritative repair API。
 - `execute_apply` 必然推进 node checkpoint；repair 不能调用它，否则会产生 checkpoint
   超前于数据的不可恢复状态。
 - target 没有“锁 fence 但不推进 checkpoint”的 RAII repair transaction；source 没有按
