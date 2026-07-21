@@ -20,7 +20,7 @@ use super::{
     ManagedTableRecord, ManagedTableState, RelationState, SnapshotActivationDisposition,
     SnapshotActivationOutcome, SnapshotActivationRequest, SnapshotActivationTable,
     SnapshotTargetError, database_generation, ensure_one_metadata_row, load_relation_state,
-    manifest, matches_activation, validate_managed_fence, validate_managed_identity,
+    manifest, matches_activation, progress, validate_managed_fence, validate_managed_identity,
 };
 
 #[derive(Debug)]
@@ -29,7 +29,9 @@ enum TableActivationState {
         shadow: ManagedTableRecord,
         previous_active: Option<ManagedTableRecord>,
     },
-    Active,
+    Active {
+        target: ManagedTableRecord,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,7 @@ struct QuarantinePlan {
 fn group_is_active(states: &[TableActivationState]) -> Result<bool, SnapshotTargetError> {
     let active_count = states
         .iter()
-        .filter(|state| matches!(state, TableActivationState::Active))
+        .filter(|state| matches!(state, TableActivationState::Active { .. }))
         .count();
     if active_count == states.len() {
         Ok(true)
@@ -101,6 +103,11 @@ pub async fn activate_snapshot_group(
     }
 
     let stale = load_stale_active_tables(&transaction, &request).await?;
+    if stored.snapshot_progress_version == progress::SNAPSHOT_PROGRESS_VERSION {
+        let progress_identities = activation_progress_identities(&request.tables, &states)?;
+        progress::lock_completed_snapshot_tables(&transaction, &request, &progress_identities)
+            .await?;
+    }
     let mut reserved_names = request
         .tables
         .iter()
@@ -445,15 +452,24 @@ pub async fn validate_active_snapshot_group(
         ));
     }
 
+    let mut states = Vec::with_capacity(expected.tables.len());
     for table in &expected.tables {
         let target = load_relation_state(&transaction, &table.target).await?;
         let shadow = load_relation_state(&transaction, &table.shadow).await?;
-        if !matches!(
-            classify_table(&expected, table, target, shadow)?,
-            TableActivationState::Active
-        ) {
+        let state = classify_table(&expected, table, target, shadow)?;
+        if !matches!(state, TableActivationState::Active { .. }) {
             return Err(SnapshotTargetError::MixedActivationState);
         }
+        states.push(state);
+    }
+    if stored.snapshot_progress_version == progress::SNAPSHOT_PROGRESS_VERSION {
+        let progress_identities = activation_progress_identities(&expected.tables, &states)?;
+        progress::lock_completed_snapshot_tables(
+            &transaction,
+            &stored.request,
+            &progress_identities,
+        )
+        .await?;
     }
     for boundary in &stored.request.initial_checkpoints {
         let current = load_node_checkpoint_locked(&transaction, boundary.key).await?;
@@ -544,7 +560,7 @@ fn classify_table(
 
     match (target, shadow) {
         (Some(active), None) if matches_activation(&active, table, request.snapshot_group_id) => {
-            Ok(TableActivationState::Active)
+            Ok(TableActivationState::Active { target: active })
         }
         (Some(active), Some(_))
             if matches_activation(&active, table, request.snapshot_group_id) =>
@@ -574,6 +590,35 @@ fn classify_table(
             table.shadow.to_string(),
         )),
     }
+}
+
+fn activation_progress_identities(
+    tables: &[SnapshotActivationTable],
+    states: &[TableActivationState],
+) -> Result<Vec<progress::CompletedSnapshotTableIdentity>, SnapshotTargetError> {
+    if tables.len() != states.len() {
+        return Err(SnapshotTargetError::DuplicateActivationIdentity);
+    }
+    tables
+        .iter()
+        .zip(states)
+        .map(|(table, state)| {
+            let relation_oid = match state {
+                TableActivationState::Pending { shadow, .. } => shadow.relation_oid,
+                TableActivationState::Active { target } => target.relation_oid,
+            }
+            .ok_or_else(|| SnapshotTargetError::MissingRelationIdentity(table.target.to_string()))?;
+            if relation_oid <= 0 {
+                return Err(SnapshotTargetError::MissingRelationIdentity(
+                    table.target.to_string(),
+                ));
+            }
+            Ok(progress::CompletedSnapshotTableIdentity {
+                table: table.clone(),
+                shadow_relation_oid: relation_oid,
+            })
+        })
+        .collect()
 }
 
 fn require_state(
@@ -822,7 +867,7 @@ mod tests {
             RelationState::Vacant,
         )
         .unwrap();
-        assert!(matches!(active, TableActivationState::Active));
+        assert!(matches!(active, TableActivationState::Active { .. }));
     }
 
     #[test]
@@ -853,8 +898,52 @@ mod tests {
             previous_active: None,
         };
         assert!(matches!(
-            group_is_active(&[TableActivationState::Active, pending]),
+            group_is_active(&[
+                TableActivationState::Active {
+                    target: record(ManagedTableState::Active, 7, "sha256:new")
+                },
+                pending
+            ]),
             Err(SnapshotTargetError::MixedActivationState)
+        ));
+    }
+
+    #[test]
+    fn activation_progress_identity_uses_the_promoted_physical_relation() {
+        let request = request();
+        let table = request.tables[0].clone();
+        let mut pending_shadow = record(ManagedTableState::Shadow, 7, "sha256:new");
+        pending_shadow.relation_oid = Some(16_384);
+        let pending = TableActivationState::Pending {
+            shadow: pending_shadow,
+            previous_active: None,
+        };
+        let identities = activation_progress_identities(&[table.clone()], &[pending]).unwrap();
+        assert_eq!(identities[0].table, table);
+        assert_eq!(identities[0].shadow_relation_oid, 16_384);
+
+        let mut active_target = record(ManagedTableState::Active, 7, "sha256:new");
+        active_target.relation_oid = Some(16_384);
+        let active = TableActivationState::Active {
+            target: active_target,
+        };
+        assert_eq!(
+            activation_progress_identities(&[table], &[active]).unwrap()[0]
+                .shadow_relation_oid,
+            16_384
+        );
+    }
+
+    #[test]
+    fn activation_rejects_progress_without_a_physical_relation_identity() {
+        let request = request();
+        let pending = TableActivationState::Pending {
+            shadow: record(ManagedTableState::Shadow, 7, "sha256:new"),
+            previous_active: None,
+        };
+        assert!(matches!(
+            activation_progress_identities(&request.tables, &[pending]),
+            Err(SnapshotTargetError::MissingRelationIdentity(_))
         ));
     }
 

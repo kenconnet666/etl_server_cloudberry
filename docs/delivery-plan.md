@@ -26,9 +26,10 @@ git switch --track origin/codex/phase1-durable-cdc
 下一位开发者首先处理：
 
 1. 把 source snapshot 改为复合 PK keyset page：固定 typed PK order、`LIMIT + 1` lookahead、显式 cursor 和行/字节预算；真实 PG18 覆盖首页、中间页、尾页、空表、quoted identifier 与复合 PK。
-2. 增加 target V7 per-table snapshot progress，使 shadow COPY 与 cursor 同事务；同 generation 的新 token 必须严格 adoption 已有 loading group，不能启动时无条件删除后重来。
-3. source pager 与 target progress 合流后改 runtime 为可恢复 bounded snapshot，再实现 fence-first repair session、canonical source/target reader 和 reconciliation state；在此之前不能启动自动 repair runner。
-4. 补 final chunk 双连接并发、真实 commit ambiguity 和 Phase 1 source/spool/target/checkpoint/ACK kill-point E2E。
+2. 增加 target V7 per-table snapshot progress，使 shadow COPY 与 cursor 同事务。该进度只用于同一存活 `SnapshotSession`/S0 内的 target commit ambiguity 和完整性校验；它不是跨进程 MVCC 恢复点。
+3. source pager 与 target progress 合流后改 runtime 为 bounded snapshot：进程仍持有原 S0 时可按 exact group/progress 继续；进程崩溃、S0 消失后不得在 fresh S1 中沿旧 cursor 续传，必须在新 fence 下验证并清理旧 loading group/slot，以新 slot、S1 和 L1 从表头重拉。
+4. 先实现 read-only fence-first consistency runner 和 canonical source/target reader；发现差异时进入受影响表的 shadow rebuild。active table 原地 repair 必须等到“repair 后从旧 checkpoint 重放 WAL”对 PK move/delete/reuse/swap 的证明和故障矩阵成立后才能解锁。
+5. 补 final chunk 双连接并发、真实 commit ambiguity 和 Phase 1 source/spool/target/checkpoint/ACK kill-point E2E。
 
 测试容器不是交付状态的一部分；本轮结束时会停止 `pg2cb-it-pg18` 和 `pg2cb-it-cb21`，不会操作 `ducklake-*`。用户曾在会话中暴露 GitHub PAT，该令牌没有写入仓库或 Git 配置，仍应在 GitHub 立即撤销并重新生成。
 
@@ -99,9 +100,9 @@ ConsistencyRunner
 - target 以稳定 manifest、record range/digest 和 durable `next_seq` 记录 chunk；receipt 与 DML
   同事务提交，不能只依赖 deferred checkpoint。
 - node completion tracker 在完整事务完成后推进连续 checkpoint。
-- snapshot 改为 PK chunk、并行 reader、持久进度和可恢复 shadow load。
+- snapshot 改为 PK chunk、并行 reader、持久进度和 bounded shadow load；同一 live S0 内可恢复 target commit ambiguity，进程崩溃后从新 slot 边界完整重拉。
 - target 每个 apply 验证 table relation oid、generation、schema fingerprint 和 fence。
-- 实现 Standalone reconciliation/repair runner。
+- 实现 Standalone read-only reconciliation runner；差异先触发 table shadow rebuild，原地 repair 保持 capability-gated。
 
 退出条件：最大测试事务显著大于进程内存预算；内存保持水位内；在 source read、spool write、
 target chunk commit、checkpoint commit、ACK 前后 kill 均可收敛；磁盘 high-water 进入
@@ -156,7 +157,7 @@ CRUD、故障、rebalance 和 topology drift 的最终 PK hash 一致。
 | 完整 `Vec<TransactionChange>` 作为唯一事务载体 | 所有 source/sink/test 使用 bounded change reader |
 | DDL -> `request_pipeline_rebuild` | Phase 2 table transition 通过 E2E/soak；全局 rebuild API保留 |
 | run-scoped immutable `TableBindingRegistry` | dynamic binding 的 crash/replay/schema version 测试通过 |
-| snapshot 整表单流 COPY | PK chunk progress、resume、activation ambiguity 测试通过 |
+| snapshot 整表单流 COPY | PK chunk progress、同一 S0 commit ambiguity、process-crash full reload 和 activation ambiguity 测试通过 |
 | 单 Cloudberry client/global apply 串行 | completion tracker 与 table fence 并发测试通过 |
 | Citus validation-only discovery | Phase 4 node data plane 和 capability matrix 通过 |
 

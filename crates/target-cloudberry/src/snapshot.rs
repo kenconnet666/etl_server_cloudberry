@@ -29,6 +29,7 @@ const TYPE_EXISTS_SQL: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_type A
 mod activation;
 mod cleanup;
 mod manifest;
+mod progress;
 
 pub use activation::{activate_snapshot_group, validate_active_snapshot_group};
 pub use cleanup::{
@@ -37,6 +38,10 @@ pub use cleanup::{
     garbage_collect_quarantined_tables,
 };
 pub use manifest::{SnapshotGroupRegistrationDisposition, begin_snapshot_group};
+pub use progress::{
+    SNAPSHOT_CURSOR_FORMAT_VERSION, SnapshotPageApplyOutcome, SnapshotTableProgress,
+    copy_snapshot_page, register_snapshot_table_progress,
+};
 
 #[derive(Debug, Error)]
 pub enum SnapshotTargetError {
@@ -218,6 +223,49 @@ pub enum SnapshotTargetError {
     QuarantineNameConflict(String),
     #[error("snapshot metadata write affected {0} rows instead of one")]
     UnexpectedMetadataWriteCount(u64),
+    #[error("snapshot progress for `{0}` is missing")]
+    MissingSnapshotProgress(String),
+    #[error("snapshot group `{0}` does not have one progress identity per manifest table")]
+    IncompleteSnapshotProgress(Uuid),
+    #[error("snapshot progress for `{0}` has not reached the source snapshot tail")]
+    SnapshotProgressIncomplete(String),
+    #[error("snapshot progress identity for `{table}` differs in `{field}`")]
+    SnapshotProgressIdentityMismatch {
+        table: String,
+        field: &'static str,
+    },
+    #[error("persisted snapshot progress field `{field}` has invalid value `{value}` for `{table}`")]
+    InvalidSnapshotProgressValue {
+        table: String,
+        field: &'static str,
+        value: String,
+    },
+    #[error("snapshot cursor values cannot contain NUL")]
+    InvalidSnapshotCursorValue,
+    #[error("snapshot cursor has {actual} fields, expected {expected}")]
+    SnapshotCursorArityMismatch { expected: usize, actual: usize },
+    #[error("snapshot cursor primary-key arity {0} exceeds the target range")]
+    SnapshotCursorArityOutOfRange(usize),
+    #[error("snapshot cursor digest for `{0}` does not match its canonical values")]
+    SnapshotCursorDigestMismatch(String),
+    #[error("bounded snapshot pagination for `{0}` requires a primary key")]
+    SnapshotPaginationRequiresPrimaryKey(String),
+    #[error("incomplete snapshot page for `{0}` did not advance its cursor")]
+    SnapshotCursorDidNotAdvance(String),
+    #[error("incomplete snapshot page for `{0}` copied no rows")]
+    EmptyIncompleteSnapshotPage(String),
+    #[error("snapshot page for `{0}` advanced its cursor without copying rows")]
+    SnapshotCursorAdvancedWithoutRows(String),
+    #[error("snapshot progress counter overflow for `{0}`")]
+    SnapshotProgressCounterOverflow(String),
+    #[error("snapshot progress `{field}` value {value} exceeds the target bigint range")]
+    SnapshotProgressValueOutOfRange { field: &'static str, value: u64 },
+    #[error("snapshot progress for `{0}` changed after it was locked")]
+    SnapshotProgressChanged(String),
+    #[error("whole-table snapshot progress for `{0}` is not freshly registered")]
+    SnapshotProgressNotFresh(String),
+    #[error("snapshot group `{group}` uses unsupported progress version {version}")]
+    UnsupportedSnapshotProgressVersion { group: Uuid, version: u16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,7 +401,10 @@ pub async fn begin_snapshot_apply<'client>(
 
     let shadow_state = load_relation_state(&transaction, &plan.shadow.target).await?;
     if validate_shadow_for_rebuild(&shadow_state, &plan, ownership)? {
-        remove_managed_shadow(&transaction, &plan.shadow.target).await?;
+        let RelationState::Managed(record) = &shadow_state else {
+            unreachable!("only a managed shadow can be rebuilt")
+        };
+        remove_managed_shadow(&transaction, &plan.shadow.target, record).await?;
     }
 
     for prerequisite in &plan.shadow.prerequisites {
@@ -361,9 +412,11 @@ pub async fn begin_snapshot_apply<'client>(
     }
     transaction.batch_execute(&plan.shadow.create_sql).await?;
     register_shadow(&transaction, &plan, ownership).await?;
+    progress::register_snapshot_table_progress(&transaction, &plan, ownership).await?;
     Ok(SnapshotApply {
         transaction,
         plan,
+        ownership: ownership.clone(),
         mode: SnapshotApplyMode::Copy,
         copied_rows: None,
     })
@@ -373,6 +426,7 @@ pub async fn begin_snapshot_apply<'client>(
 pub struct SnapshotApply<'client> {
     transaction: Transaction<'client>,
     plan: SnapshotTargetPlan,
+    ownership: SnapshotOwnership,
     mode: SnapshotApplyMode,
     copied_rows: Option<u64>,
 }
@@ -411,7 +465,16 @@ impl SnapshotApply<'_> {
     /// Commit the DDL and copied rows together.
     pub async fn commit(self) -> Result<SnapshotApplyOutcome, SnapshotTargetError> {
         let outcome = match self.copied_rows {
-            Some(rows) => SnapshotApplyOutcome::Copied { rows },
+            Some(rows) => {
+                progress::complete_full_snapshot_copy(
+                    &self.transaction,
+                    &self.plan,
+                    &self.ownership,
+                    rows,
+                )
+                .await?;
+                SnapshotApplyOutcome::Copied { rows }
+            }
             None => {
                 self.transaction.rollback().await?;
                 return Err(SnapshotTargetError::CopyNotCompleted);
@@ -759,7 +822,14 @@ fn validate_shadow_for_rebuild(
 async fn remove_managed_shadow(
     transaction: &Transaction<'_>,
     table: &QualifiedName,
+    record: &ManagedTableRecord,
 ) -> Result<(), SnapshotTargetError> {
+    progress::delete_snapshot_progress_for_shadow(
+        transaction,
+        record.snapshot_group_id,
+        record.relation_oid,
+    )
+    .await?;
     transaction
         .batch_execute(&format!("DROP TABLE {}", quote_qualified_name(table)?))
         .await?;

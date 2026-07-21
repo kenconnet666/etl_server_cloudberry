@@ -3,17 +3,27 @@
 //! Snapshot operations use the official `tokio-postgres` client. The replication fork is kept out
 //! of this module so a snapshot transaction can never accidentally be passed to a replication
 //! connection.
+//!
+//! Initial-load PK cursors are scoped to one live `SnapshotSession`. A cursor from an older
+//! repeatable-read snapshot must never resume a fresh session: a PK move across that boundary can
+//! otherwise be skipped or duplicated, and replay from the old consistent LSN does not repair the
+//! gap. A fresh initial-load session restarts its scan from the beginning.
 
 use std::{
+    error::Error,
     marker::PhantomData,
+    mem::size_of,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
-use cloudberry_etl_core::schema::{QualifiedName, TableSchema};
-use futures::Stream;
-use tokio_postgres::{Client, CopyOutStream, IsolationLevel, Transaction};
+use bytes::{BufMut, Bytes, BytesMut};
+use cloudberry_etl_core::schema::{ColumnSchema, PgType, QualifiedName, TableSchema};
+use futures::{Stream, TryStreamExt};
+use tokio_postgres::{
+    Client, CopyOutStream, IsolationLevel, Transaction,
+    types::{Format, IsNull, ToSql, Type},
+};
 
 use crate::{
     SourceError, SourceResult,
@@ -156,6 +166,239 @@ impl CopyFormat {
     }
 }
 
+/// A canonical value read through PostgreSQL's text output function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalSnapshotCell {
+    Null,
+    Text(Bytes),
+}
+
+/// One fully materialized source row. `values` follow `TableSchema::columns`;
+/// `key` follows primary-key ordinal order and is always non-NULL text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSnapshotRow {
+    pub key: Vec<Bytes>,
+    pub values: Vec<CanonicalSnapshotCell>,
+}
+
+/// A source-derived keyset page. `materialized_bytes` is the conservative
+/// retained-size estimate for `rows`; the reader also applies the same budget
+/// to the discarded lookahead row before returning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPage {
+    pub rows: Vec<CanonicalSnapshotRow>,
+    pub has_more: bool,
+    pub next_key: Option<Vec<Bytes>>,
+    pub materialized_bytes: usize,
+    snapshot_id: String,
+    table_identity: SnapshotTableIdentity,
+    start_exclusive: Option<Vec<Bytes>>,
+}
+
+impl SnapshotPage {
+    #[must_use]
+    pub fn start_exclusive(&self) -> Option<&[Bytes]> {
+        self.start_exclusive.as_deref()
+    }
+
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<SnapshotCursor> {
+        self.next_key.as_ref().map(|key| SnapshotCursor {
+            key: key.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            table_identity: self.table_identity.clone(),
+        })
+    }
+}
+
+/// An opaque, session-bound source cursor. It cannot be reconstructed from a
+/// durable raw key in a fresh repeatable-read snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCursor {
+    key: Vec<Bytes>,
+    snapshot_id: String,
+    table_identity: SnapshotTableIdentity,
+}
+
+impl SnapshotCursor {
+    #[must_use]
+    pub fn key(&self) -> &[Bytes] {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSnapshotKeyRow {
+    pub key: Vec<Bytes>,
+}
+
+/// A lightweight source page used only to derive bounded COPY ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotKeyPage {
+    pub rows: Vec<CanonicalSnapshotKeyRow>,
+    pub has_more: bool,
+    pub next_key: Option<Vec<Bytes>>,
+    pub materialized_bytes: usize,
+    snapshot_id: String,
+    table_identity: SnapshotTableIdentity,
+    start_exclusive: Option<Vec<Bytes>>,
+}
+
+impl SnapshotKeyPage {
+    /// Derives `(start_exclusive, end_inclusive]`. A source tail deliberately
+    /// has no end; the repeatable-read snapshot proves that the tail is fixed.
+    pub fn copy_range(&self) -> SourceResult<SnapshotKeyRange> {
+        if self.rows.is_empty() && self.has_more {
+            return Err(SourceError::contract(
+                "an empty canonical PK page cannot have more rows",
+            ));
+        }
+        let expected_next_key = self.rows.last().map(|row| &row.key);
+        if expected_next_key != self.next_key.as_ref() {
+            return Err(SourceError::contract(
+                "canonical PK page next_key must equal the final row key",
+            ));
+        }
+        Ok(SnapshotKeyRange {
+            start_exclusive: self.start_exclusive.clone(),
+            end_inclusive: self.has_more.then(|| self.next_key.clone()).flatten(),
+            snapshot_id: self.snapshot_id.clone(),
+            table_identity: self.table_identity.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<SnapshotCursor> {
+        self.next_key.as_ref().map(|key| SnapshotCursor {
+            key: key.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            table_identity: self.table_identity.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotKeyRange {
+    start_exclusive: Option<Vec<Bytes>>,
+    end_inclusive: Option<Vec<Bytes>>,
+    snapshot_id: String,
+    table_identity: SnapshotTableIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotTableIdentity {
+    relation_id: u32,
+    generation: u64,
+    name: QualifiedName,
+    key_columns: Vec<SnapshotKeyColumnIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotKeyColumnIdentity {
+    attnum: i16,
+    name: String,
+    ordinal: u16,
+    data_type: PgType,
+    collation: Option<QualifiedName>,
+}
+
+impl SnapshotKeyRange {
+    #[must_use]
+    pub fn start_exclusive(&self) -> Option<&[Bytes]> {
+        self.start_exclusive.as_deref()
+    }
+
+    #[must_use]
+    pub fn end_inclusive(&self) -> Option<&[Bytes]> {
+        self.end_inclusive.as_deref()
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotPageLimits {
+    pub row_limit: usize,
+    pub max_page_bytes: usize,
+}
+
+impl SnapshotPageLimits {
+    fn limit_plus_one(self) -> SourceResult<usize> {
+        if self.row_limit == 0 {
+            return Err(SourceError::contract(
+                "canonical snapshot row_limit must be greater than zero",
+            ));
+        }
+        if self.max_page_bytes == 0 {
+            return Err(SourceError::contract(
+                "canonical snapshot max_page_bytes must be greater than zero",
+            ));
+        }
+        let limit = self.row_limit.checked_add(1).ok_or_else(|| {
+            SourceError::contract("canonical snapshot row limit arithmetic overflow")
+        })?;
+        i64::try_from(limit).map_err(|_| {
+            SourceError::contract("canonical snapshot row limit exceeds PostgreSQL LIMIT")
+        })?;
+        Ok(limit)
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalTextParameter<'value>(&'value str);
+
+impl ToSql for CanonicalTextParameter<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Send + Sync>> {
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        self.to_sql(ty, out)
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+}
+
+struct CanonicalPagePlan {
+    sql: String,
+    key_indexes: Vec<usize>,
+    value_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CanonicalProjection {
+    KeysOnly,
+    AllColumns,
+}
+
 pub struct SnapshotSession<'client> {
     transaction: Transaction<'client>,
     snapshot_id: String,
@@ -227,6 +470,218 @@ impl<'client> SnapshotSession<'client> {
         })
     }
 
+    /// Build the validation-gated PK-only keyset query. This API plans SQL;
+    /// it does not establish a target fence or make a repair authoritative.
+    pub fn canonical_pk_page_sql(
+        schema: &TableSchema,
+        has_start: bool,
+        limits: SnapshotPageLimits,
+    ) -> SourceResult<String> {
+        Ok(
+            build_canonical_page_plan(schema, has_start, limits, CanonicalProjection::KeysOnly)?
+                .sql,
+        )
+    }
+
+    /// Read only a bounded set of canonical PKs plus one lookahead row. The
+    /// returned boundary can feed `copy_text_pk_range` without materializing
+    /// or re-encoding the page's non-key values.
+    ///
+    /// The optional cursor must be the preceding page's opaque token from this
+    /// same live session. It is not a durable resume cursor. A fresh snapshot
+    /// must restart an initial-load scan from `None`.
+    pub async fn read_canonical_pk_page(
+        &self,
+        schema: &TableSchema,
+        cursor: Option<&SnapshotCursor>,
+        limits: SnapshotPageLimits,
+    ) -> SourceResult<SnapshotKeyPage> {
+        let table_identity = snapshot_table_identity(schema)?;
+        validate_cursor_scope(cursor, &self.snapshot_id, &table_identity)?;
+        let start_exclusive = cursor.map(|cursor| cursor.key.clone());
+        let plan = build_canonical_page_plan(
+            schema,
+            cursor.is_some(),
+            limits,
+            CanonicalProjection::KeysOnly,
+        )?;
+        let rows = self
+            .query_canonical_page(plan, cursor, limits, &table_identity)
+            .await?
+            .into_iter()
+            .map(|row| CanonicalSnapshotKeyRow { key: row.key })
+            .collect();
+        finish_key_page(
+            rows,
+            limits.row_limit,
+            &self.snapshot_id,
+            table_identity,
+            start_exclusive,
+        )
+    }
+
+    /// Build the full-row canonical query reserved for reconciliation. Initial
+    /// snapshots should use the PK boundary plus direct range COPY path.
+    pub fn canonical_row_page_sql(
+        schema: &TableSchema,
+        has_start: bool,
+        limits: SnapshotPageLimits,
+    ) -> SourceResult<String> {
+        Ok(
+            build_canonical_page_plan(schema, has_start, limits, CanonicalProjection::AllColumns)?
+                .sql,
+        )
+    }
+
+    /// Materialize a bounded canonical full-row page for validation-gated
+    /// reconciliation. This is intentionally not used by snapshot COPY.
+    pub async fn read_canonical_row_page(
+        &self,
+        schema: &TableSchema,
+        cursor: Option<&SnapshotCursor>,
+        limits: SnapshotPageLimits,
+    ) -> SourceResult<SnapshotPage> {
+        let table_identity = snapshot_table_identity(schema)?;
+        validate_cursor_scope(cursor, &self.snapshot_id, &table_identity)?;
+        let start_exclusive = cursor.map(|cursor| cursor.key.clone());
+        let plan = build_canonical_page_plan(
+            schema,
+            cursor.is_some(),
+            limits,
+            CanonicalProjection::AllColumns,
+        )?;
+        let rows = self
+            .query_canonical_page(plan, cursor, limits, &table_identity)
+            .await?;
+        finish_row_page(
+            rows,
+            limits.row_limit,
+            &self.snapshot_id,
+            table_identity,
+            start_exclusive,
+        )
+    }
+
+    /// Build a direct text COPY for one source-derived `(start, end]` range.
+    /// Canonical keys are rendered only as hex data decoded by `pg_catalog`
+    /// and cast to the catalog-qualified PK type; no user SQL is reused.
+    pub fn copy_text_pk_range_sql(
+        schema: &TableSchema,
+        range: &SnapshotKeyRange,
+    ) -> SourceResult<String> {
+        build_copy_range_sql(schema, range)
+    }
+
+    /// Stream a range directly from PostgreSQL COPY. The same repeatable-read
+    /// transaction owns both the preceding PK boundary read and this stream.
+    pub async fn copy_text_pk_range<'session>(
+        &'session mut self,
+        schema: &TableSchema,
+        range: &SnapshotKeyRange,
+    ) -> SourceResult<SnapshotCopy<'session>> {
+        if range.snapshot_id != self.snapshot_id {
+            return Err(SourceError::contract(
+                "snapshot PK range belongs to a different repeatable-read snapshot",
+            ));
+        }
+        let table_identity = snapshot_table_identity(schema)?;
+        if range.table_identity != table_identity {
+            return Err(SourceError::contract(
+                "snapshot PK range belongs to a different table or primary-key contract",
+            ));
+        }
+        let sql = Self::copy_text_pk_range_sql(schema, range)?;
+        let statement = self.transaction.prepare(&sql).await?;
+        let stream = self.transaction.copy_out(&statement).await?;
+        Ok(SnapshotCopy {
+            stream: Box::pin(stream),
+            _session: PhantomData,
+        })
+    }
+
+    async fn query_canonical_page(
+        &self,
+        plan: CanonicalPagePlan,
+        cursor: Option<&SnapshotCursor>,
+        limits: SnapshotPageLimits,
+        table_identity: &SnapshotTableIdentity,
+    ) -> SourceResult<Vec<CanonicalSnapshotRow>> {
+        validate_cursor_scope(cursor, &self.snapshot_id, table_identity)?;
+        let start_text = validate_key(
+            "cursor",
+            cursor.map(|cursor| cursor.key.as_slice()),
+            plan.key_indexes.len(),
+        )?;
+        let parameters = start_text
+            .iter()
+            .map(|value| CanonicalTextParameter(value))
+            .collect::<Vec<_>>();
+        let parameter_refs = parameters
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let statement = self.transaction.prepare(&plan.sql).await?;
+        let stream = self
+            .transaction
+            .query_raw(&statement, parameter_refs)
+            .await?;
+        let mut stream = std::pin::pin!(stream);
+        let mut rows = Vec::new();
+        let mut materialized_bytes = 0usize;
+        let mut previous_key: Option<Vec<Bytes>> = None;
+
+        while let Some(row) = stream.as_mut().try_next().await? {
+            let expected_arity = plan
+                .value_count
+                .checked_add(1)
+                .ok_or_else(|| SourceError::contract("canonical snapshot result arity overflow"))?;
+            if row.len() != expected_arity {
+                return Err(SourceError::contract(format!(
+                    "canonical snapshot returned {} fields; expected {expected_arity}",
+                    row.len()
+                )));
+            }
+
+            let strictly_ordered: bool = row.try_get(plan.value_count)?;
+            let canonical = decode_canonical_row(&row, &plan.key_indexes, plan.value_count)?;
+            if previous_key.as_ref() == Some(&canonical.key) {
+                return Err(SourceError::contract(
+                    "canonical snapshot page contains a duplicate primary key",
+                ));
+            }
+            if !strictly_ordered {
+                return Err(SourceError::contract(
+                    "canonical snapshot page is not strictly ordered by the native primary key",
+                ));
+            }
+
+            let row_bytes = estimate_canonical_row_bytes(&canonical).ok_or_else(|| {
+                SourceError::contract("canonical snapshot page byte estimate overflow")
+            })?;
+            materialized_bytes = materialized_bytes.checked_add(row_bytes).ok_or_else(|| {
+                SourceError::contract("canonical snapshot page byte estimate overflow")
+            })?;
+            if materialized_bytes > limits.max_page_bytes {
+                return Err(SourceError::contract(format!(
+                    "canonical snapshot page requires {materialized_bytes} estimated bytes, exceeding max_page_bytes {}",
+                    limits.max_page_bytes
+                )));
+            }
+
+            previous_key = Some(canonical.key.clone());
+            rows.push(canonical);
+        }
+
+        let max_rows = limits.limit_plus_one()?;
+        if rows.len() > max_rows {
+            return Err(SourceError::contract(format!(
+                "canonical snapshot returned {} rows for LIMIT {max_rows}",
+                rows.len()
+            )));
+        }
+        Ok(rows)
+    }
+
     /// Commit only after all COPY streams have been drained. Dropping this session rolls back.
     pub async fn commit(self) -> SourceResult<()> {
         self.transaction.commit().await.map_err(SourceError::from)
@@ -236,6 +691,425 @@ impl<'client> SnapshotSession<'client> {
     pub async fn rollback(self) -> SourceResult<()> {
         self.transaction.rollback().await.map_err(SourceError::from)
     }
+}
+
+fn build_canonical_page_plan(
+    schema: &TableSchema,
+    has_start: bool,
+    limits: SnapshotPageLimits,
+    projection: CanonicalProjection,
+) -> SourceResult<CanonicalPagePlan> {
+    let limit_plus_one = limits.limit_plus_one()?;
+    let (key_columns, schema_key_indexes) = validated_primary_key(schema)?;
+    let selected_columns = match projection {
+        CanonicalProjection::KeysOnly => key_columns.clone(),
+        CanonicalProjection::AllColumns => schema.columns.iter().collect(),
+    };
+    let key_indexes = match projection {
+        CanonicalProjection::KeysOnly => (0..key_columns.len()).collect(),
+        CanonicalProjection::AllColumns => schema_key_indexes,
+    };
+
+    let qualified_table = quote_qualified(&schema.name.schema, &schema.name.name)?;
+    let selected = quote_columns(&selected_columns)?;
+    let keys = quote_columns(&key_columns)?;
+    let canonical_values = selected
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            format!("p.{column}::text AS \"__pg2cb_value_{index}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let raw_values = selected.join(", ");
+    let quoted_keys = keys.join(", ");
+    let predicate = if has_start {
+        let parameters = key_columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let type_name =
+                    quote_qualified(&column.data_type.name.schema, &column.data_type.name.name)?;
+                Ok(format!("CAST(${} AS {type_name})", index + 1))
+            })
+            .collect::<SourceResult<Vec<_>>>()?
+            .join(", ");
+        format!(" WHERE ROW({quoted_keys}) > ROW({parameters})")
+    } else {
+        String::new()
+    };
+    let qualified_keys = keys
+        .iter()
+        .map(|key| format!("p.{key}"))
+        .collect::<Vec<_>>();
+    let qualified_key_list = qualified_keys.join(", ");
+    let lagged_keys = qualified_keys
+        .iter()
+        .map(|key| format!("lag({key}) OVER \"__pg2cb_pk_window\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "WITH \"__pg2cb_page\" AS MATERIALIZED (SELECT {raw_values} FROM {qualified_table}{predicate} ORDER BY {quoted_keys} LIMIT {limit_plus_one}) SELECT {canonical_values}, (row_number() OVER \"__pg2cb_pk_window\" = 1 OR ROW({qualified_key_list}) > ROW({lagged_keys})) AS \"__pg2cb_pk_strict\" FROM \"__pg2cb_page\" AS p WINDOW \"__pg2cb_pk_window\" AS (ORDER BY {qualified_key_list}) ORDER BY {qualified_key_list}"
+    );
+
+    Ok(CanonicalPagePlan {
+        sql,
+        key_indexes,
+        value_count: selected_columns.len(),
+    })
+}
+
+fn build_copy_range_sql(schema: &TableSchema, range: &SnapshotKeyRange) -> SourceResult<String> {
+    let table_identity = snapshot_table_identity(schema)?;
+    if range.table_identity != table_identity {
+        return Err(SourceError::contract(
+            "snapshot PK range does not match the requested table or primary-key contract",
+        ));
+    }
+    let (key_columns, _) = validated_primary_key(schema)?;
+    let selected_columns = schema.columns.iter().collect::<Vec<_>>();
+    if selected_columns.is_empty() {
+        return Err(SourceError::contract(
+            "snapshot range COPY requires at least one column",
+        ));
+    }
+    let qualified_table = quote_qualified(&schema.name.schema, &schema.name.name)?;
+    let selected = quote_columns(&selected_columns)?.join(", ");
+    let keys = quote_columns(&key_columns)?.join(", ");
+    let mut predicates = Vec::with_capacity(2);
+    if let Some(start) = range.start_exclusive.as_deref() {
+        predicates.push(format!(
+            "ROW({keys}) > ROW({})",
+            render_typed_key(&key_columns, start, "start_exclusive")?
+        ));
+    }
+    if let Some(end) = range.end_inclusive.as_deref() {
+        predicates.push(format!(
+            "ROW({keys}) <= ROW({})",
+            render_typed_key(&key_columns, end, "end_inclusive")?
+        ));
+    }
+    let predicate = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+
+    Ok(format!(
+        "COPY (SELECT {selected} FROM {qualified_table}{predicate} ORDER BY {keys}) TO STDOUT WITH (FORMAT text, HEADER false, DELIMITER E'\\t', NULL E'\\\\N')"
+    ))
+}
+
+fn validated_primary_key(schema: &TableSchema) -> SourceResult<(Vec<&ColumnSchema>, Vec<usize>)> {
+    if schema.columns.is_empty() {
+        return Err(SourceError::contract(
+            "canonical snapshot requires at least one source column",
+        ));
+    }
+    let key_columns = schema.primary_key();
+    if key_columns.is_empty() {
+        return Err(SourceError::contract(format!(
+            "canonical snapshot table {} has no primary key",
+            schema.name
+        )));
+    }
+
+    let mut key_indexes = Vec::with_capacity(key_columns.len());
+    for (index, column) in key_columns.iter().enumerate() {
+        let expected_ordinal = u16::try_from(index + 1)
+            .map_err(|_| SourceError::contract("primary-key ordinal exceeds u16"))?;
+        if column.primary_key_ordinal != Some(expected_ordinal) {
+            return Err(SourceError::contract(format!(
+                "canonical snapshot primary-key ordinals are not contiguous at column {}",
+                column.name
+            )));
+        }
+        if column.nullable {
+            return Err(SourceError::contract(format!(
+                "canonical snapshot primary-key column {} is nullable",
+                column.name
+            )));
+        }
+        if !column.data_type.kind.is_supported() {
+            return Err(SourceError::contract(format!(
+                "canonical snapshot primary-key column {} has an unsupported type",
+                column.name
+            )));
+        }
+        let schema_index = schema
+            .columns
+            .iter()
+            .position(|candidate| candidate.attnum == column.attnum)
+            .ok_or_else(|| {
+                SourceError::contract(format!(
+                    "primary-key column {} is absent from the source column list",
+                    column.name
+                ))
+            })?;
+        key_indexes.push(schema_index);
+    }
+    Ok((key_columns, key_indexes))
+}
+
+fn snapshot_table_identity(schema: &TableSchema) -> SourceResult<SnapshotTableIdentity> {
+    let (key_columns, _) = validated_primary_key(schema)?;
+    let key_columns = key_columns
+        .into_iter()
+        .map(|column| {
+            let ordinal = column.primary_key_ordinal.ok_or_else(|| {
+                SourceError::contract(format!(
+                    "primary-key column {} lost its ordinal",
+                    column.name
+                ))
+            })?;
+            Ok(SnapshotKeyColumnIdentity {
+                attnum: column.attnum,
+                name: column.name.clone(),
+                ordinal,
+                data_type: column.data_type.clone(),
+                collation: column.collation.clone(),
+            })
+        })
+        .collect::<SourceResult<Vec<_>>>()?;
+    Ok(SnapshotTableIdentity {
+        relation_id: schema.relation_id,
+        generation: schema.generation,
+        name: schema.name.clone(),
+        key_columns,
+    })
+}
+
+fn quote_columns(columns: &[&ColumnSchema]) -> SourceResult<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect()
+}
+
+fn validate_cursor_scope(
+    cursor: Option<&SnapshotCursor>,
+    snapshot_id: &str,
+    table_identity: &SnapshotTableIdentity,
+) -> SourceResult<()> {
+    if let Some(cursor) = cursor {
+        if cursor.snapshot_id != snapshot_id {
+            return Err(SourceError::contract(
+                "snapshot cursor belongs to a different repeatable-read snapshot",
+            ));
+        }
+        if cursor.table_identity != *table_identity {
+            return Err(SourceError::contract(
+                "snapshot cursor belongs to a different table or primary-key contract",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_key<'value>(
+    label: &str,
+    key: Option<&'value [Bytes]>,
+    expected_arity: usize,
+) -> SourceResult<Vec<&'value str>> {
+    let Some(key) = key else {
+        return Ok(Vec::new());
+    };
+    if key.len() != expected_arity {
+        return Err(SourceError::contract(format!(
+            "canonical snapshot {label} has {} fields; expected {expected_arity}",
+            key.len()
+        )));
+    }
+    key.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = std::str::from_utf8(value).map_err(|_| {
+                SourceError::contract(format!(
+                    "canonical snapshot {label} field {index} is not UTF-8 text"
+                ))
+            })?;
+            if value.contains('\0') {
+                return Err(SourceError::contract(format!(
+                    "canonical snapshot {label} field {index} contains NUL"
+                )));
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn render_typed_key(columns: &[&ColumnSchema], key: &[Bytes], label: &str) -> SourceResult<String> {
+    let values = validate_key(label, Some(key), columns.len())?;
+    columns
+        .iter()
+        .zip(values)
+        .map(|(column, value)| {
+            let type_name = quote_qualified(
+                &column.data_type.name.schema,
+                &column.data_type.name.name,
+            )?;
+            let hex = encode_hex(value.as_bytes());
+            Ok(format!(
+                "CAST(pg_catalog.convert_from(pg_catalog.decode('{hex}', 'hex'), 'UTF8') AS {type_name})"
+            ))
+        })
+        .collect::<SourceResult<Vec<_>>>()
+        .map(|values| values.join(", "))
+}
+
+fn encode_hex(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_canonical_row(
+    row: &tokio_postgres::Row,
+    key_indexes: &[usize],
+    value_count: usize,
+) -> SourceResult<CanonicalSnapshotRow> {
+    let values = (0..value_count)
+        .map(|index| {
+            row.try_get::<_, Option<String>>(index)
+                .map(|value| match value {
+                    Some(value) => CanonicalSnapshotCell::Text(Bytes::from(value)),
+                    None => CanonicalSnapshotCell::Null,
+                })
+                .map_err(SourceError::from)
+        })
+        .collect::<SourceResult<Vec<_>>>()?;
+    let key = key_indexes
+        .iter()
+        .map(|index| match values.get(*index) {
+            Some(CanonicalSnapshotCell::Text(value)) => Ok(value.clone()),
+            Some(CanonicalSnapshotCell::Null) => Err(SourceError::contract(format!(
+                "canonical snapshot primary-key field {index} is NULL"
+            ))),
+            None => Err(SourceError::contract(format!(
+                "canonical snapshot primary-key index {index} exceeds row arity {value_count}"
+            ))),
+        })
+        .collect::<SourceResult<Vec<_>>>()?;
+    if key.len() != key_indexes.len() {
+        return Err(SourceError::contract(
+            "canonical snapshot primary-key arity changed while decoding",
+        ));
+    }
+    Ok(CanonicalSnapshotRow { key, values })
+}
+
+fn finish_key_page(
+    mut rows: Vec<CanonicalSnapshotKeyRow>,
+    row_limit: usize,
+    snapshot_id: &str,
+    table_identity: SnapshotTableIdentity,
+    start_exclusive: Option<Vec<Bytes>>,
+) -> SourceResult<SnapshotKeyPage> {
+    let max_rows = row_limit
+        .checked_add(1)
+        .ok_or_else(|| SourceError::contract("canonical PK page row limit overflow"))?;
+    if rows.len() > max_rows {
+        return Err(SourceError::contract(format!(
+            "canonical PK page returned {} rows for a row limit of {row_limit}",
+            rows.len()
+        )));
+    }
+    let has_more = rows.len() > row_limit;
+    if has_more {
+        rows.truncate(row_limit);
+    }
+    let next_key = rows.last().map(|row| row.key.clone());
+    let materialized_bytes = estimate_key_page_bytes(&rows)
+        .ok_or_else(|| SourceError::contract("canonical PK page byte estimate overflow"))?;
+    Ok(SnapshotKeyPage {
+        rows,
+        has_more,
+        next_key,
+        materialized_bytes,
+        snapshot_id: snapshot_id.to_owned(),
+        table_identity,
+        start_exclusive,
+    })
+}
+
+fn finish_row_page(
+    mut rows: Vec<CanonicalSnapshotRow>,
+    row_limit: usize,
+    snapshot_id: &str,
+    table_identity: SnapshotTableIdentity,
+    start_exclusive: Option<Vec<Bytes>>,
+) -> SourceResult<SnapshotPage> {
+    let max_rows = row_limit
+        .checked_add(1)
+        .ok_or_else(|| SourceError::contract("canonical row page row limit overflow"))?;
+    if rows.len() > max_rows {
+        return Err(SourceError::contract(format!(
+            "canonical row page returned {} rows for a row limit of {row_limit}",
+            rows.len()
+        )));
+    }
+    let has_more = rows.len() > row_limit;
+    if has_more {
+        rows.truncate(row_limit);
+    }
+    let next_key = rows.last().map(|row| row.key.clone());
+    let materialized_bytes = rows.iter().try_fold(0usize, |total, row| {
+        total.checked_add(estimate_canonical_row_bytes(row)?)
+    });
+    let materialized_bytes = materialized_bytes
+        .ok_or_else(|| SourceError::contract("canonical row page byte estimate overflow"))?;
+    Ok(SnapshotPage {
+        rows,
+        has_more,
+        next_key,
+        materialized_bytes,
+        snapshot_id: snapshot_id.to_owned(),
+        table_identity,
+        start_exclusive,
+    })
+}
+
+fn estimate_key_page_bytes(rows: &[CanonicalSnapshotKeyRow]) -> Option<usize> {
+    rows.iter().try_fold(0usize, |total, row| {
+        let containers = row.key.len().checked_mul(size_of::<Bytes>())?;
+        let payload = row
+            .key
+            .iter()
+            .try_fold(0usize, |bytes, value| bytes.checked_add(value.len()))?;
+        total
+            .checked_add(size_of::<CanonicalSnapshotKeyRow>())?
+            .checked_add(containers)?
+            .checked_add(payload)
+    })
+}
+
+fn estimate_canonical_row_bytes(row: &CanonicalSnapshotRow) -> Option<usize> {
+    let key_containers = row.key.len().checked_mul(size_of::<Bytes>())?;
+    let value_containers = row
+        .values
+        .len()
+        .checked_mul(size_of::<CanonicalSnapshotCell>())?;
+    let key_payload = row
+        .key
+        .iter()
+        .try_fold(0usize, |bytes, value| bytes.checked_add(value.len()))?;
+    let value_payload = row.values.iter().try_fold(0usize, |bytes, value| {
+        let len = match value {
+            CanonicalSnapshotCell::Null => 0,
+            CanonicalSnapshotCell::Text(value) => value.len(),
+        };
+        bytes.checked_add(len)
+    })?;
+    size_of::<CanonicalSnapshotRow>()
+        .checked_add(key_containers)?
+        .checked_add(value_containers)?
+        .checked_add(key_payload)?
+        .checked_add(value_payload)
 }
 
 pub struct SnapshotCopy<'session> {
@@ -335,7 +1209,67 @@ fn validate_snapshot_id(value: &str) -> SourceResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use cloudberry_etl_core::schema::{
+        GeneratedColumn, IdentityColumn, PgType, PgTypeKind, ReplicaIdentity, TableKind,
+    };
+
     use super::*;
+
+    fn composite_schema() -> TableSchema {
+        TableSchema {
+            relation_id: 42,
+            generation: 1,
+            name: QualifiedName::new("Sales\"Data", "Order\"Rows").unwrap(),
+            kind: TableKind::Ordinary,
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![
+                column(1, "Tenant\"Id", "text", PgTypeKind::Text, Some(1)),
+                column(2, "Seq No", "int8", PgTypeKind::Int8, Some(2)),
+                column(3, "Payload", "text", PgTypeKind::Text, None),
+            ],
+            distribution_key: Vec::new(),
+            partition_key: Vec::new(),
+        }
+    }
+
+    fn column(
+        attnum: i16,
+        name: &str,
+        type_name: &str,
+        kind: PgTypeKind,
+        primary_key_ordinal: Option<u16>,
+    ) -> ColumnSchema {
+        ColumnSchema {
+            attnum,
+            name: name.to_owned(),
+            data_type: PgType {
+                oid: u32::try_from(attnum).unwrap(),
+                name: QualifiedName::new("pg_catalog", type_name).unwrap(),
+                kind,
+            },
+            nullable: primary_key_ordinal.is_none(),
+            primary_key_ordinal,
+            generated: GeneratedColumn::None,
+            identity: IdentityColumn::None,
+            collation: None,
+        }
+    }
+
+    fn limits(row_limit: usize) -> SnapshotPageLimits {
+        SnapshotPageLimits {
+            row_limit,
+            max_page_bytes: 1024 * 1024,
+        }
+    }
+
+    fn key(values: &[&'static [u8]]) -> CanonicalSnapshotKeyRow {
+        CanonicalSnapshotKeyRow {
+            key: values
+                .iter()
+                .map(|value| Bytes::from_static(value))
+                .collect(),
+        }
+    }
 
     #[test]
     fn copy_sql_quotes_an_explicit_stable_column_list() {
@@ -368,5 +1302,148 @@ mod tests {
         let sql = set_snapshot_sql("000003A1-1'2").unwrap();
         assert!(sql.contains("'000003A1-1''2'"));
         assert!(set_snapshot_sql("bad\nvalue").is_err());
+    }
+
+    #[test]
+    fn canonical_pk_sql_uses_typed_keyset_and_native_composite_order() {
+        let schema = composite_schema();
+        let sql = SnapshotSession::canonical_pk_page_sql(&schema, true, limits(2)).unwrap();
+
+        assert!(sql.contains(
+            "SELECT \"Tenant\"\"Id\", \"Seq No\" FROM \"Sales\"\"Data\".\"Order\"\"Rows\""
+        ));
+        assert!(sql.contains(
+            "WHERE ROW(\"Tenant\"\"Id\", \"Seq No\") > ROW(CAST($1 AS \"pg_catalog\".\"text\"), CAST($2 AS \"pg_catalog\".\"int8\"))"
+        ));
+        assert!(sql.contains("\"Tenant\"\"Id\"::text, \"Seq No\"::text"));
+        assert!(sql.contains("ORDER BY \"Tenant\"\"Id\", \"Seq No\" LIMIT 3"));
+        assert!(sql.contains("lag(\"Seq No\") OVER \"__pg2cb_pk_window\""));
+        assert!(sql.contains("AS \"__pg2cb_pk_strict\""));
+
+        let first_sql = SnapshotSession::canonical_pk_page_sql(&schema, false, limits(2)).unwrap();
+        assert!(!first_sql.contains(" WHERE ROW("));
+        assert!(!first_sql.contains("$1"));
+
+        let row_sql = SnapshotSession::canonical_row_page_sql(&schema, true, limits(2)).unwrap();
+        assert!(row_sql.contains("\"Payload\"::text"));
+    }
+
+    #[test]
+    fn canonical_page_limits_are_nonzero_and_add_lookahead_safely() {
+        let schema = composite_schema();
+        assert!(
+            SnapshotSession::canonical_pk_page_sql(
+                &schema,
+                false,
+                SnapshotPageLimits {
+                    row_limit: 0,
+                    max_page_bytes: 1,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            SnapshotSession::canonical_pk_page_sql(
+                &schema,
+                false,
+                SnapshotPageLimits {
+                    row_limit: 1,
+                    max_page_bytes: 0,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            SnapshotSession::canonical_pk_page_sql(
+                &schema,
+                false,
+                SnapshotPageLimits {
+                    row_limit: usize::MAX,
+                    max_page_bytes: 1,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn key_pages_derive_bounded_first_and_unbounded_tail_copy_ranges() {
+        let first = finish_key_page(
+            vec![key(&[b"a", b"1"]), key(&[b"a", b"2"]), key(&[b"a", b"3"])],
+            2,
+            "snapshot-a",
+        )
+        .unwrap();
+        assert!(first.has_more);
+        assert_eq!(
+            first.next_key,
+            Some(vec![Bytes::from_static(b"a"), Bytes::from_static(b"2")])
+        );
+        assert_eq!(
+            first.copy_range(None).unwrap(),
+            SnapshotKeyRange {
+                start_exclusive: None,
+                end_inclusive: first.next_key.clone(),
+                snapshot_id: "snapshot-a".to_owned(),
+            }
+        );
+
+        let start = first.next_cursor().unwrap();
+        let tail = finish_key_page(vec![key(&[b"b", b"1"])], 2, "snapshot-a").unwrap();
+        assert!(!tail.has_more);
+        assert_eq!(
+            tail.copy_range(Some(&start)).unwrap(),
+            SnapshotKeyRange {
+                start_exclusive: Some(start.key().to_vec()),
+                end_inclusive: None,
+                snapshot_id: "snapshot-a".to_owned(),
+            }
+        );
+
+        let tail_cursor = tail.next_cursor().unwrap();
+        let empty = finish_key_page(Vec::new(), 2, "snapshot-a").unwrap();
+        assert!(!empty.has_more);
+        assert_eq!(
+            empty.copy_range(Some(&tail_cursor)).unwrap(),
+            SnapshotKeyRange {
+                start_exclusive: Some(tail_cursor.key().to_vec()),
+                end_inclusive: None,
+                snapshot_id: "snapshot-a".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn range_copy_uses_safe_typed_hex_keys_and_keeps_left_pk_bare() {
+        let schema = composite_schema();
+        let range = SnapshotKeyRange {
+            start_exclusive: Some(vec![Bytes::from_static(b"a'\\"), Bytes::from_static(b"2")]),
+            end_inclusive: Some(vec![Bytes::from_static(b"b"), Bytes::from_static(b"10")]),
+            snapshot_id: "snapshot-a".to_owned(),
+        };
+        let sql = SnapshotSession::copy_text_pk_range_sql(&schema, &range).unwrap();
+
+        assert!(sql.starts_with(
+            "COPY (SELECT \"Tenant\"\"Id\", \"Seq No\", \"Payload\" FROM \"Sales\"\"Data\".\"Order\"\"Rows\""
+        ));
+        assert!(sql.contains("ROW(\"Tenant\"\"Id\", \"Seq No\") > ROW("));
+        assert!(sql.contains("ROW(\"Tenant\"\"Id\", \"Seq No\") <= ROW("));
+        assert!(sql.contains("pg_catalog.decode('61275c', 'hex')"));
+        assert!(sql.contains("AS \"pg_catalog\".\"int8\""));
+        assert!(sql.contains("ORDER BY \"Tenant\"\"Id\", \"Seq No\""));
+        assert!(!sql.contains("CAST(\"Tenant"));
+        assert!(!sql.contains("a'\\"));
+    }
+
+    #[test]
+    fn canonical_text_parameter_uses_postgres_text_format() {
+        let value = CanonicalTextParameter("10");
+        let mut encoded = BytesMut::new();
+        assert!(matches!(value.encode_format(&Type::INT8), Format::Text));
+        assert!(matches!(
+            value.to_sql(&Type::INT8, &mut encoded).unwrap(),
+            IsNull::No
+        ));
+        assert_eq!(&encoded[..], b"10");
     }
 }

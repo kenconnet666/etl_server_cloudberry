@@ -217,6 +217,57 @@ USING heap
 DISTRIBUTED BY (pipeline_id, topology_generation, node_id);
 "#;
 
+/// Durable per-table progress for bounded snapshot COPY pages.
+///
+/// The cursor contains the source primary-key values in canonical text form and is advanced in
+/// the same target transaction as the corresponding shadow-table COPY.  Distribution by the
+/// snapshot group keeps group-wide activation checks colocated while remaining a prefix of every
+/// unique key.
+pub const TARGET_V7_SQL: &str = r#"
+ALTER TABLE pg2cb_meta.snapshot_groups
+    ADD COLUMN IF NOT EXISTS snapshot_progress_version integer NOT NULL DEFAULT 0
+        CHECK (snapshot_progress_version IN (0, 1));
+
+CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_table_progress (
+    snapshot_group_id uuid NOT NULL,
+    target_schema text NOT NULL,
+    target_table text NOT NULL,
+    shadow_schema text NOT NULL,
+    shadow_table text NOT NULL,
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    shadow_relation_oid bigint NOT NULL CHECK (shadow_relation_oid > 0),
+    source_relation_id bigint NOT NULL CHECK (source_relation_id > 0),
+    table_generation bigint NOT NULL CHECK (table_generation >= 0),
+    schema_fingerprint text NOT NULL CHECK (schema_fingerprint <> ''),
+    cursor_format_version integer NOT NULL CHECK (cursor_format_version = 1),
+    primary_key_arity integer NOT NULL CHECK (primary_key_arity >= 0),
+    cursor_values text[] NOT NULL DEFAULT ARRAY[]::text[]
+        CHECK (array_position(cursor_values, NULL) IS NULL)
+        CHECK (cardinality(cursor_values) = 0
+            OR cardinality(cursor_values) = primary_key_arity),
+    cursor_digest bytea NOT NULL CHECK (octet_length(cursor_digest) = 32),
+    completed boolean NOT NULL DEFAULT false,
+    pages_copied bigint NOT NULL DEFAULT 0 CHECK (pages_copied >= 0),
+    rows_copied bigint NOT NULL DEFAULT 0 CHECK (rows_copied >= 0),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    PRIMARY KEY (snapshot_group_id, target_schema, target_table),
+    UNIQUE (snapshot_group_id, shadow_relation_oid),
+    CHECK ((completed AND completed_at IS NOT NULL)
+        OR (NOT completed AND completed_at IS NULL))
+)
+USING heap
+DISTRIBUTED BY (snapshot_group_id);
+
+CREATE INDEX IF NOT EXISTS snapshot_table_progress_pipeline_generation_idx
+    ON pg2cb_meta.snapshot_table_progress (
+        pipeline_id, topology_generation, snapshot_group_id, completed
+    );
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -253,6 +304,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "durable_transaction_chunk_ledger",
         sql: TARGET_V6_SQL,
+    },
+    Migration {
+        version: 7,
+        name: "durable_snapshot_table_progress",
+        sql: TARGET_V7_SQL,
     },
 ];
 
@@ -389,17 +445,39 @@ mod tests {
                 .count(),
             2
         );
+        assert!(TARGET_V7_SQL.contains(
+            "CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_table_progress"
+        ));
+        assert!(TARGET_V7_SQL.contains(
+            "ADD COLUMN IF NOT EXISTS snapshot_progress_version integer NOT NULL DEFAULT 0"
+        ));
+        assert!(TARGET_V7_SQL.contains(
+            "PRIMARY KEY (snapshot_group_id, target_schema, target_table)"
+        ));
+        assert!(TARGET_V7_SQL.contains("shadow_schema text NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("shadow_table text NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("shadow_relation_oid bigint NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("UNIQUE (snapshot_group_id, shadow_relation_oid)"));
+        assert!(TARGET_V7_SQL.contains("cursor_format_version integer NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("primary_key_arity integer NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("cursor_values text[] NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("cursor_digest bytea NOT NULL"));
+        assert!(TARGET_V7_SQL.contains("completed boolean NOT NULL DEFAULT false"));
+        assert!(TARGET_V7_SQL.contains("pages_copied bigint NOT NULL DEFAULT 0"));
+        assert!(TARGET_V7_SQL.contains("rows_copied bigint NOT NULL DEFAULT 0"));
+        assert!(TARGET_V7_SQL.contains("DISTRIBUTED BY (snapshot_group_id)"));
     }
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 6);
+        assert_eq!(MIGRATIONS.len(), 7);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[1].version, 2);
         assert_eq!(MIGRATIONS[2].version, 3);
         assert_eq!(MIGRATIONS[3].version, 4);
         assert_eq!(MIGRATIONS[4].version, 5);
         assert_eq!(MIGRATIONS[5].version, 6);
+        assert_eq!(MIGRATIONS[6].version, 7);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
@@ -423,6 +501,10 @@ mod tests {
         assert_eq!(
             Sha256::digest(MIGRATIONS[5].sql),
             Sha256::digest(TARGET_V6_SQL)
+        );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[6].sql),
+            Sha256::digest(TARGET_V7_SQL)
         );
     }
 }

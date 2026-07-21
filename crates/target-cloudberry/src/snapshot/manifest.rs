@@ -48,6 +48,7 @@ impl SnapshotGroupState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StoredSnapshotGroup {
     pub(super) state: SnapshotGroupState,
+    pub(super) snapshot_progress_version: u16,
     pub(super) request: SnapshotActivationRequest,
 }
 
@@ -268,7 +269,7 @@ async fn insert_snapshot_group(
     })?;
     let checksum = manifest_checksum(request);
     let group_sql = format!(
-        "INSERT INTO {}.snapshot_groups (snapshot_group_id, pipeline_id, topology_generation, fencing_token, state, table_count, node_count, manifest_checksum) VALUES ($1, $2, $3, $4, 'loading', $5, $6, $7)",
+        "INSERT INTO {}.snapshot_groups (snapshot_group_id, pipeline_id, topology_generation, fencing_token, state, table_count, node_count, manifest_checksum, snapshot_progress_version) VALUES ($1, $2, $3, $4, 'loading', $5, $6, $7, 1)",
         quote_identifier(TARGET_METADATA_SCHEMA)?
     );
     let written = transaction
@@ -401,7 +402,7 @@ async fn load_snapshot_group_optional(
         return Err(SnapshotTargetError::InvalidSnapshotGroupId);
     }
     let group_sql = format!(
-        "SELECT pipeline_id, topology_generation, fencing_token, state, table_count, node_count, manifest_checksum FROM {}.snapshot_groups WHERE snapshot_group_id = $1 FOR UPDATE",
+        "SELECT pipeline_id, topology_generation, fencing_token, state, table_count, node_count, manifest_checksum, snapshot_progress_version FROM {}.snapshot_groups WHERE snapshot_group_id = $1 FOR UPDATE",
         quote_identifier(TARGET_METADATA_SCHEMA)?
     );
     let Some(group) = transaction
@@ -418,7 +419,14 @@ async fn load_snapshot_group_optional(
     let table_count = persisted_count(&group, "table_count", snapshot_group_id)?;
     let node_count = persisted_count(&group, "node_count", snapshot_group_id)?;
     let stored_checksum: Vec<u8> = group.try_get("manifest_checksum")?;
-    if fencing_token <= 0 || stored_checksum.len() != 32 {
+    let progress_version_raw: i32 = group.try_get("snapshot_progress_version")?;
+    let snapshot_progress_version = u16::try_from(progress_version_raw).map_err(|_| {
+        SnapshotTargetError::CorruptSnapshotGroupManifest(snapshot_group_id)
+    })?;
+    if fencing_token <= 0
+        || stored_checksum.len() != 32
+        || snapshot_progress_version > 1
+    {
         return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
             snapshot_group_id,
         ));
@@ -473,6 +481,7 @@ async fn load_snapshot_group_optional(
     }
     Ok(Some(StoredSnapshotGroup {
         state,
+        snapshot_progress_version,
         request: canonical,
     }))
 }
@@ -667,6 +676,7 @@ mod tests {
         let request = canonical_request(&request()).unwrap();
         let stored = StoredSnapshotGroup {
             state: SnapshotGroupState::Loading,
+            snapshot_progress_version: 1,
             request: request.clone(),
         };
         let ownership = SnapshotOwnership {

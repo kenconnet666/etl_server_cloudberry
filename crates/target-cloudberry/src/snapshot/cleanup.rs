@@ -22,7 +22,7 @@ use super::{
     activation::quarantine_name,
     database_generation, ensure_one_metadata_row, load_relation_state,
     manifest::{self, SnapshotGroupState},
-    relation_oid,
+    progress, relation_oid,
 };
 
 /// Authority and immutable ownership information required to remove one interrupted load.
@@ -200,6 +200,7 @@ async fn cleanup_loading_snapshot_group_locked(
         .map(|table| table.shadow.clone())
         .collect::<HashSet<_>>();
     let mut shadows = Vec::with_capacity(expected_shadows.len());
+    let mut progress_identities = Vec::with_capacity(expected_shadows.len());
 
     for table in &stored.request.tables {
         let state = load_relation_state(transaction, &table.shadow).await?;
@@ -229,6 +230,13 @@ async fn cleanup_loading_snapshot_group_locked(
             &table.schema_fingerprint,
         )?;
         validate_relation_identity(transaction, &table.shadow, &record).await?;
+        let shadow_relation_oid = record.relation_oid.ok_or_else(|| {
+            SnapshotTargetError::MissingRelationIdentity(table.shadow.to_string())
+        })?;
+        progress_identities.push(progress::CompletedSnapshotTableIdentity {
+            table: table.clone(),
+            shadow_relation_oid,
+        });
         shadows.push(table.shadow.clone());
     }
 
@@ -252,6 +260,18 @@ async fn cleanup_loading_snapshot_group_locked(
                 name.to_string(),
             ));
         }
+    }
+
+    if stored.snapshot_progress_version == progress::SNAPSHOT_PROGRESS_VERSION {
+        progress::delete_loading_snapshot_group_progress(
+            transaction,
+            &stored.request,
+            &progress_identities,
+        )
+        .await?;
+    } else {
+        progress::delete_loading_snapshot_group_progress(transaction, &stored.request, &[])
+            .await?;
     }
 
     for shadow in &shadows {
