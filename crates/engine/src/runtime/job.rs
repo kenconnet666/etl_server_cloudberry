@@ -1,6 +1,10 @@
 //! Concrete PostgreSQL 18 to Cloudberry pipeline job.
 
-use std::{str::FromStr as _, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr as _,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use cloudberry_etl_core::{
@@ -24,6 +28,7 @@ use cloudberry_etl_source_postgres::{
     },
     snapshot::begin_at_exported_snapshot,
     snapshot_slot::SnapshotSlotGuard,
+    spool::{ChunkLimits, SpoolError, SpoolIdentity, SpoolJournal, SpoolLimits},
     wal::{ReplicationTransport, SourceNodeIdentity, TransactionAssembler, TransactionLimits},
 };
 use cloudberry_etl_target_cloudberry::{
@@ -162,6 +167,8 @@ enum RuntimeJobError {
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error(transparent)]
+    Spool(#[from] SpoolError),
+    #[error(transparent)]
     TargetMigration(#[from] MigrationError),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
@@ -182,6 +189,7 @@ enum RuntimeJobError {
 pub struct PostgresCloudberryJobFactory {
     control: Arc<dyn ControlStore>,
     master_key: Arc<MasterKey>,
+    spool_root: PathBuf,
 }
 
 impl std::fmt::Debug for PostgresCloudberryJobFactory {
@@ -198,7 +206,14 @@ impl PostgresCloudberryJobFactory {
         Self {
             control,
             master_key,
+            spool_root: PathBuf::from("data/spool"),
         }
+    }
+
+    #[must_use]
+    pub fn with_spool_root(mut self, spool_root: impl AsRef<Path>) -> Self {
+        self.spool_root = spool_root.as_ref().to_owned();
+        self
     }
 
     async fn resolve(
@@ -263,6 +278,7 @@ impl PostgresCloudberryJobFactory {
             pipeline_settings,
             source_dsn,
             target_dsn,
+            spool_root: self.spool_root.clone(),
             telemetry,
         })
     }
@@ -295,6 +311,7 @@ struct PostgresCloudberryJob {
     pipeline_settings: PipelineSettings,
     source_dsn: SecretString,
     target_dsn: SecretString,
+    spool_root: PathBuf,
     telemetry: PipelineTelemetryHandle,
 }
 
@@ -458,16 +475,38 @@ impl PostgresCloudberryJob {
             &names.publication,
         )
         .await?;
-        let assembler = TransactionAssembler::with_limits(
-            SourceNodeIdentity {
-                node_id: STANDALONE_NODE_ID,
-                system_identifier: report.identity.system_identifier,
-                timeline: report.identity.timeline,
+        let source_identity = SourceNodeIdentity {
+            node_id: STANDALONE_NODE_ID,
+            system_identifier: report.identity.system_identifier,
+            timeline: report.identity.timeline,
+        };
+        let transaction_settings = self.source_settings.transaction;
+        // Run preparation proved the managed slot covers the target checkpoint (or created both
+        // from one snapshot), and START_REPLICATION above established replay from that point.
+        // Local spool files are not a source of truth, so this exact identity can be regenerated.
+        let journal = SpoolJournal::open_after_wal_replay_verified(
+            &self.spool_root,
+            SpoolIdentity {
+                pipeline_id: self.pipeline_id,
+                topology_generation: self.topology_generation,
+                node_id: source_identity.node_id,
+                system_identifier: source_identity.system_identifier,
+                timeline: source_identity.timeline,
             },
+            SpoolLimits {
+                memory_high_water_bytes: transaction_settings.memory_high_water_bytes,
+                segment_target_bytes: transaction_settings.segment_target_bytes,
+                disk_high_water_bytes: transaction_settings.disk_high_water_bytes,
+                minimum_free_disk_bytes: transaction_settings.minimum_free_disk_bytes,
+            },
+        )?;
+        let assembler = TransactionAssembler::with_spool(
+            source_identity,
             TransactionLimits {
-                max_changes: self.source_settings.transaction.max_changes,
-                max_bytes: self.source_settings.transaction.max_bytes,
+                max_changes: transaction_settings.memory_high_water_changes,
+                max_bytes: transaction_settings.memory_high_water_bytes,
             },
+            journal,
         )?;
         let mut source = PgOutputTransactionSource::new_with_telemetry(
             transport,
@@ -493,8 +532,17 @@ impl PostgresCloudberryJob {
             &self.source_settings.exclude_schemas,
         );
         ddl_scope.exclude(self.source_settings.metadata_schema.clone());
-        let sink =
-            CloudberryTransactionSink::new(target, self.fence, &names.slot, registry, ddl_scope)?;
+        let sink = CloudberryTransactionSink::new_with_chunk_limits(
+            target,
+            self.fence,
+            &names.slot,
+            registry,
+            ddl_scope,
+            ChunkLimits {
+                max_records: self.pipeline_settings.batch.max_rows,
+                max_bytes: self.pipeline_settings.batch.max_bytes,
+            },
+        )?;
         let batcher = Batcher::new(BatchLimits {
             max_rows: self.pipeline_settings.batch.max_rows,
             max_bytes: self.pipeline_settings.batch.max_bytes,

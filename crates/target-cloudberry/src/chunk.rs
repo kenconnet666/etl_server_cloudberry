@@ -13,8 +13,8 @@ use thiserror::Error;
 use tokio_postgres::{Row, Transaction};
 
 use crate::checkpoint::{
-    AdvanceOutcome, CheckpointError, NodeCheckpoint, PipelineFence, advance_node_checkpoint,
-    lock_pipeline_fence,
+    AdvanceOutcome, CheckpointError, CheckpointKey, NodeCheckpoint, PipelineFence,
+    advance_node_checkpoint, checkpoint_reached, load_node_checkpoint_locked, lock_pipeline_fence,
 };
 
 pub const LOCK_TRANSACTION_PROGRESS_SQL: &str = r#"
@@ -61,6 +61,21 @@ INSERT INTO pg2cb_meta.transaction_committed_chunks (
 VALUES ($1, $2, $3, $4::text::pg_lsn, $5, $6, $7, $8)
 "#;
 
+pub const DELETE_TRANSACTION_COMMITTED_CHUNKS_SQL: &str = r#"
+DELETE FROM pg2cb_meta.transaction_committed_chunks
+WHERE pipeline_id = $1 AND topology_generation = $2 AND node_id = $3
+  AND end_lsn = $4::text::pg_lsn
+"#;
+
+pub const DELETE_TRANSACTION_PROGRESS_SQL: &str = r#"
+DELETE FROM pg2cb_meta.transaction_chunk_progress
+WHERE pipeline_id = $1 AND topology_generation = $2 AND node_id = $3
+  AND end_lsn = $4::text::pg_lsn
+  AND system_identifier = $5::text::numeric AND timeline = $6 AND slot_name = $7
+  AND xid = $8 AND manifest_version = $9 AND record_count = $10
+  AND manifest_digest = $11 AND next_seq = $10 AND fencing_token = $12
+"#;
+
 const UPDATE_PROGRESS_FENCE_SQL: &str = r#"
 UPDATE pg2cb_meta.transaction_chunk_progress
 SET fencing_token = $5, updated_at = clock_timestamp()
@@ -90,6 +105,28 @@ pub struct TransactionChunkManifest {
     pub manifest_digest: [u8; 32],
 }
 
+impl TransactionChunkManifest {
+    /// Derives the only checkpoint that this immutable manifest may publish.
+    ///
+    /// Keeping this conversion beside the manifest prevents a caller from pairing a chunk
+    /// receipt with a checkpoint for a different source transaction. Validation still happens at
+    /// the completion boundary before any row is published.
+    #[must_use]
+    pub fn node_checkpoint(&self) -> NodeCheckpoint {
+        NodeCheckpoint {
+            key: CheckpointKey {
+                pipeline_id: self.key.pipeline_id,
+                topology_generation: self.key.topology_generation,
+                node_id: self.key.node_id,
+            },
+            system_identifier: self.system_identifier,
+            timeline: self.timeline,
+            slot_name: self.slot_name.clone(),
+            applied_lsn: self.key.end_lsn,
+        }
+    }
+}
+
 /// Identity of one half-open record range in an immutable transaction manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataChunkIdentity {
@@ -101,15 +138,29 @@ pub struct DataChunkIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressRegistration {
     Registered,
-    Existing { next_seq: u64 },
+    Existing {
+        next_seq: u64,
+    },
+    /// The target-authoritative checkpoint already covers this manifest.
+    AlreadyCheckpointed {
+        applied_lsn: PgLsn,
+    },
 }
 
 /// Result of locking the ledger before user-table DML starts.
 #[derive(Debug)]
 pub enum PrepareDataChunkOutcome {
     Apply(PreparedDataChunk),
-    AlreadyCommitted { next_seq: u64 },
-    ResumeAt { next_seq: u64 },
+    AlreadyCommitted {
+        next_seq: u64,
+    },
+    ResumeAt {
+        next_seq: u64,
+    },
+    /// The ledger was retired with a checkpoint at or beyond this manifest.
+    AlreadyCheckpointed {
+        applied_lsn: PgLsn,
+    },
 }
 
 /// Capability proving that a chunk is exactly the next range in a locked progress row.
@@ -204,6 +255,15 @@ pub enum ChunkLedgerError {
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("chunk ledger write affected {0} rows instead of one")]
     UnexpectedWriteCount(u64),
+    #[error("chunk ledger retirement deleted {0} progress rows instead of one")]
+    UnexpectedProgressRetirementCount(u64),
+    #[error(
+        "chunk ledger retirement deleted {deleted_chunks} receipts for a {record_count}-record manifest"
+    )]
+    UnexpectedCommittedChunkRetirementCount {
+        record_count: u64,
+        deleted_chunks: u64,
+    },
 }
 
 /// Registers and locks an immutable transaction manifest in a caller-owned target transaction.
@@ -215,14 +275,21 @@ pub async fn register_transaction_progress(
     fence: PipelineFence,
     manifest: &TransactionChunkManifest,
 ) -> Result<ProgressRegistration, ChunkLedgerError> {
-    let (progress, registered) = lock_or_register_progress(transaction, fence, manifest).await?;
-    Ok(if registered {
-        ProgressRegistration::Registered
-    } else {
-        ProgressRegistration::Existing {
-            next_seq: progress.next_seq,
+    match lock_or_register_progress(transaction, fence, manifest).await? {
+        LockOrRegisterProgressOutcome::Progress {
+            progress,
+            registered,
+        } => Ok(if registered {
+            ProgressRegistration::Registered
+        } else {
+            ProgressRegistration::Existing {
+                next_seq: progress.next_seq,
+            }
+        }),
+        LockOrRegisterProgressOutcome::AlreadyCheckpointed { applied_lsn } => {
+            Ok(ProgressRegistration::AlreadyCheckpointed { applied_lsn })
         }
-    })
+    }
 }
 
 /// Locks or registers progress and decides whether a chunk may execute.
@@ -239,7 +306,12 @@ pub async fn prepare_data_chunk(
 ) -> Result<PrepareDataChunkOutcome, ChunkLedgerError> {
     validate_manifest(fence, manifest)?;
     validate_chunk(manifest.record_count, chunk)?;
-    let (progress, _) = lock_or_register_progress(transaction, fence, manifest).await?;
+    let progress = match lock_or_register_progress(transaction, fence, manifest).await? {
+        LockOrRegisterProgressOutcome::Progress { progress, .. } => progress,
+        LockOrRegisterProgressOutcome::AlreadyCheckpointed { applied_lsn } => {
+            return Ok(PrepareDataChunkOutcome::AlreadyCheckpointed { applied_lsn });
+        }
+    };
 
     let committed = if chunk.start_seq < progress.next_seq {
         load_committed_chunk(transaction, manifest.key, chunk.start_seq).await?
@@ -336,7 +408,13 @@ pub async fn prepare_transaction_completion(
     })
 }
 
-/// Advances a checkpoint using a completion capability in the same caller-owned transaction.
+/// Advances a checkpoint and retires its chunk ledger in the same caller-owned transaction.
+///
+/// The target checkpoint is the recovery authority: replication always restarts from that
+/// checkpoint, and manifest/chunk entry points check it before creating a new ledger. Therefore a
+/// commit response lost after this operation is safe even though its receipts have been deleted.
+/// The checkpoint update, receipt deletion, and progress deletion become durable only when the
+/// caller commits this transaction.
 pub async fn complete_transaction_checkpoint(
     transaction: &Transaction<'_>,
     completion: PreparedTransactionCompletion,
@@ -349,9 +427,11 @@ pub async fn complete_transaction_checkpoint(
     };
     ensure_same_manifest(&progress.manifest, &completion.manifest)?;
     ensure_complete(&progress)?;
-    advance_node_checkpoint(transaction, completion.fence, checkpoint)
+    let outcome = advance_node_checkpoint(transaction, completion.fence, checkpoint)
         .await
-        .map_err(ChunkLedgerError::from)
+        .map_err(ChunkLedgerError::from)?;
+    retire_transaction_ledger(transaction, completion.fence, &completion.manifest).await?;
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +454,16 @@ enum ChunkClassification {
     ResumeAt,
 }
 
+enum LockOrRegisterProgressOutcome {
+    Progress {
+        progress: StoredProgress,
+        registered: bool,
+    },
+    AlreadyCheckpointed {
+        applied_lsn: PgLsn,
+    },
+}
+
 struct DatabaseKey {
     pipeline_id: uuid::Uuid,
     generation: i64,
@@ -394,13 +484,19 @@ async fn lock_or_register_progress(
     transaction: &Transaction<'_>,
     fence: PipelineFence,
     manifest: &TransactionChunkManifest,
-) -> Result<(StoredProgress, bool), ChunkLedgerError> {
+) -> Result<LockOrRegisterProgressOutcome, ChunkLedgerError> {
     validate_manifest(fence, manifest)?;
     lock_pipeline_fence(transaction, fence).await?;
     if let Some(mut progress) = load_progress_locked(transaction, manifest.key).await? {
         ensure_same_manifest(&progress.manifest, manifest)?;
         adopt_fence(transaction, fence, &mut progress).await?;
-        return Ok((progress, false));
+        return Ok(LockOrRegisterProgressOutcome::Progress {
+            progress,
+            registered: false,
+        });
+    }
+    if let Some(applied_lsn) = manifest_checkpoint_reached_locked(transaction, manifest).await? {
+        return Ok(LockOrRegisterProgressOutcome::AlreadyCheckpointed { applied_lsn });
     }
 
     let database = DatabaseKey::new(manifest.key)?;
@@ -429,14 +525,14 @@ async fn lock_or_register_progress(
         )
         .await?;
     ensure_one_row(inserted)?;
-    Ok((
-        StoredProgress {
+    Ok(LockOrRegisterProgressOutcome::Progress {
+        progress: StoredProgress {
             manifest: manifest.clone(),
             next_seq: 0,
             fencing_token: fence.fencing_token,
         },
-        true,
-    ))
+        registered: true,
+    })
 }
 
 async fn load_progress_locked(
@@ -480,6 +576,65 @@ async fn load_committed_chunk(
         .await?
         .map(committed_chunk_from_row)
         .transpose()
+}
+
+async fn manifest_checkpoint_reached_locked(
+    transaction: &Transaction<'_>,
+    manifest: &TransactionChunkManifest,
+) -> Result<Option<PgLsn>, ChunkLedgerError> {
+    let checkpoint = checkpoint_for_manifest(manifest);
+    let current = load_node_checkpoint_locked(transaction, checkpoint.key).await?;
+    if checkpoint_reached(current.as_ref(), &checkpoint)? {
+        Ok(current.map(|stored| stored.checkpoint.applied_lsn))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn retire_transaction_ledger(
+    transaction: &Transaction<'_>,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+) -> Result<(), ChunkLedgerError> {
+    let database = DatabaseKey::new(manifest.key)?;
+    let timeline = i64::from(manifest.timeline);
+    let xid = i64::from(manifest.xid);
+    let manifest_version = i32::from(manifest.manifest_version);
+    let record_count = database_sequence("record_count", manifest.record_count)?;
+    let system_identifier = manifest.system_identifier.to_string();
+
+    // Committed chunk receipts may legitimately be empty for a zero-record transaction.
+    let deleted_chunks = transaction
+        .execute(
+            DELETE_TRANSACTION_COMMITTED_CHUNKS_SQL,
+            &[
+                &database.pipeline_id,
+                &database.generation,
+                &manifest.key.node_id,
+                &database.end_lsn,
+            ],
+        )
+        .await?;
+    let deleted_progress = transaction
+        .execute(
+            DELETE_TRANSACTION_PROGRESS_SQL,
+            &[
+                &database.pipeline_id,
+                &database.generation,
+                &manifest.key.node_id,
+                &database.end_lsn,
+                &system_identifier,
+                &timeline,
+                &manifest.slot_name,
+                &xid,
+                &manifest_version,
+                &record_count,
+                &&manifest.manifest_digest[..],
+                &fence.fencing_token,
+            ],
+        )
+        .await?;
+    ensure_retirement_counts(manifest.record_count, deleted_chunks, deleted_progress)
 }
 
 async fn adopt_fence(
@@ -652,6 +807,20 @@ fn ensure_checkpoint_matches(
     Ok(())
 }
 
+fn checkpoint_for_manifest(manifest: &TransactionChunkManifest) -> NodeCheckpoint {
+    NodeCheckpoint {
+        key: CheckpointKey {
+            pipeline_id: manifest.key.pipeline_id,
+            topology_generation: manifest.key.topology_generation,
+            node_id: manifest.key.node_id,
+        },
+        system_identifier: manifest.system_identifier,
+        timeline: manifest.timeline,
+        slot_name: manifest.slot_name.clone(),
+        applied_lsn: manifest.key.end_lsn,
+    }
+}
+
 fn progress_from_row(row: Row) -> Result<StoredProgress, ChunkLedgerError> {
     let key = key_from_row(&row)?;
     let system_identifier = parse_persisted::<u64>(&row, "system_identifier")?;
@@ -763,6 +932,25 @@ fn ensure_one_row(written: u64) -> Result<(), ChunkLedgerError> {
     } else {
         Err(ChunkLedgerError::UnexpectedWriteCount(written))
     }
+}
+
+fn ensure_retirement_counts(
+    record_count: u64,
+    deleted_chunks: u64,
+    deleted_progress: u64,
+) -> Result<(), ChunkLedgerError> {
+    if (record_count == 0 && deleted_chunks != 0) || (record_count > 0 && deleted_chunks == 0) {
+        return Err(ChunkLedgerError::UnexpectedCommittedChunkRetirementCount {
+            record_count,
+            deleted_chunks,
+        });
+    }
+    if deleted_progress != 1 {
+        return Err(ChunkLedgerError::UnexpectedProgressRetirementCount(
+            deleted_progress,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -946,6 +1134,52 @@ mod tests {
         assert!(matches!(
             ensure_checkpoint_matches(&manifest, &checkpoint),
             Err(ChunkLedgerError::CheckpointLsnMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn retirement_sql_filters_the_complete_transaction_identity() {
+        for sql in [
+            DELETE_TRANSACTION_COMMITTED_CHUNKS_SQL,
+            DELETE_TRANSACTION_PROGRESS_SQL,
+        ] {
+            assert!(sql.contains("pipeline_id = $1"));
+            assert!(sql.contains("topology_generation = $2"));
+            assert!(sql.contains("node_id = $3"));
+            assert!(sql.contains("end_lsn = $4::text::pg_lsn"));
+        }
+        assert!(DELETE_TRANSACTION_PROGRESS_SQL.contains("system_identifier = $5::text::numeric"));
+        assert!(DELETE_TRANSACTION_PROGRESS_SQL.contains("manifest_digest = $11"));
+        assert!(DELETE_TRANSACTION_PROGRESS_SQL.contains("next_seq = $10"));
+        assert!(DELETE_TRANSACTION_PROGRESS_SQL.contains("fencing_token = $12"));
+    }
+
+    #[test]
+    fn retirement_allows_empty_or_non_empty_receipts_but_requires_one_progress_row() {
+        assert!(ensure_retirement_counts(0, 0, 1).is_ok());
+        assert!(ensure_retirement_counts(30, 1, 1).is_ok());
+        assert!(ensure_retirement_counts(30, 7, 1).is_ok());
+        assert!(matches!(
+            ensure_retirement_counts(0, 1, 1),
+            Err(ChunkLedgerError::UnexpectedCommittedChunkRetirementCount {
+                record_count: 0,
+                deleted_chunks: 1
+            })
+        ));
+        assert!(matches!(
+            ensure_retirement_counts(30, 0, 1),
+            Err(ChunkLedgerError::UnexpectedCommittedChunkRetirementCount {
+                record_count: 30,
+                deleted_chunks: 0
+            })
+        ));
+        assert!(matches!(
+            ensure_retirement_counts(0, 0, 0),
+            Err(ChunkLedgerError::UnexpectedProgressRetirementCount(0))
+        ));
+        assert!(matches!(
+            ensure_retirement_counts(30, 7, 2),
+            Err(ChunkLedgerError::UnexpectedProgressRetirementCount(2))
         ));
     }
 }

@@ -16,6 +16,7 @@ use cloudberry_etl_core::{
     mapping::SourcePrefix,
     pipeline::SourceTopology,
 };
+use cloudberry_etl_engine::runtime::{PipelineSettings, SourceSettings, TargetSettings};
 use cloudberry_etl_metadata::{
     crypto::{source_credential_aad, target_credential_aad},
     model::{PipelineDefinition, SourceProfile, TargetProfile},
@@ -145,6 +146,10 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
          # TYPE pg2cb_pipeline_target_checkpoint_lsn gauge\n\
          # HELP pg2cb_pipeline_estimated_byte_lag Estimated WAL byte distance.\n\
          # TYPE pg2cb_pipeline_estimated_byte_lag gauge\n\
+         # HELP pg2cb_pipeline_spool_bytes Durable transaction spool bytes currently in use.\n\
+         # TYPE pg2cb_pipeline_spool_bytes gauge\n\
+         # HELP pg2cb_pipeline_resource_wait Whether the pipeline is waiting for a recoverable resource.\n\
+         # TYPE pg2cb_pipeline_resource_wait gauge\n\
          # HELP pg2cb_pipeline_slot_retained_wal_bytes WAL bytes retained by the source logical slot.\n\
          # TYPE pg2cb_pipeline_slot_retained_wal_bytes gauge\n\
          # HELP pg2cb_pipeline_slot_safe_wal_bytes WAL bytes remaining before PostgreSQL may invalidate the slot.\n\
@@ -199,6 +204,12 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
         );
         append_optional_metric(
             &mut body,
+            "pg2cb_pipeline_spool_bytes",
+            &pipeline_id,
+            snapshot.spool_bytes,
+        );
+        append_optional_metric(
+            &mut body,
             "pg2cb_pipeline_slot_retained_wal_bytes",
             &pipeline_id,
             snapshot.slot_retained_wal_bytes,
@@ -234,9 +245,14 @@ async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, Api
         body.push_str(&format!(
             "pg2cb_pipeline_restart_total{{pipeline_id=\"{pipeline_id}\"}} {}\n\
              pg2cb_pipeline_last_error_info{{pipeline_id=\"{pipeline_id}\"}} {}\n\
+             pg2cb_pipeline_resource_wait{{pipeline_id=\"{pipeline_id}\"}} {}\n\
              pg2cb_pipeline_wal_retention_warning{{pipeline_id=\"{pipeline_id}\"}} {}\n",
             snapshot.restart_count,
             u8::from(snapshot.last_error.is_some()),
+            u8::from(matches!(
+                snapshot.state,
+                cloudberry_etl_engine::telemetry::PipelineRuntimeState::ResourceWait
+            )),
             u8::from(snapshot.wal_retention_warning),
         ));
     }
@@ -412,6 +428,8 @@ async fn create_source(
     validate_name(&request.name)?;
     validate_name(&request.database_name)?;
     validate_object(&request.settings)?;
+    SourceSettings::parse(&request.settings)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let id = SourceId::new();
     let now = Utc::now();
     let source = SourceProfile {
@@ -496,6 +514,8 @@ async fn create_target(
     validate_name(&request.name)?;
     validate_name(&request.database_name)?;
     validate_object(&request.settings)?;
+    TargetSettings::parse(&request.settings)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let id = TargetId::new();
     let now = Utc::now();
     let target = TargetProfile {
@@ -645,12 +665,18 @@ async fn create_pipeline(
     validate_object(&request.settings)?;
     let sources = state.control.list_sources().await.map_err(store_error)?;
     let targets = state.control.list_targets().await.map_err(store_error)?;
-    if !sources.iter().any(|source| source.id == request.source_id) {
-        return Err(ApiError::bad_request("source_id does not exist"));
-    }
+    let source = sources
+        .iter()
+        .find(|source| source.id == request.source_id)
+        .ok_or_else(|| ApiError::bad_request("source_id does not exist"))?;
     if !targets.iter().any(|target| target.id == request.target_id) {
         return Err(ApiError::bad_request("target_id does not exist"));
     }
+    let source_settings = SourceSettings::parse(&source.settings)
+        .map_err(|error| ApiError::bad_request(format!("source settings are invalid: {error}")))?;
+    PipelineSettings::parse(&request.settings)
+        .and_then(|settings| settings.validate_with_source(&source_settings))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let now = Utc::now();
     let pipeline = PipelineDefinition {
         id: PipelineId::new(),
@@ -949,7 +975,7 @@ mod tests {
         });
         (
             AppState {
-                control: control.clone(),
+                control: Arc::<CommandStore>::clone(&control),
                 master_key: Arc::new(key),
                 supervisor: Arc::new(PipelineSupervisor::new()),
                 connection_tester: Arc::new(NoopConnectionTester),
@@ -1010,9 +1036,8 @@ mod tests {
             .await
             .expect("metrics gate is open");
 
-        let error = match metrics(State(state)).await {
-            Err(error) => error,
-            Ok(_) => panic!("overlapping scrape was accepted"),
+        let Err(error) = metrics(State(state)).await else {
+            panic!("overlapping scrape was accepted");
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1107,5 +1132,49 @@ mod tests {
         assert!(body.contains(&format!("pipeline_id=\"{id}\"")));
         assert!(!body.contains("secret"));
         assert!(!body.contains("private_table"));
+    }
+
+    #[tokio::test]
+    async fn exposes_recoverable_resource_wait_without_metric_reason_labels() {
+        let (state, id, _) = command_state();
+        let telemetry = state.supervisor.telemetry_for(id).await;
+        telemetry.mark_started();
+        telemetry.mark_running();
+        telemetry.set_phase(PipelinePhase::CatchingUp);
+        telemetry.spool_usage_observed(8192);
+        telemetry.mark_resource_wait("spool path C:/private/pipeline is full");
+
+        let Json(view) = get_pipeline(State(state.clone()), Path(id))
+            .await
+            .expect("pipeline detail succeeds");
+        let runtime = view.runtime.expect("runtime is included");
+        assert_eq!(runtime.state.as_str(), "resource_wait");
+        assert_eq!(runtime.phase, PipelinePhase::CatchingUp);
+        assert_eq!(runtime.spool_bytes, Some(8192));
+        assert_eq!(
+            runtime.resource_wait_reason.as_deref(),
+            Some("spool path C:/private/pipeline is full")
+        );
+        assert!(runtime.last_error.is_none());
+
+        let response = metrics(State(state))
+            .await
+            .expect("metrics succeeds")
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body can be read");
+        let body = String::from_utf8(body.to_vec()).expect("metrics are UTF-8");
+        assert!(body.contains(&format!(
+            "pg2cb_pipeline_runtime_state{{pipeline_id=\"{id}\",state=\"resource_wait\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "pg2cb_pipeline_resource_wait{{pipeline_id=\"{id}\"}} 1"
+        )));
+        assert!(body.contains(&format!(
+            "pg2cb_pipeline_spool_bytes{{pipeline_id=\"{id}\"}} 8192"
+        )));
+        assert!(!body.contains("private"));
+        assert!(!body.contains("spool path"));
     }
 }

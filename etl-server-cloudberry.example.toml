@@ -3,6 +3,9 @@ listen = "127.0.0.1:8080"
 secure_cookies = false
 session_ttl_seconds = 28800
 
+[engine]
+spool_directory = "data/spool"
+
 [admin]
 username = "admin"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$replace_with_hash_password_output$invalid"

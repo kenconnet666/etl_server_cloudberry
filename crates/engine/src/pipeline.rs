@@ -1,10 +1,8 @@
 //! Replication loop and recoverable pipeline state machine.
 
 use async_trait::async_trait;
-use cloudberry_etl_core::{
-    change::{SourcePosition, SourceTransaction},
-    pipeline::PipelinePhase,
-};
+use cloudberry_etl_core::{change::SourcePosition, pipeline::PipelinePhase};
+use cloudberry_etl_source_postgres::wal::CommittedTransaction;
 use thiserror::Error;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +24,8 @@ pub enum PipelineError {
     Normalize(#[from] crate::normalize::NormalizeError),
     #[error("source acknowledgement failed: {0}")]
     Acknowledge(String),
+    #[error("transaction spool cleanup failed: {0}")]
+    SpoolCleanup(String),
     #[error(transparent)]
     Batch(#[from] BatchError),
     #[error("invalid pipeline transition from {from:?} to {to:?}")]
@@ -37,7 +37,7 @@ pub enum PipelineError {
 
 #[async_trait]
 pub trait TransactionSource: Send {
-    async fn next_transaction(&mut self) -> Result<Option<SourceTransaction>, PipelineError>;
+    async fn next_transaction(&mut self) -> Result<Option<CommittedTransaction>, PipelineError>;
     async fn acknowledge(&mut self, position: &SourcePosition) -> Result<(), PipelineError>;
 }
 
@@ -206,6 +206,11 @@ async fn apply_and_ack(
     if let Some(telemetry) = telemetry {
         telemetry.applied(final_position.lsn);
     }
+    for transaction in batch.transactions() {
+        transaction
+            .cleanup_spool()
+            .map_err(|error| PipelineError::SpoolCleanup(error.to_string()))?;
+    }
     source.acknowledge(final_position).await?;
     if let Some(telemetry) = telemetry {
         telemetry.acknowledged(final_position.lsn);
@@ -224,13 +229,15 @@ mod tests {
     use crate::batch::BatchLimits;
 
     struct FakeSource {
-        events: VecDeque<SourceTransaction>,
+        events: VecDeque<CommittedTransaction>,
         log: std::sync::Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
     impl TransactionSource for FakeSource {
-        async fn next_transaction(&mut self) -> Result<Option<SourceTransaction>, PipelineError> {
+        async fn next_transaction(
+            &mut self,
+        ) -> Result<Option<CommittedTransaction>, PipelineError> {
             Ok(self.events.pop_front())
         }
 
@@ -263,8 +270,8 @@ mod tests {
         }
     }
 
-    fn transaction(lsn: u64) -> SourceTransaction {
-        SourceTransaction {
+    fn transaction(lsn: u64) -> CommittedTransaction {
+        cloudberry_etl_core::change::SourceTransaction {
             xid: lsn as u32,
             commit_time: Utc::now(),
             final_position: SourcePosition {
@@ -275,6 +282,7 @@ mod tests {
             },
             changes: vec![],
         }
+        .into()
     }
 
     fn batcher() -> Batcher {

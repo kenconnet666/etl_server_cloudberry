@@ -219,12 +219,14 @@ source table                              -> target table
 
 源数据库必须为最大快照时间、最长可接受故障时间和峰值 WAL 留出容量，但 slot 不得无限保留 WAL。每个 pipeline 配置：
 
+同一 topology generation 内，每个 source node 的 committed transaction `end_lsn` 必须严格递增且唯一。相等或回退都按协议/identity 破坏 fail closed；账本回收后，target checkpoint 正是依靠这个不变量安全覆盖已经完成的旧 manifest，不能用 `xid` 或到达顺序替代。
+
 - retained WAL warning 和 hard limit。
 - 最大未 ACK 时间。
-- 最大 transaction/spool bytes。
+- transaction 内存水位、spool 磁盘高水位和最低剩余空间；这些是背压阈值，不是事务大小拒绝阈值。
 - snapshot 和 reconciliation 的源端 I/O 限速。
 
-达到 hard limit 前服务暂停新工作并告警；若继续会危及源磁盘，运维可以显式失效 slot。之后必须执行新 generation 快照，不能从猜测位置续传。
+达到本地 spool 或源 WAL hard limit 前服务停止继续读取和 ACK、进入可恢复资源等待并告警，不因单个事务大小失败。若资源无法恢复且继续会危及源磁盘，运维可以显式失效 slot；之后必须执行新 generation 快照，不能从猜测位置续传。
 
 以下操作必须先走 `prepare` 流程：
 

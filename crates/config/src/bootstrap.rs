@@ -1,4 +1,8 @@
-use std::{env, fs, net::SocketAddr, path::Path};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -111,6 +115,8 @@ impl ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
+    /// Service-local root for versioned WAL transaction journals.
+    pub spool_directory: PathBuf,
     pub reconcile_interval_seconds: u64,
     pub lease_ttl_seconds: u64,
     pub lease_renew_interval_seconds: u64,
@@ -122,6 +128,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            spool_directory: PathBuf::from("data/spool"),
             reconcile_interval_seconds: 2,
             lease_ttl_seconds: 30,
             lease_renew_interval_seconds: 10,
@@ -134,6 +141,11 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.spool_directory.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "engine.spool_directory must not be empty".into(),
+            ));
+        }
         if self.reconcile_interval_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "engine.reconcile_interval_seconds must be greater than zero".into(),
@@ -221,6 +233,7 @@ mod tests {
         session_ttl_seconds = 3600
 
         [engine]
+        spool_directory = "data/spool"
         reconcile_interval_seconds = 2
         lease_ttl_seconds = 30
         lease_renew_interval_seconds = 10

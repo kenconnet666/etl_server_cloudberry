@@ -151,7 +151,7 @@ Commit { source_position }
 
 行值在解析前保留为 `Bytes`，状态模型为 `Null | UnchangedToast | Text(Bytes) | Binary(Bytes)`。OID 只用于当前连接内定位，持久化类型身份同时包含 namespace、name、kind、typmod 和结构 fingerprint，不能把数据库本地 OID 当成跨重启契约。
 
-所有 channel 以事件数和字节数双重限界。普通事务在内存中合并；超过阈值的 streamed transaction 写入本服务专属的有界临时 spool，收到 COMMIT 后才能交给 applier，ABORT 时丢弃。spool 不是持久消息源，进程崩溃后由未 ACK 的 WAL 重放恢复。
+所有 channel 以事件数和字节数双重限界。普通事务可以在内存中合并；越过内存水位后透明写入本服务专属的有界磁盘 spool，不以事务字节数触发业务失败。收到 COMMIT 后才能按有界 chunk 交给 applier，ABORT 时丢弃。磁盘达到高水位时停止读取和 ACK、进入可恢复的资源等待；spool 不是独立消息权威，进程崩溃后仍可由未 ACK 的 WAL 重放恢复。详见 [ADR 0004](adr/0004-streaming-spool-and-completion.md)。
 
 ### 4. 调度与批处理
 
@@ -197,7 +197,7 @@ payload = change identity + affected relation identities
 - 阻塞：无法精确翻译的对象或来源不明的 DDL。
 - DROP TABLE：移动到 quarantine，默认保留 30 天后才允许显式清理。
 
-DDL 错误阻塞受影响表并保留 WAL，不跳过行。若 WAL 保留达到保护阈值，pipeline 暂停并要求重建，不允许无限填满源磁盘。
+DDL 错误阻塞受影响表并保留 WAL，不跳过行。其他表可以继续 apply/spool，但 completion tracker 不允许 checkpoint 越过 schema barrier。安全变化在线执行；无法证明安全时自动重建受影响表或依赖闭包。只有 WAL/slot、source identity 或 topology coverage 失真才升级为整 pipeline 重建。详见 [ADR 0005](adr/0005-online-schema-evolution.md)。
 
 ### 7. Reconciliation 与修复
 
@@ -282,3 +282,5 @@ bootstrap 配置只包含监听地址、单管理员 Argon2id hash、明确的 `
 - [ADR 0001：At-least-once 与当前状态收敛](adr/0001-delivery-semantics.md)
 - [ADR 0002：控制面和元数据权威](adr/0002-control-and-metadata.md)
 - [ADR 0003：Citus CDC 的逐节点 LSN 与 topology generation](adr/0003-citus-cdc.md)
+- [ADR 0004：流式事务、磁盘 spool 与连续 checkpoint](adr/0004-streaming-spool-and-completion.md)
+- [ADR 0005：表级 DDL 跟随与 shadow reload fallback](adr/0005-online-schema-evolution.md)

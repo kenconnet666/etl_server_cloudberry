@@ -10,10 +10,18 @@ The delivery contract is at-least-once with idempotent primary-key application
 and eventual convergence. A selected table that violates the source contract
 currently prevents that pipeline from starting. It is never silently skipped.
 
+The accepted final direction is broader than the current V3 boundary. Large
+transactions will use bounded memory plus a versioned disk spool instead of a
+transaction-size failure. Safe DDL will be applied online; changes that cannot
+be proven safe will rebuild the affected table or dependency group while WAL
+ingest continues. Standalone, physical HA, and Citus will share the same
+node-stream, spool, schema-transition, and checkpoint-completion model.
+
 The project is intentionally scoped to PostgreSQL as the source and
 Cloudberry as the destination. See [docs/architecture.md](docs/architecture.md)
 and [docs/source-contract.md](docs/source-contract.md) before deploying a
-pipeline.
+pipeline. The phased implementation and old-path removal gates are tracked in
+[docs/delivery-plan.md](docs/delivery-plan.md).
 
 ## Workspace
 
@@ -57,3 +65,8 @@ cargo test --workspace --all-features
 
 The integration environment uses WSL Docker on Windows. Exact image versions
 and lifecycle commands are documented under `tests/integration`.
+
+Functional tests may cross the Windows/WSL virtual network using the reachable
+`10.144.144.4` and `10.144.144.5` addresses. Peak throughput and latency tests
+run PostgreSQL, the service, and Cloudberry in one Linux/WSL instance to remove
+virtual-network noise; cross-boundary benchmarks are reported separately.

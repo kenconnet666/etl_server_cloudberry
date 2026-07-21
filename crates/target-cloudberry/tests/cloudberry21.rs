@@ -14,8 +14,8 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyRequest, LedgeredDataChunkOutcome, LedgeredDataChunkRequest, StageOperation,
-        StagingRow, TableApplyBatch, execute_apply, execute_ledgered_completion,
+        ApplyError, ApplyRequest, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
+        StageOperation, StagingRow, TableApplyBatch, execute_apply, execute_ledgered_completion,
         execute_ledgered_data_chunk, plan_apply,
     },
     checkpoint::{
@@ -621,6 +621,38 @@ async fn run_test(
             previous_lsn: PgLsn::new(100)
         }
     );
+    assert_eq!(ledger_counts(client, manifest.key).await?, (0, 0));
+
+    // A lost COMMIT response can replay this request after the receipts were retired. The target
+    // checkpoint must short-circuit before staging or user-table DML executes.
+    client
+        .execute(
+            &format!(
+                "UPDATE {}.items SET payload = 'checkpoint_sentinel', quantity = 99 WHERE id = 1",
+                quote_identifier(target_schema)
+            ),
+            &[],
+        )
+        .await?;
+    assert!(matches!(
+        execute_ledgered_data_chunk(client, &data_chunk).await?,
+        LedgeredDataChunkOutcome::AlreadyCheckpointed { applied_lsn }
+            if applied_lsn == manifest.key.end_lsn
+    ));
+    assert_eq!(
+        row(client, target_schema, 1).await?,
+        Some(("checkpoint_sentinel".into(), 99))
+    );
+    assert_eq!(ledger_counts(client, manifest.key).await?, (0, 0));
+    client
+        .execute(
+            &format!(
+                "UPDATE {}.items SET payload = 'chunk', quantity = 11 WHERE id = 1",
+                quote_identifier(target_schema)
+            ),
+            &[],
+        )
+        .await?;
 
     let moved = request(
         fence,
@@ -658,6 +690,148 @@ async fn run_test(
     execute_apply(client, &deleted).await?;
     assert_eq!(row(client, target_schema, 2).await?, None);
 
+    let graph_seed = request_rows(
+        fence,
+        &plan,
+        140,
+        vec![
+            StagingRow {
+                operation: StageOperation::Upsert,
+                cells: vec![text("1"), text("one"), text("10")],
+                old_key: None,
+            },
+            StagingRow {
+                operation: StageOperation::Upsert,
+                cells: vec![text("2"), text("two"), text("20")],
+                old_key: None,
+            },
+        ],
+    );
+    execute_apply(client, &graph_seed).await?;
+
+    let duplicate_destination = request_rows(
+        fence,
+        &plan,
+        145,
+        vec![
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("3"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("1")]),
+            },
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("3"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("2")]),
+            },
+        ],
+    );
+    assert!(matches!(
+        execute_apply(client, &duplicate_destination).await,
+        Err(ApplyError::InvalidBatch(_))
+    ));
+    let duplicate_origin = request_rows(
+        fence,
+        &plan,
+        145,
+        vec![
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("3"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("1")]),
+            },
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("4"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("1")]),
+            },
+        ],
+    );
+    assert!(matches!(
+        execute_apply(client, &duplicate_origin).await,
+        Err(ApplyError::InvalidBatch(_))
+    ));
+
+    let chain = request_rows(
+        fence,
+        &plan,
+        150,
+        vec![
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("3"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("2")]),
+            },
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("2"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("1")]),
+            },
+        ],
+    );
+    let outcome = execute_apply(client, &chain).await?;
+    assert_eq!(outcome.moved_rows, 2);
+    assert_eq!(row(client, target_schema, 1).await?, None);
+    assert_eq!(
+        row(client, target_schema, 2).await?,
+        Some(("one".into(), 10))
+    );
+    assert_eq!(
+        row(client, target_schema, 3).await?,
+        Some(("two".into(), 20))
+    );
+
+    let swap = request_rows(
+        fence,
+        &plan,
+        160,
+        vec![
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("3"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("2")]),
+            },
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("2"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("3")]),
+            },
+        ],
+    );
+    execute_apply(client, &swap).await?;
+    assert_eq!(
+        row(client, target_schema, 2).await?,
+        Some(("two".into(), 20))
+    );
+    assert_eq!(
+        row(client, target_schema, 3).await?,
+        Some(("one".into(), 10))
+    );
+
+    let delete_then_move = request_rows(
+        fence,
+        &plan,
+        170,
+        vec![
+            StagingRow {
+                operation: StageOperation::Delete,
+                cells: vec![text("2"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: None,
+            },
+            StagingRow {
+                operation: StageOperation::Move,
+                cells: vec![text("2"), Cell::UnchangedToast, Cell::UnchangedToast],
+                old_key: Some(vec![text("3")]),
+            },
+        ],
+    );
+    execute_apply(client, &delete_then_move).await?;
+    assert_eq!(
+        row(client, target_schema, 2).await?,
+        Some(("one".into(), 10))
+    );
+    assert_eq!(row(client, target_schema, 3).await?, None);
+
     let checkpoint = load_node_checkpoint(
         client,
         CheckpointKey {
@@ -668,7 +842,7 @@ async fn run_test(
     )
     .await?
     .expect("checkpoint must exist");
-    assert_eq!(checkpoint.checkpoint.applied_lsn, PgLsn::new(130));
+    assert_eq!(checkpoint.checkpoint.applied_lsn, PgLsn::new(170));
     assert_eq!(checkpoint.fencing_token, fence.fencing_token);
     Ok(())
 }
@@ -678,6 +852,15 @@ fn request(
     plan: &cloudberry_etl_target_cloudberry::apply::ApplyPlan,
     lsn: u64,
     row: StagingRow,
+) -> ApplyRequest {
+    request_rows(fence, plan, lsn, vec![row])
+}
+
+fn request_rows(
+    fence: PipelineFence,
+    plan: &cloudberry_etl_target_cloudberry::apply::ApplyPlan,
+    lsn: u64,
+    rows: Vec<StagingRow>,
 ) -> ApplyRequest {
     ApplyRequest {
         fence,
@@ -694,7 +877,7 @@ fn request(
         },
         tables: vec![TableApplyBatch {
             plan: Arc::new(plan.clone()),
-            rows: vec![row],
+            rows,
         }],
     }
 }
@@ -715,6 +898,32 @@ async fn row(
         .await?
         .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
         .transpose()
+}
+
+async fn ledger_counts(
+    client: &Client,
+    key: TransactionChunkKey,
+) -> Result<(i64, i64), tokio_postgres::Error> {
+    let pipeline_id = key.pipeline_id.as_uuid();
+    let generation = i64::try_from(key.topology_generation).expect("test generation fits bigint");
+    let end_lsn = key.end_lsn.to_string();
+    let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+        &[&pipeline_id, &generation, &key.node_id, &end_lsn];
+    let progress = client
+        .query_one(
+            "SELECT count(*) FROM pg2cb_meta.transaction_chunk_progress WHERE pipeline_id = $1 AND topology_generation = $2 AND node_id = $3 AND end_lsn = $4::text::pg_lsn",
+            parameters,
+        )
+        .await?
+        .get(0);
+    let chunks = client
+        .query_one(
+            "SELECT count(*) FROM pg2cb_meta.transaction_committed_chunks WHERE pipeline_id = $1 AND topology_generation = $2 AND node_id = $3 AND end_lsn = $4::text::pg_lsn",
+            parameters,
+        )
+        .await?
+        .get(0);
+    Ok((progress, chunks))
 }
 
 fn source_schema() -> TableSchema {

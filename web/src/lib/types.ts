@@ -1,7 +1,13 @@
 export type Id = string;
 
 export type SourceTopology = 'standalone' | 'physical_ha' | 'citus';
-export type RuntimeState = 'starting' | 'running' | 'stopped' | 'failed' | 'degraded';
+export type RuntimeState =
+  | 'starting'
+  | 'running'
+  | 'resource_wait'
+  | 'stopped'
+  | 'failed'
+  | 'degraded';
 export type PipelinePhase =
   | 'draft'
   | 'validating'
@@ -84,6 +90,8 @@ export interface PipelineRuntime {
   source_current_lsn?: string | null;
   target_checkpoint_lsn?: string | null;
   estimated_byte_lag?: number | null;
+  spool_bytes?: number | null;
+  resource_wait_reason?: string | null;
   slot_retained_wal_bytes?: number | null;
   slot_safe_wal_bytes?: number | null;
   wal_retention_warning: boolean;

@@ -10,4 +10,5 @@ pub mod ddl;
 pub mod publication;
 pub mod snapshot;
 pub mod snapshot_slot;
+pub mod spool;
 pub mod wal;

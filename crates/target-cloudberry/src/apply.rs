@@ -100,9 +100,10 @@ pub struct ApplyPlan {
     pub create_staging_sql: String,
     pub copy_sql: String,
     pub validation_sql: String,
+    pub materialize_moves_sql: Option<String>,
     pub delete_sql: String,
-    pub move_sql: String,
     pub delete_moved_sql: String,
+    pub move_sql: String,
     pub update_sql: Option<String>,
     pub insert_sql: String,
 }
@@ -162,6 +163,10 @@ pub enum LedgeredDataChunkOutcome {
     AlreadyCommitted { next_seq: u64 },
     /// Durable progress is inside or beyond a differently partitioned request.
     ResumeAt { next_seq: u64 },
+    /// The target checkpoint already covers this transaction and no DML ran.
+    AlreadyCheckpointed {
+        applied_lsn: cloudberry_etl_core::lsn::PgLsn,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +238,10 @@ pub async fn execute_ledgered_data_chunk(
         PrepareDataChunkOutcome::ResumeAt { next_seq } => {
             transaction.rollback().await?;
             Ok(LedgeredDataChunkOutcome::ResumeAt { next_seq })
+        }
+        PrepareDataChunkOutcome::AlreadyCheckpointed { applied_lsn } => {
+            transaction.rollback().await?;
+            Ok(LedgeredDataChunkOutcome::AlreadyCheckpointed { applied_lsn })
         }
     }
 }
@@ -385,17 +394,20 @@ async fn apply_tables(
                 table.plan.table.target.to_string(),
             ));
         }
+        if let Some(materialize_moves_sql) = &table.plan.materialize_moves_sql {
+            transaction.execute(materialize_moves_sql, &[]).await?;
+        }
         stats.deleted_rows = stats
             .deleted_rows
             .saturating_add(transaction.execute(&table.plan.delete_sql, &[]).await?);
-        stats.moved_rows = stats
-            .moved_rows
-            .saturating_add(transaction.execute(&table.plan.move_sql, &[]).await?);
         stats.deleted_rows = stats.deleted_rows.saturating_add(
             transaction
                 .execute(&table.plan.delete_moved_sql, &[])
                 .await?,
         );
+        stats.moved_rows = stats
+            .moved_rows
+            .saturating_add(transaction.execute(&table.plan.move_sql, &[]).await?);
         if let Some(update_sql) = &table.plan.update_sql {
             stats.updated_rows = stats
                 .updated_rows
@@ -413,6 +425,8 @@ async fn apply_tables(
 /// `U` upserts a stable key, `D` deletes a stable key, and `M` moves a row to a
 /// new primary key. A false presence flag means the source sent
 /// `UnchangedToast`; it is valid only when the target can supply the prior value.
+/// Move rows are materialized before any old key is released, so chains and
+/// swaps do not depend on statement snapshots or temporary unique-key gaps.
 pub fn plan_apply(
     source: &TableSchema,
     target: QualifiedName,
@@ -603,16 +617,36 @@ pub fn plan_apply(
             .join(" AND ")
     };
     let grouped_key = qualified_columns("s", key_names)?.join(", ");
-    let grouped_old_key = old_key_columns
+    let release_by_delete_join = equality_join("r", "s", key_names)?;
+    let release_by_move_join = old_key_columns
         .iter()
         .map(|column| {
             Ok(format!(
-                "s.{}",
-                quote_identifier(&column.staging_column_name)?
+                "r.{} = s.{}",
+                quote_identifier(&column.staging_column_name)?,
+                quote_identifier(&column.source_column_name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, SqlRenderError>>()?
+        .join(" AND ");
+    let destination_released = format!(
+        "EXISTS (\n                SELECT 1\n                FROM {quoted_staging} AS r\n                WHERE (r.{quoted_operation} = {} AND ({release_by_delete_join}))\n                   OR (r.{quoted_operation} = {} AND ({release_by_move_join}))\n            )",
+        quote_literal("D")?,
+        quote_literal("M")?,
+    );
+    let release_delete_projection = qualified_columns("r", key_names)?.join(", ");
+    let release_move_projection = old_key_columns
+        .iter()
+        .map(|column| {
+            Ok(format!(
+                "r.{} AS {}",
+                quote_identifier(&column.staging_column_name)?,
+                quote_identifier(&column.source_column_name)?
             ))
         })
         .collect::<Result<Vec<_>, SqlRenderError>>()?
         .join(", ");
+    let grouped_release_key = qualified_columns("released", key_names)?.join(", ");
     let old_validation_join = old_key_columns
         .iter()
         .map(|column| {
@@ -625,7 +659,7 @@ pub fn plan_apply(
         .collect::<Result<Vec<_>, SqlRenderError>>()?
         .join(" AND ");
     let validation_sql = format!(
-        "SELECT (\n    EXISTS (\n        SELECT 1\n        FROM {quoted_staging} AS s\n        LEFT JOIN {quoted_target} AS t ON {key_join}\n        LEFT JOIN {quoted_target} AS old_t ON {old_validation_join}\n        WHERE s.{quoted_operation} NOT IN ({upsert}, {delete}, {move_op})\n           OR {key_is_null}\n           OR (s.{quoted_operation} IN ({upsert}, {delete}) AND ({old_key_present} OR ({old_key_is_not_null})))\n           OR (s.{quoted_operation} = {move_op} AND (NOT {old_key_present} OR ({old_key_is_null}) OR ({same_move_key})))\n           OR (s.{quoted_operation} = {move_op} AND {target_missing} = {old_target_missing})\n           OR (s.{quoted_operation} = {upsert} AND {target_missing} AND NOT ({all_present}))\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        GROUP BY {grouped_key}\n        HAVING count(*) > 1\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        WHERE s.{quoted_operation} = {move_op}\n        GROUP BY {grouped_old_key}\n        HAVING count(*) > 1\n    )\n) AS invalid_batch",
+        "SELECT (\n    EXISTS (\n        SELECT 1\n        FROM {quoted_staging} AS s\n        LEFT JOIN {quoted_target} AS t ON {key_join}\n        LEFT JOIN {quoted_target} AS old_t ON {old_validation_join}\n        WHERE s.{quoted_operation} NOT IN ({upsert}, {delete}, {move_op})\n           OR {key_is_null}\n           OR (s.{quoted_operation} IN ({upsert}, {delete}) AND ({old_key_present} OR ({old_key_is_not_null})))\n           OR (s.{quoted_operation} = {move_op} AND (NOT {old_key_present} OR ({old_key_is_null}) OR ({same_move_key})))\n           OR (s.{quoted_operation} = {move_op} AND {old_target_missing})\n           OR (s.{quoted_operation} = {move_op} AND NOT {target_missing} AND NOT ({destination_released}))\n           OR (s.{quoted_operation} = {upsert} AND ({target_missing} OR ({destination_released})) AND NOT ({all_present}))\n    )\n    OR EXISTS (\n        SELECT 1 FROM {quoted_staging} AS s\n        WHERE s.{quoted_operation} IN ({upsert}, {move_op})\n        GROUP BY {grouped_key}\n        HAVING count(*) > 1\n    )\n    OR EXISTS (\n        SELECT 1\n        FROM (\n            SELECT {release_delete_projection}\n            FROM {quoted_staging} AS r\n            WHERE r.{quoted_operation} = {delete}\n            UNION ALL\n            SELECT {release_move_projection}\n            FROM {quoted_staging} AS r\n            WHERE r.{quoted_operation} = {move_op}\n        ) AS released\n        GROUP BY {grouped_release_key}\n        HAVING count(*) > 1\n    )\n) AS invalid_batch",
         upsert = quote_literal("U")?,
         delete = quote_literal("D")?,
         move_op = quote_literal("M")?,
@@ -641,36 +675,34 @@ pub fn plan_apply(
         .iter()
         .map(|column| column.name.clone())
         .collect();
-    let moved_columns = table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(source_column_index, column)| {
-            let data = quote_identifier(&column.name)?;
-            if column.primary_key_ordinal.is_some() {
-                Ok(format!("s.{data}"))
-            } else {
-                let presence = presence_columns
-                    .iter()
-                    .find(|presence| presence.source_column_index == source_column_index)
-                    .expect("every non-key column has a presence column");
+    let materialize_moves_sql = if presence_columns.is_empty() {
+        None
+    } else {
+        let assignments = presence_columns
+            .iter()
+            .map(|presence| {
+                let data = quote_identifier(&presence.source_column_name)?;
                 let present = quote_identifier(&presence.staging_column_name)?;
                 Ok(format!(
-                    "CASE WHEN s.{present} THEN s.{data} ELSE t.{data} END"
+                    "    {data} = CASE WHEN s.{present} THEN s.{data} ELSE t.{data} END"
                 ))
-            }
-        })
-        .collect::<Result<Vec<_>, SqlRenderError>>()?
-        .join(", ");
-    let move_sql = format!(
-        "INSERT INTO {quoted_target} ({})\nSELECT {moved_columns}\nFROM {quoted_staging} AS s\nJOIN {quoted_target} AS t ON {old_key_join}\nWHERE s.{quoted_operation} = {}\n  AND NOT EXISTS (SELECT 1 FROM {quoted_target} AS new_t WHERE {})",
-        quote_identifier_list(&data_names)?,
-        quote_literal("M")?,
-        equality_join("new_t", "s", key_names)?,
-    );
+            })
+            .collect::<Result<Vec<_>, SqlRenderError>>()?
+            .join(",\n");
+        Some(format!(
+            "UPDATE {quoted_staging} AS s\nSET\n{assignments}\nFROM {quoted_target} AS t\nWHERE s.{quoted_operation} = {} AND {old_key_join}",
+            quote_literal("M")?
+        ))
+    };
     let delete_moved_sql = format!(
         "DELETE FROM {quoted_target} AS t\nUSING {quoted_staging} AS s\nWHERE s.{quoted_operation} = {} AND {old_key_join}",
         quote_literal("M")?
+    );
+    let selected_columns = qualified_columns("s", &data_names)?.join(", ");
+    let move_sql = format!(
+        "INSERT INTO {quoted_target} ({})\nSELECT {selected_columns}\nFROM {quoted_staging} AS s\nWHERE s.{quoted_operation} = {}",
+        quote_identifier_list(&data_names)?,
+        quote_literal("M")?,
     );
 
     let update_sql = if presence_columns.is_empty() {
@@ -693,7 +725,6 @@ pub fn plan_apply(
         ))
     };
 
-    let selected_columns = qualified_columns("s", &data_names)?.join(", ");
     let insert_sql = format!(
         "INSERT INTO {quoted_target} ({})\nSELECT {selected_columns}\nFROM {quoted_staging} AS s\nWHERE s.{quoted_operation} = {}\n  AND NOT EXISTS (SELECT 1 FROM {quoted_target} AS t WHERE {key_join})",
         quote_identifier_list(&data_names)?,
@@ -713,9 +744,10 @@ pub fn plan_apply(
         create_staging_sql,
         copy_sql,
         validation_sql,
+        materialize_moves_sql,
         delete_sql,
-        move_sql,
         delete_moved_sql,
+        move_sql,
         update_sql,
         insert_sql,
     })
@@ -833,10 +865,26 @@ mod tests {
                 .contains("DELETE FROM \"target\".\"orders\"")
         );
         assert!(plan.update_sql.as_ref().unwrap().contains("CASE WHEN"));
-        assert!(plan.move_sql.contains("JOIN \"target\".\"orders\" AS t"));
-        assert!(plan.move_sql.contains("ELSE t.\"payload\" END"));
+        let materialize_moves = plan.materialize_moves_sql.as_ref().unwrap();
+        assert!(materialize_moves.contains("UPDATE \"stage_orders\" AS s"));
+        assert!(materialize_moves.contains("FROM \"target\".\"orders\" AS t"));
+        assert!(materialize_moves.contains("ELSE t.\"payload\" END"));
         assert!(plan.delete_moved_sql.contains("s.\"__pg2cb_op\" = E'M'"));
+        assert!(
+            plan.move_sql
+                .contains("SELECT s.\"tenant\", s.\"id\", s.\"payload\"")
+        );
+        assert!(!plan.move_sql.contains("JOIN \"target\".\"orders\""));
         assert!(plan.insert_sql.contains("NOT EXISTS"));
+        assert!(plan.validation_sql.contains("UNION ALL"));
+        assert!(
+            plan.validation_sql
+                .contains("s.\"__pg2cb_op\" IN (E'U', E'M')")
+        );
+        assert!(
+            plan.validation_sql
+                .contains("r.\"__pg2cb_old_2\" = s.\"id\"")
+        );
     }
 
     #[test]
@@ -868,6 +916,7 @@ mod tests {
         )
         .unwrap();
         assert!(plan.update_sql.is_none());
+        assert!(plan.materialize_moves_sql.is_none());
         assert!(plan.validation_sql.contains("NOT (TRUE)"));
     }
 

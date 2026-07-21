@@ -35,6 +35,8 @@ pub enum SourceError {
     Json(#[from] serde_json::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("spool journal error: {0}")]
+    Spool(String),
 }
 
 pub type SourceResult<T> = Result<T, SourceError>;

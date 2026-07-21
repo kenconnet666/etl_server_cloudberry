@@ -1,8 +1,9 @@
 //! Bounded, node-ordered change batching.
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use cloudberry_etl_core::change::{Cell, RowChange, SourceTransaction, TransactionChange};
+use cloudberry_etl_core::lsn::PgLsn;
+use cloudberry_etl_source_postgres::wal::CommittedTransaction;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,15 +29,29 @@ pub enum BatchError {
     InvalidLimits,
     #[error("transactions from node {actual} cannot enter a node {expected} batch")]
     MixedNodes { expected: i32, actual: i32 },
-    #[error("transactions from different PostgreSQL system identifiers cannot share a batch")]
-    MixedSystems,
-    #[error("transaction LSN moved backwards from {previous} to {actual}")]
+    #[error(
+        "source node {node_id} changed PostgreSQL system identifier from {expected} to {actual}"
+    )]
+    MixedSystems {
+        node_id: i32,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("source node {node_id} changed timeline from {expected} to {actual}")]
+    MixedTimelines {
+        node_id: i32,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("transaction LSN did not advance beyond {previous}: got {actual}")]
     NonMonotonicLsn { previous: String, actual: String },
+    #[error("transaction change source failed: {0}")]
+    ChangeSource(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct TransactionBatch {
-    transactions: Vec<SourceTransaction>,
+    transactions: Vec<CommittedTransaction>,
     row_count: usize,
     estimated_bytes: usize,
     has_generation_barrier: bool,
@@ -44,7 +59,7 @@ pub struct TransactionBatch {
 
 impl TransactionBatch {
     #[must_use]
-    pub fn transactions(&self) -> &[SourceTransaction] {
+    pub fn transactions(&self) -> &[CommittedTransaction] {
         &self.transactions
     }
 
@@ -64,7 +79,7 @@ impl TransactionBatch {
     }
 
     #[must_use]
-    pub fn final_transaction(&self) -> &SourceTransaction {
+    pub fn final_transaction(&self) -> &CommittedTransaction {
         self.transactions
             .last()
             .expect("a constructed batch always has a transaction")
@@ -74,10 +89,18 @@ impl TransactionBatch {
 #[derive(Debug)]
 pub struct Batcher {
     limits: BatchLimits,
-    pending: Vec<SourceTransaction>,
+    pending: Vec<CommittedTransaction>,
     pending_rows: usize,
     pending_bytes: usize,
-    node_identity: Option<(i32, u64)>,
+    pending_node_id: Option<i32>,
+    node_watermarks: HashMap<i32, NodeWatermark>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeWatermark {
+    system_identifier: u64,
+    timeline: u32,
+    end_lsn: PgLsn,
 }
 
 impl Batcher {
@@ -90,21 +113,24 @@ impl Batcher {
             pending: Vec::new(),
             pending_rows: 0,
             pending_bytes: 0,
-            node_identity: None,
+            pending_node_id: None,
+            node_watermarks: HashMap::new(),
         })
     }
 
-    pub fn push(
-        &mut self,
-        transaction: SourceTransaction,
-    ) -> Result<Option<TransactionBatch>, BatchError> {
+    pub fn push<T>(&mut self, transaction: T) -> Result<Option<TransactionBatch>, BatchError>
+    where
+        T: Into<CommittedTransaction>,
+    {
+        let transaction = transaction.into();
         self.validate_order(&transaction)?;
-        let rows = transaction_row_count(&transaction);
-        let bytes = transaction_estimated_bytes(&transaction);
-        let barrier = transaction
-            .changes
-            .iter()
-            .any(TransactionChange::requires_generation_barrier);
+        let stats = transaction
+            .change_source
+            .stats()
+            .map_err(|error| BatchError::ChangeSource(error.to_string()))?;
+        let rows = usize::try_from(stats.row_count).unwrap_or(usize::MAX);
+        let bytes = usize::try_from(stats.encoded_bytes).unwrap_or(usize::MAX);
+        let barrier = stats.has_generation_barrier;
         let must_flush = !self.pending.is_empty()
             && (barrier
                 || self.pending_rows.saturating_add(rows) > self.limits.max_rows
@@ -114,10 +140,16 @@ impl Batcher {
                 || self.pending.len() >= self.limits.max_rows);
         let full = must_flush.then(|| self.take_pending());
 
-        self.node_identity = Some((
-            transaction.final_position.node_id,
-            transaction.final_position.system_identifier,
-        ));
+        let position = &transaction.final_position;
+        self.pending_node_id = Some(position.node_id);
+        self.node_watermarks.insert(
+            position.node_id,
+            NodeWatermark {
+                system_identifier: position.system_identifier,
+                timeline: position.timeline,
+                end_lsn: position.lsn,
+            },
+        );
         self.pending_rows = self.pending_rows.saturating_add(rows);
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         self.pending.push(transaction);
@@ -139,25 +171,37 @@ impl Batcher {
         self.limits.max_delay
     }
 
-    fn validate_order(&self, transaction: &SourceTransaction) -> Result<(), BatchError> {
-        if let Some((node_id, system_identifier)) = self.node_identity {
-            if node_id != transaction.final_position.node_id {
-                return Err(BatchError::MixedNodes {
-                    expected: node_id,
-                    actual: transaction.final_position.node_id,
+    fn validate_order(&self, transaction: &CommittedTransaction) -> Result<(), BatchError> {
+        let position = &transaction.final_position;
+        if let Some(node_id) = self.pending_node_id
+            && node_id != position.node_id
+        {
+            return Err(BatchError::MixedNodes {
+                expected: node_id,
+                actual: position.node_id,
+            });
+        }
+        if let Some(previous) = self.node_watermarks.get(&position.node_id) {
+            if previous.system_identifier != position.system_identifier {
+                return Err(BatchError::MixedSystems {
+                    node_id: position.node_id,
+                    expected: previous.system_identifier,
+                    actual: position.system_identifier,
                 });
             }
-            if system_identifier != transaction.final_position.system_identifier {
-                return Err(BatchError::MixedSystems);
+            if previous.timeline != position.timeline {
+                return Err(BatchError::MixedTimelines {
+                    node_id: position.node_id,
+                    expected: previous.timeline,
+                    actual: position.timeline,
+                });
             }
-        }
-        if let Some(previous) = self.pending.last()
-            && transaction.final_position.lsn < previous.final_position.lsn
-        {
-            return Err(BatchError::NonMonotonicLsn {
-                previous: previous.final_position.lsn.to_string(),
-                actual: transaction.final_position.lsn.to_string(),
-            });
+            if position.lsn <= previous.end_lsn {
+                return Err(BatchError::NonMonotonicLsn {
+                    previous: previous.end_lsn.to_string(),
+                    actual: position.lsn.to_string(),
+                });
+            }
         }
         Ok(())
     }
@@ -168,11 +212,11 @@ impl Batcher {
         let estimated_bytes = std::mem::take(&mut self.pending_bytes);
         let has_generation_barrier = transactions.iter().any(|transaction| {
             transaction
-                .changes
-                .iter()
-                .any(TransactionChange::requires_generation_barrier)
+                .change_source
+                .stats()
+                .is_ok_and(|stats| stats.has_generation_barrier)
         });
-        self.node_identity = None;
+        self.pending_node_id = None;
         TransactionBatch {
             transactions,
             row_count,
@@ -182,65 +226,34 @@ impl Batcher {
     }
 }
 
-fn transaction_row_count(transaction: &SourceTransaction) -> usize {
-    transaction
-        .changes
-        .iter()
-        .filter(|change| matches!(change, TransactionChange::Row(_)))
-        .count()
-}
-
-fn transaction_estimated_bytes(transaction: &SourceTransaction) -> usize {
-    transaction
-        .changes
-        .iter()
-        .map(|change| match change {
-            TransactionChange::Row(change) => match &change.change {
-                RowChange::Insert { new } => tuple_bytes(&new.cells),
-                RowChange::Update { old_key, new } => {
-                    old_key.as_ref().map_or(0, |key| tuple_bytes(&key.cells))
-                        + tuple_bytes(&new.cells)
-                }
-                RowChange::Delete { old_key } => tuple_bytes(&old_key.cells),
-            },
-            TransactionChange::Truncate { relation_ids, .. } => relation_ids.len() * 4,
-            TransactionChange::Ddl(message) => {
-                message.command_tag.len()
-                    + message.schema_fingerprint.len()
-                    + message.relation_ids.len() * 4
-            }
-        })
-        .sum()
-}
-
-fn tuple_bytes(cells: &[Cell]) -> usize {
-    cells
-        .iter()
-        .map(|cell| match cell {
-            Cell::Null | Cell::UnchangedToast => 1,
-            Cell::Text(value) | Cell::Binary(value) => value.len(),
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use cloudberry_etl_core::{
-        change::{DdlMessage, SourcePosition, TransactionChange},
+        change::{DdlMessage, SourcePosition, SourceTransaction, TransactionChange},
         lsn::PgLsn,
     };
 
     use super::*;
 
     fn transaction(lsn: u64, changes: Vec<TransactionChange>) -> SourceTransaction {
+        transaction_at(1, 9, 1, lsn, changes)
+    }
+
+    fn transaction_at(
+        node_id: i32,
+        system_identifier: u64,
+        timeline: u32,
+        lsn: u64,
+        changes: Vec<TransactionChange>,
+    ) -> SourceTransaction {
         SourceTransaction {
             xid: lsn as u32,
             commit_time: Utc::now(),
             final_position: SourcePosition {
-                node_id: 1,
-                system_identifier: 9,
-                timeline: 1,
+                node_id,
+                system_identifier,
+                timeline,
                 lsn: PgLsn::new(lsn),
             },
             changes,
@@ -266,13 +279,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lsn_regression() {
+    fn rejects_non_increasing_transaction_lsn() {
         let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
         batcher.push(transaction(2, vec![])).unwrap();
+        assert!(matches!(
+            batcher.push(transaction(2, vec![])),
+            Err(BatchError::NonMonotonicLsn { .. })
+        ));
         assert!(matches!(
             batcher.push(transaction(1, vec![])),
             Err(BatchError::NonMonotonicLsn { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_non_increasing_lsn_after_flush() {
+        let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
+        batcher.push(transaction(5, vec![])).unwrap();
+        assert!(batcher.flush().is_some());
+        assert!(batcher.is_empty());
+
+        assert!(matches!(
+            batcher.push(transaction(5, vec![])),
+            Err(BatchError::NonMonotonicLsn { .. })
+        ));
+        assert!(matches!(
+            batcher.push(transaction(4, vec![])),
+            Err(BatchError::NonMonotonicLsn { .. })
+        ));
+        assert!(batcher.push(transaction(6, vec![])).unwrap().is_none());
+    }
+
+    #[test]
+    fn tracks_lsn_watermarks_independently_per_node() {
+        let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
+        batcher.push(transaction_at(1, 9, 1, 100, vec![])).unwrap();
+        batcher.flush().unwrap();
+
+        assert!(
+            batcher
+                .push(transaction_at(2, 10, 3, 1, vec![]))
+                .unwrap()
+                .is_none()
+        );
+        batcher.flush().unwrap();
+        assert!(
+            batcher
+                .push(transaction_at(1, 9, 1, 101, vec![]))
+                .unwrap()
+                .is_none()
+        );
+        batcher.flush().unwrap();
+        assert!(matches!(
+            batcher.push(transaction_at(2, 10, 3, 1, vec![])),
+            Err(BatchError::NonMonotonicLsn { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_node_identity_changes_across_flushes() {
+        let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
+        batcher.push(transaction_at(1, 9, 1, 10, vec![])).unwrap();
+        batcher.flush().unwrap();
+
+        assert!(matches!(
+            batcher.push(transaction_at(1, 10, 1, 11, vec![])),
+            Err(BatchError::MixedSystems {
+                node_id: 1,
+                expected: 9,
+                actual: 10
+            })
+        ));
+        assert!(matches!(
+            batcher.push(transaction_at(1, 9, 2, 11, vec![])),
+            Err(BatchError::MixedTimelines {
+                node_id: 1,
+                expected: 1,
+                actual: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_mixed_nodes_only_while_a_batch_is_pending() {
+        let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
+        batcher.push(transaction_at(1, 9, 1, 10, vec![])).unwrap();
+        assert!(matches!(
+            batcher.push(transaction_at(2, 10, 1, 1, vec![])),
+            Err(BatchError::MixedNodes {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        batcher.flush().unwrap();
+        assert!(
+            batcher
+                .push(transaction_at(2, 10, 1, 1, vec![]))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

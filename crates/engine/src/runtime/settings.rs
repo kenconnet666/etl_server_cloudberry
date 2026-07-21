@@ -23,8 +23,11 @@ const DEFAULT_SOURCE_METADATA_SCHEMA: &str = "pg2cb_meta";
 const DEFAULT_BATCH_MAX_ROWS: usize = 10_000;
 const DEFAULT_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_BATCH_MAX_DELAY_MS: u64 = 250;
-const DEFAULT_TRANSACTION_MAX_CHANGES: usize = 1_000_000;
-const DEFAULT_TRANSACTION_MAX_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_TRANSACTION_MEMORY_HIGH_WATER_CHANGES: usize = 100_000;
+const DEFAULT_TRANSACTION_MEMORY_HIGH_WATER_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_TRANSACTION_SEGMENT_TARGET_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_TRANSACTION_DISK_HIGH_WATER_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const DEFAULT_TRANSACTION_MINIMUM_FREE_DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_WAL_CHECK_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_WAL_WARNING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_WAL_REBUILD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -40,6 +43,7 @@ pub const MAX_BATCH_BYTES: usize = 1 << 30;
 pub const MAX_BATCH_DELAY_MS: u64 = 60_000;
 pub const MAX_TRANSACTION_CHANGES: usize = 10_000_000;
 pub const MAX_TRANSACTION_BYTES: usize = 1 << 36;
+pub const MAX_TRANSACTION_DISK_BYTES: u64 = 1 << 50;
 pub const MAX_WAL_CHECK_INTERVAL_SECONDS: u64 = 3600;
 pub const MAX_WAL_RETENTION_BYTES: u64 = 1 << 50;
 pub const MAX_QUARANTINE_RETENTION_DAYS: u32 = 3650;
@@ -348,35 +352,70 @@ impl BatchSettings {
     }
 }
 
-/// Limits used while assembling one source transaction (including bounded spool data).
+/// Resource watermarks used while assembling source transactions.
+///
+/// These values never define a supported transaction size. Crossing the memory watermark spills
+/// to disk; crossing a disk watermark pauses WAL reads and acknowledgements until space returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransactionSettings {
-    pub max_changes: usize,
-    pub max_bytes: usize,
+    #[serde(alias = "max_changes")]
+    pub memory_high_water_changes: usize,
+    #[serde(alias = "max_bytes")]
+    pub memory_high_water_bytes: usize,
+    pub segment_target_bytes: usize,
+    pub disk_high_water_bytes: u64,
+    pub minimum_free_disk_bytes: u64,
 }
 
 impl Default for TransactionSettings {
     fn default() -> Self {
         Self {
-            max_changes: DEFAULT_TRANSACTION_MAX_CHANGES,
-            max_bytes: DEFAULT_TRANSACTION_MAX_BYTES,
+            memory_high_water_changes: DEFAULT_TRANSACTION_MEMORY_HIGH_WATER_CHANGES,
+            memory_high_water_bytes: DEFAULT_TRANSACTION_MEMORY_HIGH_WATER_BYTES,
+            segment_target_bytes: DEFAULT_TRANSACTION_SEGMENT_TARGET_BYTES,
+            disk_high_water_bytes: DEFAULT_TRANSACTION_DISK_HIGH_WATER_BYTES,
+            minimum_free_disk_bytes: DEFAULT_TRANSACTION_MINIMUM_FREE_DISK_BYTES,
         }
     }
 }
 
 impl TransactionSettings {
     pub fn validate(&self, path: &str) -> Result<(), SettingsError> {
-        if !(1..=MAX_TRANSACTION_CHANGES).contains(&self.max_changes) {
+        if !(1..=MAX_TRANSACTION_CHANGES).contains(&self.memory_high_water_changes) {
             return invalid(
-                format!("{path}.max_changes"),
+                format!("{path}.memory_high_water_changes"),
                 format!("must be between 1 and {MAX_TRANSACTION_CHANGES}"),
             );
         }
-        if !(1..=MAX_TRANSACTION_BYTES).contains(&self.max_bytes) {
+        if !(1..=MAX_TRANSACTION_BYTES).contains(&self.memory_high_water_bytes) {
             return invalid(
-                format!("{path}.max_bytes"),
+                format!("{path}.memory_high_water_bytes"),
                 format!("must be between 1 and {MAX_TRANSACTION_BYTES}"),
+            );
+        }
+        if !(1..=MAX_TRANSACTION_BYTES).contains(&self.segment_target_bytes) {
+            return invalid(
+                format!("{path}.segment_target_bytes"),
+                format!("must be between 1 and {MAX_TRANSACTION_BYTES}"),
+            );
+        }
+        if !(1..=MAX_TRANSACTION_DISK_BYTES).contains(&self.disk_high_water_bytes) {
+            return invalid(
+                format!("{path}.disk_high_water_bytes"),
+                format!("must be between 1 and {MAX_TRANSACTION_DISK_BYTES}"),
+            );
+        }
+        if self.minimum_free_disk_bytes >= self.disk_high_water_bytes {
+            return invalid(
+                format!("{path}.minimum_free_disk_bytes"),
+                "must be below disk_high_water_bytes",
+            );
+        }
+        if self.segment_target_bytes as u64 > self.disk_high_water_bytes {
+            return invalid(
+                format!("{path}.segment_target_bytes"),
+                "must not exceed disk_high_water_bytes",
             );
         }
         Ok(())

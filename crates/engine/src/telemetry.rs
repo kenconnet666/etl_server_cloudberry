@@ -17,6 +17,7 @@ use serde::Serialize;
 pub enum PipelineRuntimeState {
     Starting,
     Running,
+    ResourceWait,
     Stopped,
     Failed,
     Degraded,
@@ -28,6 +29,7 @@ impl PipelineRuntimeState {
         match self {
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::ResourceWait => "resource_wait",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Degraded => "degraded",
@@ -46,6 +48,10 @@ pub struct PipelineRuntimeSnapshot {
     pub target_checkpoint_lsn: Option<PgLsn>,
     /// LSN distance, which is a useful byte-oriented estimate of WAL backlog.
     pub estimated_byte_lag: Option<u64>,
+    /// Current durable transaction spool usage, when a runtime reports it.
+    pub spool_bytes: Option<u64>,
+    /// Human-readable reason for a recoverable resource wait. Never used as a metric label.
+    pub resource_wait_reason: Option<String>,
     pub slot_retained_wal_bytes: Option<u64>,
     pub slot_safe_wal_bytes: Option<u64>,
     pub wal_retention_warning: bool,
@@ -99,6 +105,8 @@ impl PipelineTelemetryHandle {
                     source_current_lsn: None,
                     target_checkpoint_lsn: None,
                     estimated_byte_lag: None,
+                    spool_bytes: None,
+                    resource_wait_reason: None,
                     slot_retained_wal_bytes: None,
                     slot_safe_wal_bytes: None,
                     wal_retention_warning: false,
@@ -144,11 +152,36 @@ impl PipelineTelemetryHandle {
             snapshot.started_at = Some(Utc::now());
             snapshot.stopped_at = None;
             snapshot.state = PipelineRuntimeState::Starting;
+            snapshot.resource_wait_reason = None;
         });
     }
 
     pub fn mark_running(&self) {
-        self.with_mut(|snapshot| snapshot.state = PipelineRuntimeState::Running);
+        self.with_mut(|snapshot| {
+            snapshot.state = PipelineRuntimeState::Running;
+            snapshot.resource_wait_reason = None;
+        });
+    }
+
+    /// Marks a recoverable capacity/resource wait while the job remains alive.
+    /// The replication phase is intentionally retained so this cannot be
+    /// mistaken for a rebuild or terminal pipeline failure.
+    pub fn mark_resource_wait(&self, reason: impl Into<String>) {
+        self.with_mut(|snapshot| {
+            snapshot.state = PipelineRuntimeState::ResourceWait;
+            snapshot.stopped_at = None;
+            snapshot.resource_wait_reason = Some(trim_message(reason.into()));
+        });
+    }
+
+    /// Clears a resource wait without disturbing a terminal or stopped state.
+    pub fn clear_resource_wait(&self) {
+        self.with_mut(|snapshot| {
+            if snapshot.state == PipelineRuntimeState::ResourceWait {
+                snapshot.state = PipelineRuntimeState::Running;
+                snapshot.resource_wait_reason = None;
+            }
+        });
     }
 
     pub fn mark_stopped(&self) {
@@ -156,6 +189,7 @@ impl PipelineTelemetryHandle {
             snapshot.state = PipelineRuntimeState::Stopped;
             snapshot.phase = PipelinePhase::Stopped;
             snapshot.stopped_at = Some(Utc::now());
+            snapshot.resource_wait_reason = None;
         });
     }
 
@@ -164,7 +198,8 @@ impl PipelineTelemetryHandle {
             snapshot.state = PipelineRuntimeState::Failed;
             snapshot.phase = PipelinePhase::Failed;
             snapshot.stopped_at = Some(Utc::now());
-            snapshot.last_error = Some(trim_error(error.into()));
+            snapshot.resource_wait_reason = None;
+            snapshot.last_error = Some(trim_message(error.into()));
         });
     }
 
@@ -172,7 +207,8 @@ impl PipelineTelemetryHandle {
         self.with_mut(|snapshot| {
             snapshot.state = PipelineRuntimeState::Degraded;
             snapshot.phase = PipelinePhase::Degraded;
-            snapshot.last_error = Some(trim_error(error.into()));
+            snapshot.resource_wait_reason = None;
+            snapshot.last_error = Some(trim_message(error.into()));
         });
     }
 
@@ -278,18 +314,26 @@ impl PipelineTelemetryHandle {
         });
     }
 
+    pub fn spool_usage_observed(&self, bytes: u64) {
+        self.with_mut(|snapshot| snapshot.spool_bytes = Some(bytes));
+    }
+
     pub fn error(&self, error: impl Into<String>) {
-        self.with_mut(|snapshot| snapshot.last_error = Some(trim_error(error.into())));
+        self.with_mut(|snapshot| snapshot.last_error = Some(trim_message(error.into())));
     }
 }
 
-fn trim_error(mut error: String) -> String {
-    const MAX_ERROR_BYTES: usize = 1024;
-    if error.len() > MAX_ERROR_BYTES {
-        error.truncate(MAX_ERROR_BYTES);
-        error.push_str("...");
+fn trim_message(mut message: String) -> String {
+    const MAX_MESSAGE_BYTES: usize = 1024;
+    if message.len() > MAX_MESSAGE_BYTES {
+        let mut end = MAX_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str("...");
     }
-    error
+    message
 }
 
 #[cfg(test)]
@@ -318,5 +362,57 @@ mod tests {
         assert_eq!(snapshot.slot_retained_wal_bytes, Some(80));
         assert_eq!(snapshot.slot_safe_wal_bytes, Some(20));
         assert!(snapshot.wal_retention_warning);
+    }
+
+    #[test]
+    fn resource_wait_is_recoverable_and_does_not_change_replication_phase() {
+        let telemetry = PipelineTelemetryHandle::new(PipelineId::new());
+        telemetry.mark_started();
+        telemetry.set_phase(PipelinePhase::CatchingUp);
+        telemetry.spool_usage_observed(4096);
+        telemetry.mark_resource_wait("spool capacity exhausted");
+
+        let waiting = telemetry.snapshot();
+        assert_eq!(waiting.state, PipelineRuntimeState::ResourceWait);
+        assert_eq!(waiting.phase, PipelinePhase::CatchingUp);
+        assert_eq!(waiting.spool_bytes, Some(4096));
+        assert_eq!(
+            waiting.resource_wait_reason.as_deref(),
+            Some("spool capacity exhausted")
+        );
+        assert!(waiting.last_error.is_none());
+        assert!(waiting.stopped_at.is_none());
+
+        telemetry.clear_resource_wait();
+        let recovered = telemetry.snapshot();
+        assert_eq!(recovered.state, PipelineRuntimeState::Running);
+        assert_eq!(recovered.phase, PipelinePhase::CatchingUp);
+        assert!(recovered.resource_wait_reason.is_none());
+        assert_eq!(recovered.spool_bytes, Some(4096));
+    }
+
+    #[test]
+    fn terminal_transitions_clear_resource_wait_reason() {
+        let telemetry = PipelineTelemetryHandle::new(PipelineId::new());
+        telemetry.mark_resource_wait("disk unavailable");
+        telemetry.mark_failed("source slot lost");
+
+        let failed = telemetry.snapshot();
+        assert_eq!(failed.state, PipelineRuntimeState::Failed);
+        assert!(failed.resource_wait_reason.is_none());
+        assert_eq!(failed.last_error.as_deref(), Some("source slot lost"));
+    }
+
+    #[test]
+    fn long_multibyte_resource_wait_reason_is_trimmed_safely() {
+        let telemetry = PipelineTelemetryHandle::new(PipelineId::new());
+        telemetry.mark_resource_wait("磁".repeat(400));
+
+        let reason = telemetry
+            .snapshot()
+            .resource_wait_reason
+            .expect("wait reason is recorded");
+        assert!(reason.len() <= 1027);
+        assert!(reason.ends_with("..."));
     }
 }

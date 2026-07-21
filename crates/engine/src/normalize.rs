@@ -1,6 +1,6 @@
 //! Fold pgoutput row events into one current-state staging row per lineage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -51,6 +51,8 @@ pub enum NormalizeError {
     IncompleteInsert { column: String },
     #[error("ambiguous row-change sequence: {0}")]
     AmbiguousSequence(String),
+    #[error("transaction change source failed: {0}")]
+    ChangeSource(String),
 }
 
 /// Normalize changes for exactly one relation and schema generation.
@@ -77,18 +79,22 @@ pub fn normalize_table_batch(
     schema: &TableSchema,
     batch: &TransactionBatch,
 ) -> Result<Vec<StagingRow>, NormalizeError> {
-    let changes = batch.transactions().iter().flat_map(|transaction| {
-        transaction
-            .changes
-            .iter()
-            .filter_map(|change| match change {
-                TransactionChange::Row(change) if change.relation_id == schema.relation_id => {
-                    Some(change)
-                }
-                _ => None,
-            })
-    });
-    normalize_table_changes(schema, changes)
+    let mut changes = Vec::new();
+    for transaction in batch.transactions() {
+        let reader = transaction
+            .change_source
+            .reader()
+            .map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
+        for change in reader {
+            let change = change.map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
+            if let TransactionChange::Row(change) = change
+                && change.relation_id == schema.relation_id
+            {
+                changes.push(change);
+            }
+        }
+    }
+    normalize_table_changes(schema, &changes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -300,7 +306,10 @@ impl<'a> Normalizer<'a> {
                 .get(&final_key)
                 .is_some_and(|other| *other != lineage_index)
             {
-                return Err(self.ambiguous("primary-key update reuses another batch-start key"));
+                let origin_lineage = self.origin_by_key[&final_key];
+                if self.lineages[origin_lineage].current_key.as_ref() == Some(&final_key) {
+                    return Err(self.ambiguous("primary-key update targets another live lineage"));
+                }
             }
             self.current_by_key.remove(&previous_key);
             self.current_by_key.insert(final_key.clone(), lineage_index);
@@ -344,6 +353,16 @@ impl<'a> Normalizer<'a> {
     }
 
     fn finish(mut self) -> Result<Vec<StagingRow>, NormalizeError> {
+        let moved_destinations = self
+            .lineages
+            .iter()
+            .filter_map(
+                |lineage| match (&lineage.origin_key, &lineage.current_key) {
+                    (Some(origin), Some(current)) if origin != current => Some(current.clone()),
+                    _ => None,
+                },
+            )
+            .collect::<HashSet<_>>();
         self.lineages.sort_by_key(|lineage| lineage.first_sequence);
         let lineages = std::mem::take(&mut self.lineages);
         lineages
@@ -361,7 +380,12 @@ impl<'a> Normalizer<'a> {
                     cells: lineage.cells,
                     old_key: Some(origin.cells()),
                 })),
-                (Some(origin), None) if self.current_by_key.contains_key(&origin) => None,
+                (Some(origin), None)
+                    if self.current_by_key.contains_key(&origin)
+                        && !moved_destinations.contains(&origin) =>
+                {
+                    None
+                }
                 (Some(origin), None) => {
                     let mut cells = vec![Cell::UnchangedToast; self.schema.columns.len()];
                     self.write_key(&mut cells, &origin);
@@ -629,6 +653,62 @@ mod tests {
         }
     }
 
+    fn movement(old: &str, new: &str, payload: Cell) -> StagingRow {
+        StagingRow {
+            operation: StageOperation::Move,
+            cells: vec![text(new), payload],
+            old_key: Some(vec![text(old)]),
+        }
+    }
+
+    fn text_value(cell: &Cell) -> String {
+        match cell {
+            Cell::Text(value) => String::from_utf8(value.to_vec()).unwrap(),
+            other => panic!("expected text cell, got {other:?}"),
+        }
+    }
+
+    fn apply_current_state(target: &mut HashMap<String, String>, rows: &[StagingRow]) {
+        let before = target.clone();
+        let materialized_moves = rows
+            .iter()
+            .filter(|row| row.operation == StageOperation::Move)
+            .map(|row| {
+                let old = text_value(&row.old_key.as_ref().unwrap()[0]);
+                let new = text_value(&row.cells[0]);
+                let payload = match &row.cells[1] {
+                    Cell::UnchangedToast => before.get(&old).unwrap().clone(),
+                    cell => text_value(cell),
+                };
+                (old, new, payload)
+            })
+            .collect::<Vec<_>>();
+
+        for row in rows {
+            match row.operation {
+                StageOperation::Delete => {
+                    target.remove(&text_value(&row.cells[0]));
+                }
+                StageOperation::Move => {
+                    target.remove(&text_value(&row.old_key.as_ref().unwrap()[0]));
+                }
+                StageOperation::Upsert => {}
+            }
+        }
+        for (_, new, payload) in materialized_moves {
+            target.insert(new, payload);
+        }
+        for row in rows
+            .iter()
+            .filter(|row| row.operation == StageOperation::Upsert)
+        {
+            let key = text_value(&row.cells[0]);
+            if !matches!(row.cells[1], Cell::UnchangedToast) {
+                target.insert(key, text_value(&row.cells[1]));
+            }
+        }
+    }
+
     #[test]
     fn folds_same_key_sequences_to_the_final_state() {
         let cases = vec![
@@ -805,6 +885,70 @@ mod tests {
     }
 
     #[test]
+    fn move_can_reuse_a_key_released_by_another_batch_start_lineage() {
+        let delete_then_move = [delete("2"), move_key("1", "2", Cell::UnchangedToast)];
+        assert_eq!(
+            normalize_table_changes(&schema(), &delete_then_move).unwrap(),
+            [deletion("2"), movement("1", "2", Cell::UnchangedToast),]
+        );
+
+        let move_chain = [
+            move_key("2", "3", Cell::UnchangedToast),
+            move_key("1", "2", Cell::UnchangedToast),
+        ];
+        assert_eq!(
+            normalize_table_changes(&schema(), &move_chain).unwrap(),
+            [
+                movement("2", "3", Cell::UnchangedToast),
+                movement("1", "2", Cell::UnchangedToast),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapses_a_temporary_key_swap_to_two_batch_start_moves() {
+        let changes = [
+            move_key("1", "9", Cell::UnchangedToast),
+            move_key("2", "1", Cell::UnchangedToast),
+            move_key("9", "2", Cell::UnchangedToast),
+        ];
+        assert_eq!(
+            normalize_table_changes(&schema(), &changes).unwrap(),
+            [
+                movement("1", "2", Cell::UnchangedToast),
+                movement("2", "1", Cell::UnchangedToast),
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_size_does_not_change_delete_move_or_chain_final_state() {
+        let cases = [
+            vec![delete("2"), move_key("1", "2", Cell::UnchangedToast)],
+            vec![
+                move_key("2", "3", Cell::UnchangedToast),
+                move_key("1", "2", Cell::UnchangedToast),
+            ],
+        ];
+
+        for changes in cases {
+            let mut results = Vec::new();
+            for chunk_size in [1, 2] {
+                let mut target = HashMap::from([
+                    ("1".to_owned(), "one".to_owned()),
+                    ("2".to_owned(), "two".to_owned()),
+                ]);
+                for chunk in changes.chunks(chunk_size) {
+                    let rows = normalize_table_changes(&schema(), chunk).unwrap();
+                    apply_current_state(&mut target, &rows);
+                }
+                results.push(target);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
+
+    #[test]
     fn key_only_old_tuples_use_relation_order_and_emit_pk_ordinal_order() {
         let mut composite = schema();
         composite.columns = vec![
@@ -898,7 +1042,10 @@ mod tests {
             Err(NormalizeError::GenerationMismatch { .. })
         ));
 
-        let conflict = [delete("2"), move_key("1", "2", Cell::UnchangedToast)];
+        let conflict = [
+            update("2", Cell::UnchangedToast),
+            move_key("1", "2", Cell::UnchangedToast),
+        ];
         assert!(matches!(
             normalize_table_changes(&schema(), &conflict),
             Err(NormalizeError::AmbiguousSequence(_))

@@ -161,10 +161,10 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
-    let factory = Arc::new(PostgresCloudberryJobFactory::new(
-        Arc::clone(&control),
-        master_key,
-    ));
+    let factory = Arc::new(
+        PostgresCloudberryJobFactory::new(Arc::clone(&control), master_key)
+            .with_spool_root(&config.engine.spool_directory),
+    );
     let engine = &config.engine;
     let reconciler = PipelineReconciler::new(
         control,

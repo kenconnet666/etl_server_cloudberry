@@ -31,6 +31,10 @@ use crate::{
     SourceError, SourceResult,
     ddl::{DDL_MESSAGE_PREFIX, decode_ddl_message},
     publication::start_replication_sql,
+    spool::{
+        ChangeSource, ResourceState, SpoolError, SpoolJournal, SpoolLimits, SpoolWriter,
+        framed_change_bytes,
+    },
 };
 
 const POSTGRES_EPOCH_UNIX_SECONDS: i64 = 946_684_800;
@@ -272,11 +276,49 @@ pub struct CommittedTransaction {
     pub transaction: SourceTransaction,
     /// The commit record LSN. `transaction.final_position.lsn` is the commit end LSN used for ACK.
     pub commit_lsn: PgLsn,
+    /// Change storage is separate from transaction metadata.  For small transactions this points
+    /// at the in-memory changes retained in `transaction`; for spilled transactions the vector is
+    /// empty and the reader streams validated journal frames from disk.
+    pub change_source: ChangeSource,
+}
+
+impl CommittedTransaction {
+    #[must_use]
+    pub fn from_memory(transaction: SourceTransaction, commit_lsn: PgLsn) -> Self {
+        let change_source = ChangeSource::memory(transaction.changes.clone());
+        Self {
+            transaction,
+            commit_lsn,
+            change_source,
+        }
+    }
+
+    /// Idempotently release a spilled transaction after its target checkpoint is durable.
+    pub fn cleanup_spool(&self) -> SourceResult<()> {
+        self.change_source
+            .cleanup()
+            .map_err(|error| SourceError::Spool(error.to_string()))
+    }
+}
+
+impl From<SourceTransaction> for CommittedTransaction {
+    fn from(transaction: SourceTransaction) -> Self {
+        let commit_lsn = transaction.final_position.lsn;
+        Self::from_memory(transaction, commit_lsn)
+    }
+}
+
+impl std::ops::Deref for CommittedTransaction {
+    type Target = SourceTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transaction
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembledEvent {
-    Transaction(CommittedTransaction),
+    Transaction(Box<CommittedTransaction>),
     Keepalive {
         wal_end: PgLsn,
         timestamp_micros: i64,
@@ -291,6 +333,7 @@ struct PendingTransaction {
     begin_time: DateTime<Utc>,
     changes: Vec<TransactionChange>,
     buffered_bytes: usize,
+    spool_writer: Option<SpoolWriter>,
 }
 
 /// Turn decoded pgoutput events into complete, node-scoped source transactions.
@@ -305,6 +348,8 @@ pub struct TransactionAssembler {
     pending: Option<PendingTransaction>,
     last_commit_lsn: Option<PgLsn>,
     relation_generations: HashMap<u32, u64>,
+    spool: Option<SpoolJournal>,
+    resource_wait: Option<ResourceState>,
 }
 
 impl TransactionAssembler {
@@ -316,6 +361,8 @@ impl TransactionAssembler {
             pending: None,
             last_commit_lsn: None,
             relation_generations: HashMap::new(),
+            spool: None,
+            resource_wait: None,
         }
     }
 
@@ -330,6 +377,27 @@ impl TransactionAssembler {
             pending: None,
             last_commit_lsn: None,
             relation_generations: HashMap::new(),
+            spool: None,
+            resource_wait: None,
+        })
+    }
+
+    /// Configure the same assembler to spill once its in-memory watermarks are reached.  The
+    /// legacy constructor remains memory-only for callers that do not yet have a pipeline scope.
+    pub fn with_spool(
+        identity: SourceNodeIdentity,
+        limits: TransactionLimits,
+        journal: SpoolJournal,
+    ) -> SourceResult<Self> {
+        limits.validate()?;
+        Ok(Self {
+            identity,
+            limits,
+            pending: None,
+            last_commit_lsn: None,
+            relation_generations: HashMap::new(),
+            spool: Some(journal),
+            resource_wait: None,
         })
     }
 
@@ -346,6 +414,83 @@ impl TransactionAssembler {
     #[must_use]
     pub fn relation_generation(&self, relation_id: u32) -> Option<u64> {
         self.relation_generations.get(&relation_id).copied()
+    }
+
+    #[must_use]
+    pub fn spool_limits(&self) -> Option<SpoolLimits> {
+        self.spool.as_ref().map(SpoolJournal::limits)
+    }
+
+    /// Check spool capacity before accepting a decoded message.
+    ///
+    /// On the first spill, `additional_bytes` covers every buffered change plus the current
+    /// frame. Once spilling has started, buffered writer bytes not yet reflected in file metadata
+    /// are included as pending usage. Callers can therefore wait without partially consuming the
+    /// message into assembler state.
+    pub fn spool_resource_state(
+        &self,
+        event: &DecodedMessage,
+    ) -> SourceResult<Option<ResourceState>> {
+        let Some(journal) = &self.spool else {
+            return Ok(None);
+        };
+        let Some(pending) = &self.pending else {
+            return Ok(None);
+        };
+        let additional_bytes = match event {
+            DecodedMessage::Commit {
+                commit_lsn,
+                end_lsn,
+                ..
+            } => match &pending.spool_writer {
+                Some(writer) => writer
+                    .finish_additional_bytes(*commit_lsn, *end_lsn)
+                    .map_err(|error| SourceError::Spool(error.to_string()))?,
+                None => return Ok(None),
+            },
+            _ => {
+                let Some(change) = event.to_transaction_change()? else {
+                    return Ok(None);
+                };
+                let duplicate_ddl = matches!(&change, TransactionChange::Ddl(message) if pending
+                    .changes
+                    .iter()
+                    .any(|existing| matches!(existing, TransactionChange::Ddl(previous) if previous == message)));
+                if duplicate_ddl {
+                    return Ok(None);
+                }
+                let bytes = transaction_change_bytes(&change);
+                let over_memory = pending.changes.len() >= self.limits.max_changes
+                    || pending.buffered_bytes.saturating_add(bytes) > self.limits.max_bytes;
+                if pending.spool_writer.is_some() {
+                    framed_change_bytes(&change)
+                        .map_err(|error| SourceError::Spool(error.to_string()))?
+                } else if over_memory {
+                    pending
+                        .changes
+                        .iter()
+                        .chain(std::iter::once(&change))
+                        .try_fold(0_u64, |total, buffered| {
+                            framed_change_bytes(buffered).map(|bytes| total.saturating_add(bytes))
+                        })
+                        .map_err(|error| SourceError::Spool(error.to_string()))?
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        journal
+            .resource_state(additional_bytes)
+            .map(Some)
+            .map_err(|error| SourceError::Spool(error.to_string()))
+    }
+
+    /// Return and clear a recoverable capacity failure raised after preflight (for example,
+    /// ENOSPC between the check and the write). The decoded message was not committed to the
+    /// assembler and may be retried unchanged.
+    pub fn take_resource_wait(&mut self) -> Option<ResourceState> {
+        self.resource_wait.take()
     }
 
     pub fn push(&mut self, event: DecodedMessage) -> SourceResult<Option<AssembledEvent>> {
@@ -375,10 +520,10 @@ impl TransactionAssembler {
                     ));
                 }
                 if let Some(previous) = self.last_commit_lsn
-                    && final_lsn < previous
+                    && final_lsn <= previous
                 {
                     return Err(SourceError::ReplicationProtocol(format!(
-                        "BEGIN final LSN {} moved behind committed LSN {}",
+                        "BEGIN final LSN {} did not advance beyond committed LSN {}",
                         final_lsn, previous
                     )));
                 }
@@ -388,6 +533,7 @@ impl TransactionAssembler {
                     begin_time: timestamp,
                     changes: Vec::new(),
                     buffered_bytes: 0,
+                    spool_writer: None,
                 });
                 Ok(None)
             }
@@ -427,22 +573,58 @@ impl TransactionAssembler {
                 {
                     return Ok(None);
                 }
-                let pending = self.pending.as_mut().expect("checked above");
-                if pending.changes.len() >= self.limits.max_changes {
-                    return Err(SourceError::unsupported(format!(
-                        "transaction {} exceeds {} changes; streaming protocol is unavailable",
-                        pending.xid, self.limits.max_changes
-                    )));
-                }
                 let bytes = transaction_change_bytes(&change);
-                if pending.buffered_bytes.saturating_add(bytes) > self.limits.max_bytes {
-                    return Err(SourceError::unsupported(format!(
-                        "transaction {} exceeds {} buffered bytes; streaming protocol is unavailable",
-                        pending.xid, self.limits.max_bytes
-                    )));
+                let over_memory = self.pending.as_ref().is_some_and(|pending| {
+                    pending.changes.len() >= self.limits.max_changes
+                        || pending.buffered_bytes.saturating_add(bytes) > self.limits.max_bytes
+                });
+                if over_memory
+                    && self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.spool_writer.is_none())
+                {
+                    let pending = self.pending.as_ref().expect("checked above");
+                    let journal = self.spool.as_ref().ok_or_else(|| {
+                        SourceError::unsupported(format!(
+                            "transaction {} requires a spool; configure transaction spool settings",
+                            pending.xid
+                        ))
+                    })?;
+                    let mut writer = match journal.begin(pending.xid, pending.begin_lsn) {
+                        Ok(writer) => writer,
+                        Err(error) => return Err(self.record_spool_error(error)),
+                    };
+                    for buffered in &pending.changes {
+                        if let Err(error) = writer.append(buffered) {
+                            if let Err(abort) = writer.abort() {
+                                return Err(self.record_spool_error(abort));
+                            }
+                            return Err(self.record_spool_error(error));
+                        }
+                    }
+                    if let Err(error) = writer.append(&change) {
+                        if let Err(abort) = writer.abort() {
+                            return Err(self.record_spool_error(abort));
+                        }
+                        return Err(self.record_spool_error(error));
+                    }
+                    let pending = self.pending.as_mut().expect("checked above");
+                    pending.changes.clear();
+                    pending.spool_writer = Some(writer);
+                    pending.buffered_bytes = 0;
+                    return Ok(None);
                 }
-                pending.buffered_bytes = pending.buffered_bytes.saturating_add(bytes);
-                pending.changes.push(change);
+                let pending = self.pending.as_mut().expect("checked above");
+                if let Some(writer) = pending.spool_writer.as_mut() {
+                    let result = writer.append(&change);
+                    if let Err(error) = result {
+                        return Err(self.record_spool_error(error));
+                    }
+                } else {
+                    pending.buffered_bytes = pending.buffered_bytes.saturating_add(bytes);
+                    pending.changes.push(change);
+                }
                 Ok(None)
             }
         }
@@ -497,14 +679,14 @@ impl TransactionAssembler {
             )));
         }
         if let Some(previous) = self.last_commit_lsn
-            && end_lsn < previous
+            && end_lsn <= previous
         {
             return Err(SourceError::ReplicationProtocol(format!(
-                "commit LSN {} moved backwards from {}",
+                "commit LSN {} did not advance beyond {}",
                 end_lsn, previous
             )));
         }
-        let pending = self.pending.take().ok_or_else(|| {
+        let pending = self.pending.as_ref().ok_or_else(|| {
             SourceError::ReplicationProtocol("COMMIT arrived without BEGIN".to_owned())
         })?;
         if pending.begin_lsn > end_lsn {
@@ -519,16 +701,57 @@ impl TransactionAssembler {
                 pending.xid
             )));
         }
-        self.last_commit_lsn = Some(end_lsn);
-        Ok(Some(AssembledEvent::Transaction(CommittedTransaction {
-            transaction: SourceTransaction {
-                xid: pending.xid,
-                commit_time: timestamp,
-                final_position: self.identity.position(end_lsn),
-                changes: pending.changes,
+        let spool_handle = match self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.spool_writer.as_mut())
+        {
+            Some(writer) => match writer.finish(commit_lsn, end_lsn) {
+                Ok(handle) => Some(handle),
+                Err(error) => return Err(self.record_spool_error(error)),
             },
-            commit_lsn,
-        })))
+            None => None,
+        };
+        let pending = self.pending.take().expect("validated above");
+        self.last_commit_lsn = Some(end_lsn);
+        let final_position = self.identity.position(end_lsn);
+        let (changes, change_source) = match spool_handle {
+            Some(handle) => (Vec::new(), ChangeSource::Spool(handle)),
+            None => {
+                let source = ChangeSource::memory(pending.changes.clone());
+                (pending.changes, source)
+            }
+        };
+        Ok(Some(AssembledEvent::Transaction(Box::new(
+            CommittedTransaction {
+                transaction: SourceTransaction {
+                    xid: pending.xid,
+                    commit_time: timestamp,
+                    final_position,
+                    changes,
+                },
+                commit_lsn,
+                change_source,
+            },
+        ))))
+    }
+
+    fn record_spool_error(&mut self, error: SpoolError) -> SourceError {
+        self.resource_wait = match &error {
+            SpoolError::ResourceWait {
+                used,
+                high,
+                free,
+                minimum,
+            } => Some(ResourceState::Wait {
+                used_bytes: *used,
+                disk_high_water_bytes: *high,
+                free_bytes: *free,
+                minimum_free_disk_bytes: *minimum,
+            }),
+            _ => None,
+        };
+        SourceError::Spool(error.to_string())
     }
 }
 
@@ -902,6 +1125,14 @@ pub fn parse_logical_payload(payload: Bytes) -> SourceResult<LogicalReplicationM
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use cloudberry_etl_core::id::PipelineId;
+    use uuid::Uuid;
+
     use super::*;
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
@@ -944,6 +1175,44 @@ mod tests {
             timestamp: timestamp(2),
             flags: 0,
         }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pg2cb-wal-{label}-{}", Uuid::new_v4()))
+    }
+
+    fn spooling_assembler(root: &Path, disk_high_water_bytes: u64) -> TransactionAssembler {
+        let identity = SourceNodeIdentity {
+            node_id: 7,
+            system_identifier: 99,
+            timeline: 3,
+        };
+        let journal = SpoolJournal::open(
+            root,
+            crate::spool::SpoolIdentity {
+                pipeline_id: PipelineId::new(),
+                topology_generation: 1,
+                node_id: identity.node_id,
+                system_identifier: identity.system_identifier,
+                timeline: identity.timeline,
+            },
+            SpoolLimits {
+                memory_high_water_bytes: 1,
+                segment_target_bytes: usize::try_from(disk_high_water_bytes).unwrap(),
+                disk_high_water_bytes,
+                minimum_free_disk_bytes: 1,
+            },
+        )
+        .unwrap();
+        TransactionAssembler::with_spool(
+            identity,
+            TransactionLimits {
+                max_changes: 1,
+                max_bytes: usize::MAX,
+            },
+            journal,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1068,6 +1337,131 @@ mod tests {
     }
 
     #[test]
+    fn first_spill_preflight_counts_buffered_and_current_frames() {
+        let root = temp_root("preflight");
+        let event = insert(42, 1);
+        let frame_bytes =
+            framed_change_bytes(&event.to_transaction_change().unwrap().unwrap()).unwrap();
+        let mut assembler = spooling_assembler(&root, frame_bytes);
+        assembler
+            .push(DecodedMessage::Relation(relation(42, 1)))
+            .unwrap();
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(event.clone()).unwrap();
+
+        assert!(matches!(
+            assembler.spool_resource_state(&event).unwrap(),
+            Some(ResourceState::Wait { used_bytes: 0, .. })
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tiny_memory_watermark_spills_and_streams_every_change() {
+        let root = temp_root("spill");
+        let mut assembler = spooling_assembler(&root, 1024 * 1024);
+        assembler
+            .push(DecodedMessage::Relation(relation(42, 1)))
+            .unwrap();
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(20, 21)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        assert!(committed.transaction.changes.is_empty());
+        assert!(matches!(committed.change_source, ChangeSource::Spool(_)));
+        assert_eq!(
+            committed
+                .change_source
+                .reader()
+                .unwrap()
+                .collect::<crate::spool::SpoolResult<Vec<_>>>()
+                .unwrap()
+                .len(),
+            2
+        );
+        committed.cleanup_spool().unwrap();
+        committed.cleanup_spool().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capacity_failure_rolls_back_frame_and_allows_same_change_retry() {
+        let root = temp_root("retry");
+        let mut assembler = spooling_assembler(&root, 1024 * 1024);
+        assembler
+            .push(DecodedMessage::Relation(relation(42, 1)))
+            .unwrap();
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        assembler
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.spool_writer.as_mut())
+            .unwrap()
+            .inject_next_append_capacity_failure();
+
+        let retry = insert(42, 1);
+        assert!(assembler.push(retry.clone()).is_err());
+        assert!(matches!(
+            assembler.take_resource_wait(),
+            Some(ResourceState::Wait { .. })
+        ));
+        assembler.push(retry).unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(20, 21)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        assert_eq!(
+            committed
+                .change_source
+                .reader()
+                .unwrap()
+                .collect::<crate::spool::SpoolResult<Vec<_>>>()
+                .unwrap()
+                .len(),
+            3
+        );
+        committed.cleanup_spool().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_capacity_failure_keeps_transaction_open_for_commit_retry() {
+        let root = temp_root("commit-retry");
+        let mut assembler = spooling_assembler(&root, 1024 * 1024);
+        assembler
+            .push(DecodedMessage::Relation(relation(42, 1)))
+            .unwrap();
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        assembler
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.spool_writer.as_mut())
+            .unwrap()
+            .inject_next_finish_capacity_failure();
+
+        let commit = commit(20, 21);
+        assert!(assembler.push(commit.clone()).is_err());
+        assert_eq!(assembler.pending_xid(), Some(11));
+        assert!(matches!(
+            assembler.take_resource_wait(),
+            Some(ResourceState::Wait { .. })
+        ));
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit).unwrap() else {
+            panic!("retried commit did not produce a transaction");
+        };
+        assert_eq!(committed.change_source.change_count(), 2);
+        committed.cleanup_spool().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn assembler_rejects_invalid_sequence_and_lsn_regression() {
         let identity = SourceNodeIdentity {
             node_id: 1,
@@ -1079,7 +1473,8 @@ mod tests {
         assert!(assembler.push(begin(2, 1)).unwrap().is_none());
         assert!(assembler.push(begin(3, 2)).is_err());
         assert!(assembler.push(commit(4, 5)).unwrap().is_some());
-        assert!(assembler.push(begin(5, 2)).unwrap().is_none());
+        assert!(assembler.push(begin(5, 2)).is_err());
+        assert!(assembler.push(begin(6, 2)).unwrap().is_none());
         assert!(assembler.push(commit(3, 3)).is_err());
     }
 
