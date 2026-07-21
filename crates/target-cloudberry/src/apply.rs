@@ -23,6 +23,7 @@ use crate::{
         record_data_chunk, register_transaction_progress,
     },
     copy::{CopyEncodeError, encode_row},
+    managed::{ManagedTableError, TableApplyIdentity, lock_active_apply_tables},
     schema::{CreateTablePlan, SchemaError, plan_create_table, quote_identifier_list},
     sql::{SqlRenderError, quote_identifier, quote_literal, quote_qualified_name},
 };
@@ -45,6 +46,8 @@ pub enum ApplyError {
     ChunkLedger(#[from] ChunkLedgerError),
     #[error(transparent)]
     Copy(#[from] CopyEncodeError),
+    #[error(transparent)]
+    ManagedTable(#[from] ManagedTableError),
     #[error("staging row has {actual} data cells, expected {expected}")]
     InvalidRowArity { expected: usize, actual: usize },
     #[error("primary-key column `{0}` is NULL or unchanged")]
@@ -59,6 +62,8 @@ pub enum ApplyError {
     MissingOldPrimaryKeyColumn(String),
     #[error("staging name `{0}` is repeated in one target transaction")]
     DuplicateStagingName(String),
+    #[error("apply identity target `{identity}` does not match plan target `{plan}`")]
+    IdentityTargetMismatch { identity: String, plan: String },
     #[error("Cloudberry rejected an invalid or non-collapsed staging batch for {0}")]
     InvalidBatch(String),
     #[error("empty transaction apply received a manifest with {record_count} records")]
@@ -127,6 +132,7 @@ pub struct StagingRow {
 
 #[derive(Debug, Clone)]
 pub struct TableApplyBatch {
+    pub identity: Arc<TableApplyIdentity>,
     pub plan: Arc<ApplyPlan>,
     pub rows: Vec<StagingRow>,
 }
@@ -216,7 +222,8 @@ pub async fn execute_apply(
 ) -> Result<ApplyOutcome, ApplyError> {
     validate_request(request)?;
     let transaction = client.transaction().await?;
-    lock_pipeline_fence(&transaction, request.fence).await?;
+    let identities = table_identities(&request.tables);
+    lock_active_apply_tables(&transaction, request.fence, &identities).await?;
     let stats = apply_tables(&transaction, &request.tables).await?;
     let checkpoint =
         advance_node_checkpoint(&transaction, request.fence, &request.checkpoint).await?;
@@ -252,6 +259,8 @@ pub async fn execute_ledgered_data_chunk(
     match prepared {
         PrepareDataChunkOutcome::Apply(prepared) => {
             let next_seq = prepared.next_seq();
+            let identities = table_identities(&request.tables);
+            lock_active_apply_tables(&transaction, request.fence, &identities).await?;
             record_data_chunk(&transaction, prepared).await?;
             let stats = apply_tables(&transaction, &request.tables).await?;
             finish_ledgered_data_chunk(
@@ -470,6 +479,12 @@ fn validate_request(request: &ApplyRequest) -> Result<(), ApplyError> {
 fn validate_tables(tables: &[TableApplyBatch]) -> Result<(), ApplyError> {
     let mut staging_names = HashSet::new();
     for table in tables {
+        if table.identity.target != table.plan.table.target {
+            return Err(ApplyError::IdentityTargetMismatch {
+                identity: table.identity.target.to_string(),
+                plan: table.plan.table.target.to_string(),
+            });
+        }
         if !staging_names.insert(&table.plan.staging_name) {
             return Err(ApplyError::DuplicateStagingName(
                 table.plan.staging_name.clone(),
@@ -477,6 +492,14 @@ fn validate_tables(tables: &[TableApplyBatch]) -> Result<(), ApplyError> {
         }
     }
     Ok(())
+}
+
+fn table_identities(tables: &[TableApplyBatch]) -> Vec<&TableApplyIdentity> {
+    tables
+        .iter()
+        .filter(|table| !table.rows.is_empty())
+        .map(|table| table.identity.as_ref())
+        .collect()
 }
 
 async fn apply_tables(
@@ -1000,6 +1023,33 @@ mod tests {
             plan.validation_sql
                 .contains("r.\"__pg2cb_old_2\" = s.\"id\"")
         );
+    }
+
+    #[test]
+    fn apply_batch_identity_must_name_the_planned_target() {
+        let source = table(vec![column(1, "id", Some(1))]);
+        let plan = Arc::new(
+            plan_apply(
+                &source,
+                QualifiedName::new("target", "orders").unwrap(),
+                "stage_orders",
+            )
+            .unwrap(),
+        );
+        let identity = Arc::new(TableApplyIdentity {
+            target: QualifiedName::new("target", "other").unwrap(),
+            source_relation_id: source.relation_id,
+            table_generation: 1,
+            schema_fingerprint: "sha256:test".to_owned(),
+        });
+        assert!(matches!(
+            validate_tables(&[TableApplyBatch {
+                identity,
+                plan,
+                rows: Vec::new(),
+            }]),
+            Err(ApplyError::IdentityTargetMismatch { .. })
+        ));
     }
 
     #[test]

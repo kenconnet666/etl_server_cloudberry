@@ -111,7 +111,7 @@ pub enum ManagedTableError {
 pub async fn lock_active_apply_tables(
     transaction: &Transaction<'_>,
     fence: PipelineFence,
-    identities: &[TableApplyIdentity],
+    identities: &[&TableApplyIdentity],
 ) -> Result<(), ManagedTableError> {
     let ordered = validate_and_order_identities(identities)?;
     lock_pipeline_fence(transaction, fence).await?;
@@ -127,7 +127,7 @@ pub async fn lock_active_apply_table(
     fence: PipelineFence,
     identity: &TableApplyIdentity,
 ) -> Result<(), ManagedTableError> {
-    lock_active_apply_tables(transaction, fence, std::slice::from_ref(identity)).await
+    lock_active_apply_tables(transaction, fence, &[identity]).await
 }
 
 async fn lock_active_apply_table_after_fence(
@@ -172,13 +172,13 @@ struct StoredManagedTableIdentity {
     fencing_token: i64,
 }
 
-fn validate_and_order_identities(
-    identities: &[TableApplyIdentity],
-) -> Result<Vec<&TableApplyIdentity>, ManagedTableError> {
+fn validate_and_order_identities<'a>(
+    identities: &[&'a TableApplyIdentity],
+) -> Result<Vec<&'a TableApplyIdentity>, ManagedTableError> {
     for identity in identities {
         validate_input_identity(identity)?;
     }
-    let mut ordered = identities.iter().collect::<Vec<_>>();
+    let mut ordered = identities.to_vec();
     ordered.sort_by(|left, right| {
         (&left.target.schema, &left.target.name).cmp(&(&right.target.schema, &right.target.name))
     });
@@ -368,7 +368,8 @@ mod tests {
 
     #[test]
     fn identities_are_sorted_and_duplicate_targets_fail_closed() {
-        let identities = vec![identity("z", "b"), identity("a", "z"), identity("a", "a")];
+        let identities = [identity("z", "b"), identity("a", "z"), identity("a", "a")];
+        let identities = identities.iter().collect::<Vec<_>>();
         let ordered = validate_and_order_identities(&identities).unwrap();
         let names = ordered
             .iter()
@@ -376,7 +377,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["a.a", "a.z", "z.b"]);
 
-        let duplicate = vec![identity("a", "same"), identity("a", "same")];
+        let duplicate = [identity("a", "same"), identity("a", "same")];
+        let duplicate = duplicate.iter().collect::<Vec<_>>();
         assert!(matches!(
             validate_and_order_identities(&duplicate),
             Err(ManagedTableError::DuplicateTarget(table)) if table == "a.same"

@@ -23,6 +23,7 @@ use cloudberry_etl_target_cloudberry::{
         load_node_checkpoint,
     },
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
+    managed::{ManagedTableError, TableApplyIdentity},
     migration::migrate_target_database,
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyMode,
@@ -33,6 +34,8 @@ use cloudberry_etl_target_cloudberry::{
 };
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
+
+const APPLY_SCHEMA_FINGERPRINT: &str = "sha256:cloudberry21-typed-apply-v1";
 
 #[tokio::test]
 #[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
@@ -535,6 +538,7 @@ async fn run_test(
         fencing_token: 1,
     };
     activate_pipeline_fence(client, fence).await?;
+    register_managed_apply_table(client, fence, &source, &plan.table.target).await?;
 
     let initial = request(
         fence,
@@ -592,6 +596,37 @@ async fn run_test(
         },
         tables: chunk.tables.clone(),
     };
+    client
+        .execute(
+            "UPDATE pg2cb_meta.managed_tables SET schema_fingerprint = 'sha256:drifted' WHERE target_schema = $1 AND target_table = $2",
+            &[&target_schema, &"items"],
+        )
+        .await?;
+    assert!(matches!(
+        execute_ledgered_data_chunk(client, &data_chunk).await,
+        Err(ApplyError::ManagedTable(
+            ManagedTableError::SchemaFingerprintMismatch(_)
+        ))
+    ));
+    assert_eq!(
+        row(client, target_schema, 1).await?,
+        Some(("before".into(), 10))
+    );
+    assert_eq!(ledger_counts(client, manifest.key).await?, (0, 0));
+    assert_eq!(
+        load_node_checkpoint(client, chunk.checkpoint.key)
+            .await?
+            .expect("failed identity guard must preserve the previous checkpoint")
+            .checkpoint
+            .applied_lsn,
+        PgLsn::new(100)
+    );
+    client
+        .execute(
+            "UPDATE pg2cb_meta.managed_tables SET schema_fingerprint = $3 WHERE target_schema = $1 AND target_table = $2",
+            &[&target_schema, &"items", &APPLY_SCHEMA_FINGERPRINT],
+        )
+        .await?;
     assert!(matches!(
         execute_ledgered_data_chunk(client, &data_chunk).await?,
         LedgeredDataChunkOutcome::Completed {
@@ -868,10 +903,51 @@ fn request_rows(
             applied_lsn: PgLsn::new(lsn),
         },
         tables: vec![TableApplyBatch {
+            identity: Arc::new(TableApplyIdentity {
+                target: plan.table.target.clone(),
+                source_relation_id: 42,
+                table_generation: fence.topology_generation,
+                schema_fingerprint: APPLY_SCHEMA_FINGERPRINT.to_owned(),
+            }),
             plan: Arc::new(plan.clone()),
             rows,
         }],
     }
+}
+
+async fn register_managed_apply_table(
+    client: &Client,
+    fence: PipelineFence,
+    source: &TableSchema,
+    target: &QualifiedName,
+) -> Result<(), tokio_postgres::Error> {
+    let relation_oid: i64 = client
+        .query_one(
+            "SELECT c.oid::bigint FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')",
+            &[&target.schema, &target.name],
+        )
+        .await?
+        .get(0);
+    let pipeline_id = fence.pipeline_id.as_uuid();
+    let source_relation_id = i64::from(source.relation_id);
+    let table_generation = i64::try_from(fence.topology_generation)
+        .expect("integration topology generation fits target bigint");
+    client
+        .execute(
+            "INSERT INTO pg2cb_meta.managed_tables (target_schema, target_table, pipeline_id, relation_oid, source_relation_id, table_generation, schema_fingerprint, state, fencing_token) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)",
+            &[
+                &target.schema,
+                &target.name,
+                &pipeline_id,
+                &relation_oid,
+                &source_relation_id,
+                &table_generation,
+                &APPLY_SCHEMA_FINGERPRINT,
+                &fence.fencing_token,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 async fn row(

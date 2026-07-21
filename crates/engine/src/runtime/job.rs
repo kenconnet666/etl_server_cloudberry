@@ -523,6 +523,8 @@ impl PostgresCloudberryJob {
                         table.planned.source.clone(),
                         table.planned.target.clone(),
                         table.planned.staging_name.clone(),
+                        self.topology_generation,
+                        table.planned.schema_fingerprint.clone(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,

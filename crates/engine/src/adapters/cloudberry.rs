@@ -22,6 +22,7 @@ use cloudberry_etl_target_cloudberry::{
     },
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
+    managed::TableApplyIdentity,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -54,6 +55,10 @@ pub enum AdapterConfigError {
     InvalidSlotName,
     #[error("invalid target chunk limits: {0}")]
     InvalidChunkLimits(String),
+    #[error("table generation {0} exceeds the target bigint range")]
+    InvalidTableGeneration(u64),
+    #[error("table schema fingerprint cannot be empty or contain NUL")]
+    InvalidSchemaFingerprint,
 }
 
 /// Source schema selection used to decide whether a transactional DDL event requires a rebuild.
@@ -106,6 +111,7 @@ impl DdlScope {
 #[derive(Debug, Clone)]
 pub struct TableBinding {
     schema: TableSchema,
+    identity: Arc<TableApplyIdentity>,
     plan: Arc<ApplyPlan>,
 }
 
@@ -114,11 +120,27 @@ impl TableBinding {
         schema: TableSchema,
         target: QualifiedName,
         staging_name: impl Into<String>,
+        table_generation: u64,
+        schema_fingerprint: impl Into<String>,
     ) -> Result<Self, AdapterConfigError> {
+        if i64::try_from(table_generation).is_err() {
+            return Err(AdapterConfigError::InvalidTableGeneration(table_generation));
+        }
+        let schema_fingerprint = schema_fingerprint.into();
+        if schema_fingerprint.is_empty() || schema_fingerprint.contains('\0') {
+            return Err(AdapterConfigError::InvalidSchemaFingerprint);
+        }
         let staging_name = staging_name.into();
+        let identity = Arc::new(TableApplyIdentity {
+            target: target.clone(),
+            source_relation_id: schema.relation_id,
+            table_generation,
+            schema_fingerprint,
+        });
         let plan = plan_apply(&schema, target, &staging_name)?;
         Ok(Self {
             schema,
+            identity,
             plan: Arc::new(plan),
         })
     }
@@ -131,6 +153,11 @@ impl TableBinding {
     #[must_use]
     pub fn plan(&self) -> &Arc<ApplyPlan> {
         &self.plan
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &Arc<TableApplyIdentity> {
+        &self.identity
     }
 
     const fn key(&self) -> (u32, u64) {
@@ -265,6 +292,7 @@ fn build_table_apply_batches<'a>(
         let rows = normalize_table_changes(binding.schema(), changes)?;
         if !rows.is_empty() {
             tables.push(TableApplyBatch {
+                identity: Arc::clone(binding.identity()),
                 plan: Arc::clone(binding.plan()),
                 rows,
             });
@@ -731,6 +759,8 @@ mod tests {
             schema(relation_id, generation, source_name),
             QualifiedName::new("target", target_name).unwrap(),
             staging_name,
+            4,
+            format!("sha256:test-{relation_id}"),
         )
         .unwrap()
     }
@@ -753,6 +783,16 @@ mod tests {
             &request.tables[0].plan,
             registry.get(7, 3).unwrap().plan()
         ));
+        assert!(Arc::ptr_eq(
+            &request.tables[0].identity,
+            registry.get(7, 3).unwrap().identity()
+        ));
+        assert_eq!(request.tables[0].identity.source_relation_id, 7);
+        assert_eq!(request.tables[0].identity.table_generation, 4);
+        assert_eq!(
+            request.tables[0].identity.schema_fingerprint,
+            "sha256:test-7"
+        );
         assert_eq!(request.tables[0].rows[0].cells, [text("1"), text("a")]);
         assert_eq!(request.checkpoint.key.pipeline_id, fence.pipeline_id);
         assert_eq!(request.checkpoint.key.topology_generation, 4);
@@ -1100,6 +1140,35 @@ mod tests {
         assert!(matches!(
             duplicate_staging,
             Err(AdapterConfigError::DuplicateStagingName(_))
+        ));
+    }
+
+    #[test]
+    fn binding_rejects_unpersistable_managed_table_identity() {
+        let target = || QualifiedName::new("target", "items").unwrap();
+        assert!(matches!(
+            TableBinding::new(
+                schema(7, 3, "items"),
+                target(),
+                "stage_items",
+                u64::MAX,
+                "sha256:test"
+            ),
+            Err(AdapterConfigError::InvalidTableGeneration(u64::MAX))
+        ));
+        assert!(matches!(
+            TableBinding::new(schema(7, 3, "items"), target(), "stage_items", 4, ""),
+            Err(AdapterConfigError::InvalidSchemaFingerprint)
+        ));
+        assert!(matches!(
+            TableBinding::new(
+                schema(7, 3, "items"),
+                target(),
+                "stage_items",
+                4,
+                "sha256:test\0invalid"
+            ),
+            Err(AdapterConfigError::InvalidSchemaFingerprint)
         ));
     }
 }
