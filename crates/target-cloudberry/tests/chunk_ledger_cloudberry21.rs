@@ -1,6 +1,6 @@
 //! Opt-in durable chunk ledger coverage against Apache Cloudberry 2.1.
 
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use cloudberry_etl_core::{id::PipelineId, lsn::PgLsn};
 use cloudberry_etl_target_cloudberry::{
@@ -20,6 +20,7 @@ use cloudberry_etl_target_cloudberry::{
     },
     migration::migrate_target_database,
 };
+use tokio::sync::Barrier;
 use tokio_postgres::{Client, NoTls};
 
 #[tokio::test]
@@ -244,6 +245,101 @@ async fn cloudberry21_chunk_ledger_replays_and_completes_exactly() -> Result<(),
 
     cleanup(&client, fence.pipeline_id).await;
     connection_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_concurrent_final_chunk_commits_exactly_once() -> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (mut first_client, first_connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let first_connection_task = tokio::spawn(async move {
+        if let Err(error) = first_connection.await {
+            eprintln!("first concurrent Cloudberry connection ended: {error}");
+        }
+    });
+    let (mut second_client, second_connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let second_connection_task = tokio::spawn(async move {
+        if let Err(error) = second_connection.await {
+            eprintln!("second concurrent Cloudberry connection ended: {error}");
+        }
+    });
+
+    migrate_target_database(&mut first_client).await?;
+    let fence = PipelineFence {
+        pipeline_id: PipelineId::new(),
+        topology_generation: 1,
+        fencing_token: 1,
+    };
+    activate_pipeline_fence(&first_client, fence).await?;
+    let mut manifest = manifest(fence);
+    manifest.record_count = 1;
+    manifest.manifest_digest = [0xC1; 32];
+    let request = LedgeredDataChunkRequest {
+        fence,
+        manifest: manifest.clone(),
+        chunk: chunk(0, 1, 0xC2),
+        tables: Vec::new(),
+    };
+    let barrier = Arc::new(Barrier::new(2));
+
+    let first_barrier = Arc::clone(&barrier);
+    let first_request = request.clone();
+    let first = async move {
+        first_barrier.wait().await;
+        let outcome = execute_ledgered_data_chunk(&mut first_client, &first_request).await;
+        (first_client, outcome)
+    };
+    let second_barrier = Arc::clone(&barrier);
+    let second = async move {
+        second_barrier.wait().await;
+        let outcome = execute_ledgered_data_chunk(&mut second_client, &request).await;
+        (second_client, outcome)
+    };
+    let ((verifier, first_outcome), (_second_client, second_outcome)) = tokio::join!(first, second);
+    let outcomes = [first_outcome?, second_outcome?];
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    LedgeredDataChunkOutcome::Completed {
+                        next_seq: 1,
+                        disposition: DataChunkDisposition::Applied { stats },
+                        checkpoint: AdvanceOutcome::Inserted,
+                    } if *stats == Default::default()
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    LedgeredDataChunkOutcome::AlreadyCheckpointed { applied_lsn }
+                        if *applied_lsn == manifest.key.end_lsn
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        load_node_checkpoint(&verifier, checkpoint(&manifest).key)
+            .await?
+            .expect("one concurrent final chunk must publish the checkpoint")
+            .checkpoint,
+        checkpoint(&manifest)
+    );
+    assert_eq!(ledger_counts(&verifier, manifest.key).await?, (0, 0));
+
+    cleanup(&verifier, fence.pipeline_id).await;
+    first_connection_task.abort();
+    second_connection_task.abort();
     Ok(())
 }
 
