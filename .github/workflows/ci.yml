@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master, main]
 
 permissions:
   contents: read
@@ -37,6 +37,12 @@ jobs:
       - name: Web dependencies
         working-directory: web
         run: npm ci
+      - name: Web checks
+        working-directory: web
+        run: npm run check
+      - name: Web tests
+        working-directory: web
+        run: npm test
       - name: Web build
         working-directory: web
         run: npm run build
@@ -73,7 +79,10 @@ jobs:
       - name: PostgreSQL 18 integration tests
         env:
           PG2CB_TEST_SOURCE_DSN: postgresql://postgres:pg2cb_test_only@127.0.0.1:55432/source
-        run: cargo test --locked -p cloudberry-etl-source-postgres --test postgres18 -- --ignored --test-threads=1
+          PG2CB_TEST_CONTROL_DSN: postgresql://postgres:pg2cb_test_only@127.0.0.1:55432/source
+        run: |
+          cargo test --locked -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored --test-threads=1
+          cargo test --locked -p cloudberry-etl-source-postgres --test postgres18 --test snapshot_copy_pg18 --test snapshot_slot_pg18 -- --ignored --test-threads=1
       - name: Stop PostgreSQL 18
         if: always()
         run: docker stop pg2cb-ci-pg18 || true

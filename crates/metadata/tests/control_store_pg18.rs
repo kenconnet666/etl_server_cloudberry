@@ -92,13 +92,13 @@ fn build_test_pool(config: tokio_postgres::Config) -> Result<Pool, deadpool_post
             recycling_method: RecyclingMethod::Verified,
         },
     );
-    Ok(Pool::builder(manager)
+    Pool::builder(manager)
         .max_size(1)
         .runtime(Runtime::Tokio1)
         .wait_timeout(Some(Duration::from_secs(5)))
         .create_timeout(Some(Duration::from_secs(5)))
         .recycle_timeout(Some(Duration::from_secs(5)))
-        .build()?)
+        .build()
 }
 
 struct TestIds {

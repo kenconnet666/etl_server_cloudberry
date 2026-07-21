@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Keep this file LF-only; it is invoked directly by WSL from Windows checkouts.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

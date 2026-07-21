@@ -34,7 +34,7 @@ A successful cluster is deliberately left running.
 After the verifier leaves the cluster running, execute the opt-in source adapter test from WSL:
 
 ```sh
-cd /mnt/c/Users/lionheart/IdeaProjects/etl_server_cloudberry
+cd /mnt/c/code/etl_server_cloudberry
 export PG2CB_TEST_CITUS_COORDINATOR_DSN='postgresql://postgres:pg2cb_citus_test_only@127.0.0.1:55440/source?sslmode=disable'
 export PG2CB_TEST_CITUS_WORKER1_DSN='postgresql://postgres:pg2cb_citus_test_only@127.0.0.1:55441/source?sslmode=disable'
 export PG2CB_TEST_CITUS_WORKER2_DSN='postgresql://postgres:pg2cb_citus_test_only@127.0.0.1:55442/source?sslmode=disable'
