@@ -2,6 +2,7 @@ pub mod apply;
 pub mod checkpoint;
 pub mod chunk;
 pub mod copy;
+pub mod managed;
 pub mod migration;
 pub mod schema;
 pub mod snapshot;
