@@ -28,8 +28,9 @@ use cloudberry_etl_target_cloudberry::{
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyMode,
         SnapshotApplyOutcome, SnapshotGroupRegistrationDisposition, SnapshotOwnership,
-        SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group, begin_snapshot_apply,
-        begin_snapshot_group, plan_snapshot_target, validate_active_snapshot_group,
+        SnapshotPageApplyOutcome, SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group,
+        begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages, plan_snapshot_target,
+        validate_active_snapshot_group,
     },
 };
 use tokio_postgres::{Client, NoTls};
@@ -75,6 +76,176 @@ async fn cloudberry21_snapshot_group_activation_and_retry() -> Result<(), Box<dy
     cleanup(&client, &target_schema, pipeline_id).await;
     connection_task.abort();
     result
+}
+
+#[tokio::test]
+#[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_snapshot_paging_with_resume() -> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (mut client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("integration test Cloudberry connection ended: {error}");
+        }
+    });
+
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_schema = format!("pg2cb_paging_it_{suffix}");
+    let pipeline_id = PipelineId::new();
+    let result = run_snapshot_paging_test(&mut client, &target_schema, pipeline_id).await;
+    cleanup(&client, &target_schema, pipeline_id).await;
+    connection_task.abort();
+    result
+}
+
+async fn run_snapshot_paging_test(
+    client: &mut Client,
+    target_schema: &str,
+    pipeline_id: PipelineId,
+) -> Result<(), Box<dyn Error>> {
+    migrate_target_database(client).await?;
+    let fence = PipelineFence {
+        pipeline_id,
+        topology_generation: 1,
+        fencing_token: 10,
+    };
+    activate_pipeline_fence(client, fence).await?;
+
+    // Plan a single table with composite PK (tenant_id, item_id)
+    let source_schema = TableSchema {
+        relation_id: 200,
+        generation: 1,
+        name: QualifiedName::new("public", "paged_items").unwrap(),
+        kind: TableKind::Ordinary,
+        replica_identity: ReplicaIdentity::Default,
+        columns: vec![
+            column(1, "tenant_id", PgTypeKind::Text, false, Some(1)),
+            column(2, "item_id", PgTypeKind::Int8, false, Some(2)),
+            column(3, "payload", PgTypeKind::Text, true, None),
+        ],
+        distribution_key: Vec::new(),
+        partition_key: Vec::new(),
+    };
+    let target_name = QualifiedName::new(target_schema, "paged_items").unwrap();
+    let shadow_name = QualifiedName::new(target_schema, "shadow_paged_items").unwrap();
+    let plan = plan_snapshot_target(&source_schema, target_name, shadow_name)?;
+    let snapshot_group_id = Uuid::now_v7();
+    let ownership = SnapshotOwnership {
+        fence,
+        snapshot_group_id,
+        schema_fingerprint: "sha256:paging-test".to_owned(),
+    };
+
+    // Register the snapshot group
+    let request = SnapshotActivationRequest {
+        snapshot_group_id,
+        fence,
+        tables: vec![plan.activation_table("sha256:paging-test".to_owned())],
+        initial_checkpoints: vec![NodeCheckpoint {
+            key: CheckpointKey {
+                pipeline_id: fence.pipeline_id,
+                topology_generation: fence.topology_generation,
+                node_id: 0,
+            },
+            system_identifier: 1_234,
+            timeline: 1,
+            slot_name: "pg2cb_paging_slot".to_owned(),
+            applied_lsn: PgLsn::new(100),
+        }],
+    };
+    assert_eq!(
+        begin_snapshot_group(client, &request).await?,
+        SnapshotGroupRegistrationDisposition::Registered
+    );
+
+    // Open the paged loader
+    let mut loader = begin_snapshot_pages(client, plan.clone(), &ownership).await?;
+    assert!(!loader.is_completed());
+    assert!(loader.cursor().is_empty(), "cursor starts empty");
+
+    // Page 1: tenant-a, 1-2, 2 rows
+    let page1 = "tenant-a\t1\tpayload-1\ntenant-a\t2\tpayload-2\n";
+    let stream = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(page1))]);
+    let outcome = loader
+        .apply_page(
+            client,
+            vec!["tenant-a".to_owned(), "2".to_owned()],
+            false,
+            stream,
+        )
+        .await?;
+    assert!(
+        matches!(outcome, SnapshotPageApplyOutcome::Applied(_)),
+        "page1 applied: {outcome:?}"
+    );
+    assert_eq!(loader.cursor(), &["tenant-a", "2"], "cursor advanced");
+
+    // Idempotent re-apply: same cursor -> ResumeAt
+    let stream_retry = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(page1))]);
+    let outcome_retry = loader
+        .apply_page(
+            client,
+            vec!["tenant-a".to_owned(), "2".to_owned()],
+            false,
+            stream_retry,
+        )
+        .await?;
+    assert!(
+        matches!(outcome_retry, SnapshotPageApplyOutcome::ResumeAt(_)),
+        "page1 retry => ResumeAt: {outcome_retry:?}"
+    );
+
+    // Page 2: tenant-b, 10, 1 row
+    let page2 = "tenant-b\t10\tpayload-10\n";
+    let stream2 = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(page2))]);
+    let outcome2 = loader
+        .apply_page(
+            client,
+            vec!["tenant-b".to_owned(), "10".to_owned()],
+            false,
+            stream2,
+        )
+        .await?;
+    assert!(
+        matches!(outcome2, SnapshotPageApplyOutcome::Applied(_)),
+        "page2 applied: {outcome2:?}"
+    );
+    assert_eq!(loader.cursor(), &["tenant-b", "10"], "cursor advanced");
+
+    // Final empty tail: completed=true, cursor unchanged
+    let empty_stream = futures::stream::empty::<Result<Bytes, std::io::Error>>();
+    let outcome_tail = loader
+        .apply_page(
+            client,
+            vec!["tenant-b".to_owned(), "10".to_owned()],
+            true,
+            empty_stream,
+        )
+        .await?;
+    match outcome_tail {
+        SnapshotPageApplyOutcome::Applied(progress) => {
+            assert!(progress.completed, "tail marks completed");
+            assert_eq!(progress.rows_copied, 3, "total rows");
+            assert_eq!(progress.pages_copied, 3, "three pages");
+        }
+        _ => panic!("expected Applied for tail: {outcome_tail:?}"),
+    }
+    assert!(loader.is_completed(), "loader marks completed");
+
+    // Activate the group
+    let activation = SnapshotActivationRequest {
+        snapshot_group_id,
+        fence,
+        tables: vec![plan.activation_table("sha256:paging-test".to_owned())],
+        initial_checkpoints: request.initial_checkpoints.clone(),
+    };
+    let outcome = activate_snapshot_group(client, &activation).await?;
+    assert_eq!(
+        outcome.disposition,
+        SnapshotActivationDisposition::Activated
+    );
+
+    Ok(())
 }
 
 async fn run_snapshot_activation_test(
