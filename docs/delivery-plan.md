@@ -25,7 +25,7 @@ git switch --track origin/codex/phase1-durable-cdc
 
 1. 合并 target commit 快路径。当前普通事务仍是 manifest、chunk、completion 三阶段提交；目标是单 chunk 1 次、N chunk N 次、空事务 1 次。final 调用必须同时处理 `Applied`、`AlreadyCommitted` 和 `ResumeAt == record_count`，并原子完成 checkpoint/retirement。
 2. 为快路径补单 chunk、多 chunk、空事务、final commit 响应丢失、改 chunk 大小恢复和并发双提交测试。
-3. 执行完整 workspace test/Clippy、全部 Cloudberry opt-in tests，再按 Phase 1 kill-point 矩阵推进 snapshot/reconciliation。
+3. 执行完整 workspace Clippy、全部 Cloudberry opt-in tests，再按 Phase 1 kill-point 矩阵推进 snapshot/reconciliation。
 
 测试容器不是交付状态的一部分；本轮结束时会停止 `pg2cb-it-pg18` 和 `pg2cb-it-cb21`，不会操作 `ducklake-*`。用户曾在会话中暴露 GitHub PAT，该令牌没有写入仓库或 Git 配置，仍应在 GitHub 立即撤销并重新生成。
 
