@@ -2,8 +2,31 @@
 
 use replication_postgres::{Client, Config, config::ReplicationMode};
 use replication_postgres_native_tls::MakeTlsConnector;
+use tokio_postgres::Client as SqlClient;
 
 use crate::{SourceError, SourceResult};
+
+/// Verify that the source is PostgreSQL 18.x.
+///
+/// This service only supports PostgreSQL 18 as the source. Other versions (17, 19, etc.)
+/// are explicitly rejected to maintain a single, well-tested compatibility matrix.
+pub async fn verify_pg18_version(client: &SqlClient) -> SourceResult<()> {
+    let row = client
+        .query_one("SELECT version()", &[])
+        .await
+        .map_err(|error| SourceError::contract(format!("failed to query version: {error}")))?;
+
+    let version_string: String = row.get(0);
+
+    // PostgreSQL 18.x version string format: "PostgreSQL 18.x on ..."
+    if !version_string.starts_with("PostgreSQL 18.") {
+        return Err(SourceError::contract(format!(
+            "This service only supports PostgreSQL 18.x source. Found: {version_string}"
+        )));
+    }
+
+    Ok(())
+}
 
 /// Connect the forked client used exclusively for replication protocol traffic.
 ///
