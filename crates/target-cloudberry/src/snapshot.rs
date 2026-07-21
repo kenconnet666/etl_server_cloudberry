@@ -230,11 +230,10 @@ pub enum SnapshotTargetError {
     #[error("snapshot progress for `{0}` has not reached the source snapshot tail")]
     SnapshotProgressIncomplete(String),
     #[error("snapshot progress identity for `{table}` differs in `{field}`")]
-    SnapshotProgressIdentityMismatch {
-        table: String,
-        field: &'static str,
-    },
-    #[error("persisted snapshot progress field `{field}` has invalid value `{value}` for `{table}`")]
+    SnapshotProgressIdentityMismatch { table: String, field: &'static str },
+    #[error(
+        "persisted snapshot progress field `{field}` has invalid value `{value}` for `{table}`"
+    )]
     InvalidSnapshotProgressValue {
         table: String,
         field: &'static str,

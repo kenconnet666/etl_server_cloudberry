@@ -607,7 +607,9 @@ fn activation_progress_identities(
                 TableActivationState::Pending { shadow, .. } => shadow.relation_oid,
                 TableActivationState::Active { target } => target.relation_oid,
             }
-            .ok_or_else(|| SnapshotTargetError::MissingRelationIdentity(table.target.to_string()))?;
+            .ok_or_else(|| {
+                SnapshotTargetError::MissingRelationIdentity(table.target.to_string())
+            })?;
             if relation_oid <= 0 {
                 return Err(SnapshotTargetError::MissingRelationIdentity(
                     table.target.to_string(),
@@ -928,8 +930,7 @@ mod tests {
             target: active_target,
         };
         assert_eq!(
-            activation_progress_identities(&[table], &[active]).unwrap()[0]
-                .shadow_relation_oid,
+            activation_progress_identities(&[table], &[active]).unwrap()[0].shadow_relation_oid,
             16_384
         );
     }

@@ -270,8 +270,7 @@ async fn cleanup_loading_snapshot_group_locked(
         )
         .await?;
     } else {
-        progress::delete_loading_snapshot_group_progress(transaction, &stored.request, &[])
-            .await?;
+        progress::delete_loading_snapshot_group_progress(transaction, &stored.request, &[]).await?;
     }
 
     for shadow in &shadows {

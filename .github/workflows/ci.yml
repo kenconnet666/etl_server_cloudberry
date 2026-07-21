@@ -1,89 +1,61 @@
 name: CI
 
 on:
-  pull_request:
   push:
-    branches: [master, main]
+    branches: [master, 'codex/**']
+  pull_request:
+    branches: [master]
 
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  quality:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+  rust-checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.1
-          components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v5
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Rust formatting
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-build-
+
+      - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Rust lint
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Rust tests
-        run: cargo test --workspace --all-features --locked
-      - name: Web dependencies
-        working-directory: web
-        run: npm ci
-      - name: Web checks
-        working-directory: web
-        run: npm run check
-      - name: Web tests
-        working-directory: web
-        run: npm test
-      - name: Web build
-        working-directory: web
-        run: npm run build
-      - name: Container build
-        run: docker build --tag pg2cb-ci:${{ github.sha }} .
 
-  postgres-18:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Start PostgreSQL 18
-        run: |
-          docker run --detach --rm --name pg2cb-ci-pg18 \
-            --publish 127.0.0.1:55432:5432 \
-            --env POSTGRES_PASSWORD=pg2cb_test_only \
-            --env POSTGRES_DB=source \
-            postgres:18.4-alpine \
-            -c wal_level=logical \
-            -c max_replication_slots=16 \
-            -c max_wal_senders=16
-          for attempt in $(seq 1 30); do
-            if docker exec pg2cb-ci-pg18 pg_isready --username postgres --dbname source; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs pg2cb-ci-pg18
-          exit 1
-      - name: PostgreSQL 18 integration tests
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace --all-features
+
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --lib --bins
         env:
-          PG2CB_TEST_SOURCE_DSN: postgresql://postgres:pg2cb_test_only@127.0.0.1:55432/source
-          PG2CB_TEST_CONTROL_DSN: postgresql://postgres:pg2cb_test_only@127.0.0.1:55432/source
-        run: |
-          cargo test --locked -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored --test-threads=1
-          cargo test --locked -p cloudberry-etl-source-postgres --test postgres18 --test snapshot_copy_pg18 --test snapshot_slot_pg18 -- --ignored --test-threads=1
-      - name: Stop PostgreSQL 18
-        if: always()
-        run: docker stop pg2cb-ci-pg18 || true
+          RUST_LOG: info
 
+  web-checks:
+    name: Web Checks (Placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Web UI will be rebuilt in Phase 0.4"

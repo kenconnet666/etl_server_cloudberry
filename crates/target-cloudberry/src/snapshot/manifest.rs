@@ -420,13 +420,9 @@ async fn load_snapshot_group_optional(
     let node_count = persisted_count(&group, "node_count", snapshot_group_id)?;
     let stored_checksum: Vec<u8> = group.try_get("manifest_checksum")?;
     let progress_version_raw: i32 = group.try_get("snapshot_progress_version")?;
-    let snapshot_progress_version = u16::try_from(progress_version_raw).map_err(|_| {
-        SnapshotTargetError::CorruptSnapshotGroupManifest(snapshot_group_id)
-    })?;
-    if fencing_token <= 0
-        || stored_checksum.len() != 32
-        || snapshot_progress_version > 1
-    {
+    let snapshot_progress_version = u16::try_from(progress_version_raw)
+        .map_err(|_| SnapshotTargetError::CorruptSnapshotGroupManifest(snapshot_group_id))?;
+    if fencing_token <= 0 || stored_checksum.len() != 32 || snapshot_progress_version > 1 {
         return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
             snapshot_group_id,
         ));

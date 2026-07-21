@@ -716,9 +716,7 @@ fn build_canonical_page_plan(
     let canonical_values = selected
         .iter()
         .enumerate()
-        .map(|(index, column)| {
-            format!("p.{column}::text AS \"__pg2cb_value_{index}\"")
-        })
+        .map(|(index, column)| format!("p.{column}::text AS \"__pg2cb_value_{index}\""))
         .collect::<Vec<_>>()
         .join(", ");
     let raw_values = selected.join(", ");
@@ -1368,10 +1366,34 @@ mod tests {
 
     #[test]
     fn key_pages_derive_bounded_first_and_unbounded_tail_copy_ranges() {
+        let table_identity = SnapshotTableIdentity {
+            relation_id: 12345,
+            generation: 1,
+            name: QualifiedName {
+                schema: "public".to_owned(),
+                name: "test".to_owned(),
+            },
+            key_columns: vec![SnapshotKeyColumnIdentity {
+                attnum: 1,
+                ordinal: 0,
+                name: "id".to_owned(),
+                data_type: PgType {
+                    oid: 23,
+                    name: QualifiedName {
+                        schema: "pg_catalog".to_owned(),
+                        name: "int4".to_owned(),
+                    },
+                    kind: cloudberry_etl_core::schema::PgTypeKind::Int4,
+                },
+                collation: None,
+            }],
+        };
         let first = finish_key_page(
             vec![key(&[b"a", b"1"]), key(&[b"a", b"2"]), key(&[b"a", b"3"])],
             2,
             "snapshot-a",
+            table_identity.clone(),
+            None,
         )
         .unwrap();
         assert!(first.has_more);
@@ -1380,46 +1402,102 @@ mod tests {
             Some(vec![Bytes::from_static(b"a"), Bytes::from_static(b"2")])
         );
         assert_eq!(
-            first.copy_range(None).unwrap(),
+            first.copy_range().unwrap(),
             SnapshotKeyRange {
                 start_exclusive: None,
                 end_inclusive: first.next_key.clone(),
                 snapshot_id: "snapshot-a".to_owned(),
+                table_identity: table_identity.clone(),
             }
         );
 
         let start = first.next_cursor().unwrap();
-        let tail = finish_key_page(vec![key(&[b"b", b"1"])], 2, "snapshot-a").unwrap();
+        let tail = finish_key_page(
+            vec![key(&[b"b", b"1"])],
+            2,
+            "snapshot-a",
+            table_identity.clone(),
+            Some(start.key().to_vec()),
+        )
+        .unwrap();
         assert!(!tail.has_more);
         assert_eq!(
-            tail.copy_range(Some(&start)).unwrap(),
+            tail.copy_range().unwrap(),
             SnapshotKeyRange {
                 start_exclusive: Some(start.key().to_vec()),
                 end_inclusive: None,
                 snapshot_id: "snapshot-a".to_owned(),
+                table_identity: table_identity.clone(),
             }
         );
 
         let tail_cursor = tail.next_cursor().unwrap();
-        let empty = finish_key_page(Vec::new(), 2, "snapshot-a").unwrap();
+        let empty = finish_key_page(
+            Vec::new(),
+            2,
+            "snapshot-a",
+            table_identity.clone(),
+            Some(tail_cursor.key().to_vec()),
+        )
+        .unwrap();
         assert!(!empty.has_more);
         assert_eq!(
-            empty.copy_range(Some(&tail_cursor)).unwrap(),
+            empty.copy_range().unwrap(),
             SnapshotKeyRange {
                 start_exclusive: Some(tail_cursor.key().to_vec()),
                 end_inclusive: None,
                 snapshot_id: "snapshot-a".to_owned(),
+                table_identity: table_identity.clone(),
             }
         );
     }
 
     #[test]
     fn range_copy_uses_safe_typed_hex_keys_and_keeps_left_pk_bare() {
+        let table_identity = SnapshotTableIdentity {
+            relation_id: 12345,
+            generation: 1,
+            name: QualifiedName {
+                schema: "public".to_owned(),
+                name: "test".to_owned(),
+            },
+            key_columns: vec![
+                SnapshotKeyColumnIdentity {
+                    attnum: 1,
+                    ordinal: 0,
+                    name: "a".to_owned(),
+                    data_type: PgType {
+                        oid: 25,
+                        name: QualifiedName {
+                            schema: "pg_catalog".to_owned(),
+                            name: "text".to_owned(),
+                        },
+                        kind: cloudberry_etl_core::schema::PgTypeKind::Text,
+                    },
+                    collation: None,
+                },
+                SnapshotKeyColumnIdentity {
+                    attnum: 2,
+                    ordinal: 1,
+                    name: "b".to_owned(),
+                    data_type: PgType {
+                        oid: 23,
+                        name: QualifiedName {
+                            schema: "pg_catalog".to_owned(),
+                            name: "int4".to_owned(),
+                        },
+                        kind: cloudberry_etl_core::schema::PgTypeKind::Int4,
+                    },
+                    collation: None,
+                },
+            ],
+        };
         let schema = composite_schema();
         let range = SnapshotKeyRange {
             start_exclusive: Some(vec![Bytes::from_static(b"a'\\"), Bytes::from_static(b"2")]),
             end_inclusive: Some(vec![Bytes::from_static(b"b"), Bytes::from_static(b"10")]),
             snapshot_id: "snapshot-a".to_owned(),
+            table_identity,
         };
         let sql = SnapshotSession::copy_text_pk_range_sql(&schema, &range).unwrap();
 

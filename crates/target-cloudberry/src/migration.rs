@@ -445,15 +445,15 @@ mod tests {
                 .count(),
             2
         );
-        assert!(TARGET_V7_SQL.contains(
-            "CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_table_progress"
-        ));
+        assert!(
+            TARGET_V7_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.snapshot_table_progress")
+        );
         assert!(TARGET_V7_SQL.contains(
             "ADD COLUMN IF NOT EXISTS snapshot_progress_version integer NOT NULL DEFAULT 0"
         ));
-        assert!(TARGET_V7_SQL.contains(
-            "PRIMARY KEY (snapshot_group_id, target_schema, target_table)"
-        ));
+        assert!(
+            TARGET_V7_SQL.contains("PRIMARY KEY (snapshot_group_id, target_schema, target_table)")
+        );
         assert!(TARGET_V7_SQL.contains("shadow_schema text NOT NULL"));
         assert!(TARGET_V7_SQL.contains("shadow_table text NOT NULL"));
         assert!(TARGET_V7_SQL.contains("shadow_relation_oid bigint NOT NULL"));

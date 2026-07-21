@@ -216,8 +216,7 @@ pub(super) async fn lock_completed_snapshot_tables(
     request: &SnapshotActivationRequest,
     expected: &[CompletedSnapshotTableIdentity],
 ) -> Result<(), SnapshotTargetError> {
-    let progress =
-        lock_validate_snapshot_group_progress(transaction, request, expected).await?;
+    let progress = lock_validate_snapshot_group_progress(transaction, request, expected).await?;
     for table in progress {
         if !table.completed {
             return Err(SnapshotTargetError::SnapshotProgressIncomplete(
@@ -444,11 +443,7 @@ async fn lock_progress_identity(
         ownership.fence.pipeline_id,
         plan.source_relation_id,
     )?;
-    validate_managed_fence(
-        &plan.shadow.target,
-        &record,
-        ownership.fence.fencing_token,
-    )?;
+    validate_managed_fence(&plan.shadow.target, &record, ownership.fence.fencing_token)?;
     if record.state != ManagedTableState::Shadow
         || record.snapshot_group_id != Some(ownership.snapshot_group_id)
         || record.table_generation != plan.source_generation
@@ -548,9 +543,8 @@ fn progress_from_row(row: &Row) -> Result<SnapshotTableProgress, SnapshotTargetE
     })?;
     let table_generation = persisted_u64(row, &target, "table_generation")?;
     let cursor_format_raw: i32 = row.try_get("cursor_format_version")?;
-    let cursor_format_version = u16::try_from(cursor_format_raw).map_err(|_| {
-        invalid_progress_value(&target, "cursor_format_version", cursor_format_raw)
-    })?;
+    let cursor_format_version = u16::try_from(cursor_format_raw)
+        .map_err(|_| invalid_progress_value(&target, "cursor_format_version", cursor_format_raw))?;
     let primary_key_arity = persisted_usize(row, &target, "primary_key_arity")?;
     let cursor: Vec<String> = row.try_get("cursor_values")?;
     let digest: Vec<u8> = row.try_get("cursor_digest")?;
@@ -638,9 +632,7 @@ fn validate_stored_identity(
     }
 }
 
-fn validate_progress_contract(
-    progress: &SnapshotTableProgress,
-) -> Result<(), SnapshotTargetError> {
+fn validate_progress_contract(progress: &SnapshotTableProgress) -> Result<(), SnapshotTargetError> {
     if progress.cursor_format_version != SNAPSHOT_CURSOR_FORMAT_VERSION {
         return Err(invalid_progress_value(
             &progress.target,
@@ -694,7 +686,7 @@ fn advance_progress(
     copied_rows: u64,
     completed: bool,
 ) -> Result<SnapshotTableProgress, SnapshotTargetError> {
-    validate_page_intent(&current, &next_cursor, completed)?;
+    validate_page_intent(current, &next_cursor, completed)?;
     if copied_rows == 0 && !completed {
         return Err(SnapshotTargetError::EmptyIncompleteSnapshotPage(
             current.target.to_string(),
@@ -708,9 +700,12 @@ fn advance_progress(
     let pages_copied = current.pages_copied.checked_add(1).ok_or_else(|| {
         SnapshotTargetError::SnapshotProgressCounterOverflow(current.target.to_string())
     })?;
-    let rows_copied = current.rows_copied.checked_add(copied_rows).ok_or_else(|| {
-        SnapshotTargetError::SnapshotProgressCounterOverflow(current.target.to_string())
-    })?;
+    let rows_copied = current
+        .rows_copied
+        .checked_add(copied_rows)
+        .ok_or_else(|| {
+            SnapshotTargetError::SnapshotProgressCounterOverflow(current.target.to_string())
+        })?;
     database_count("pages_copied", pages_copied)?;
     database_count("rows_copied", rows_copied)?;
     let mut advanced = current.clone();
@@ -773,10 +768,7 @@ fn cursor_digest(
     validate_cursor_arity(primary_key_arity, cursor)?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"pg2cb-snapshot-cursor-v1");
-    hash_field(
-        &mut hasher,
-        &SNAPSHOT_CURSOR_FORMAT_VERSION.to_be_bytes(),
-    );
+    hash_field(&mut hasher, &SNAPSHOT_CURSOR_FORMAT_VERSION.to_be_bytes());
     let arity = u64::try_from(primary_key_arity)
         .map_err(|_| SnapshotTargetError::SnapshotCursorArityOutOfRange(primary_key_arity))?;
     hash_field(&mut hasher, &arity.to_be_bytes());
@@ -846,10 +838,8 @@ fn invalid_progress_value(
 }
 
 fn database_count(field: &'static str, value: u64) -> Result<i64, SnapshotTargetError> {
-    i64::try_from(value).map_err(|_| SnapshotTargetError::SnapshotProgressValueOutOfRange {
-        field,
-        value,
-    })
+    i64::try_from(value)
+        .map_err(|_| SnapshotTargetError::SnapshotProgressValueOutOfRange { field, value })
 }
 
 fn database_arity(value: usize) -> Result<i32, SnapshotTargetError> {
@@ -915,21 +905,11 @@ mod tests {
             Err(SnapshotTargetError::SnapshotCursorDidNotAdvance(_))
         ));
         assert!(matches!(
-            advance_progress(
-                &current,
-                vec!["tenant-a".into(), "20".into()],
-                0,
-                false,
-            ),
+            advance_progress(&current, vec!["tenant-a".into(), "20".into()], 0, false,),
             Err(SnapshotTargetError::EmptyIncompleteSnapshotPage(_))
         ));
         assert!(matches!(
-            advance_progress(
-                &current,
-                vec!["tenant-a".into(), "20".into()],
-                0,
-                true,
-            ),
+            advance_progress(&current, vec!["tenant-a".into(), "20".into()], 0, true,),
             Err(SnapshotTargetError::SnapshotCursorAdvancedWithoutRows(_))
         ));
     }
@@ -937,13 +917,8 @@ mod tests {
     #[test]
     fn final_page_advances_exact_counters_and_marks_completion() {
         let current = progress();
-        let advanced = advance_progress(
-            &current,
-            vec!["tenant-b".into(), "4".into()],
-            25,
-            true,
-        )
-        .unwrap();
+        let advanced =
+            advance_progress(&current, vec!["tenant-b".into(), "4".into()], 25, true).unwrap();
         assert!(advanced.completed);
         assert_eq!(advanced.pages_copied, 2);
         assert_eq!(advanced.rows_copied, 125);
