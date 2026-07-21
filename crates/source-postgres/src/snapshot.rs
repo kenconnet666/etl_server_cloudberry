@@ -1454,45 +1454,42 @@ mod tests {
 
     #[test]
     fn range_copy_uses_safe_typed_hex_keys_and_keeps_left_pk_bare() {
+        let schema = composite_schema();
         let table_identity = SnapshotTableIdentity {
-            relation_id: 12345,
-            generation: 1,
-            name: QualifiedName {
-                schema: "public".to_owned(),
-                name: "test".to_owned(),
-            },
+            relation_id: schema.relation_id,
+            generation: schema.generation,
+            name: schema.name.clone(),
             key_columns: vec![
                 SnapshotKeyColumnIdentity {
                     attnum: 1,
-                    ordinal: 0,
-                    name: "a".to_owned(),
+                    ordinal: 1,
+                    name: "Tenant\"Id".to_owned(),
                     data_type: PgType {
-                        oid: 25,
+                        oid: 1,
                         name: QualifiedName {
                             schema: "pg_catalog".to_owned(),
                             name: "text".to_owned(),
                         },
-                        kind: cloudberry_etl_core::schema::PgTypeKind::Text,
+                        kind: PgTypeKind::Text,
                     },
                     collation: None,
                 },
                 SnapshotKeyColumnIdentity {
                     attnum: 2,
-                    ordinal: 1,
-                    name: "b".to_owned(),
+                    ordinal: 2,
+                    name: "Seq No".to_owned(),
                     data_type: PgType {
-                        oid: 23,
+                        oid: 2,
                         name: QualifiedName {
                             schema: "pg_catalog".to_owned(),
-                            name: "int4".to_owned(),
+                            name: "int8".to_owned(),
                         },
-                        kind: cloudberry_etl_core::schema::PgTypeKind::Int4,
+                        kind: PgTypeKind::Int8,
                     },
                     collation: None,
                 },
             ],
         };
-        let schema = composite_schema();
         let range = SnapshotKeyRange {
             start_exclusive: Some(vec![Bytes::from_static(b"a'\\"), Bytes::from_static(b"2")]),
             end_inclusive: Some(vec![Bytes::from_static(b"b"), Bytes::from_static(b"10")]),
