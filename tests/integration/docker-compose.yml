@@ -1,0 +1,55 @@
+services:
+  pg18-source:
+    image: postgres:18-alpine
+    container_name: pg2cb-it-pg18
+    environment:
+      POSTGRES_PASSWORD: pg2cb_test
+      POSTGRES_DB: source
+      POSTGRES_USER: postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    command: >
+      -c wal_level=logical
+      -c max_replication_slots=16
+      -c max_wal_senders=16
+      -c shared_preload_libraries=''
+    volumes:
+      - pg18-data:/var/lib/postgresql/data
+      - ./pg18/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d source"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - test-network
+
+  cloudberry-target:
+    image: apache/cloudberry:2.1.0-incubating
+    container_name: pg2cb-it-cb21
+    environment:
+      POSTGRES_PASSWORD: pg2cb_test
+      POSTGRES_DB: target
+      POSTGRES_USER: postgres
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - cb21-data:/var/lib/postgresql/data
+      - ./cloudberry/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d target"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - test-network
+
+volumes:
+  pg18-data:
+    driver: local
+  cb21-data:
+    driver: local
+
+networks:
+  test-network:
+    driver: bridge

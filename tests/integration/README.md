@@ -1,27 +1,65 @@
-# Integration tests
+# Integration Test Environment
 
-Integration tests use disposable databases and are opt-in locally. They never use a DSN unless
-the corresponding `PG2CB_TEST_*` environment variable is set.
+This directory contains disposable database containers for integration testing.
 
-## PostgreSQL 18
+## Quick Start
 
-Start a dedicated source instance:
+### Basic PG18 + Cloudberry Environment
 
-```text
-docker run --rm -d --name pg2cb-it-pg18 \
-  -e POSTGRES_PASSWORD=pg2cb_test_only -e POSTGRES_DB=source \
-  -p 127.0.0.1:55432:5432 postgres:18.4-alpine \
-  -c wal_level=logical -c max_replication_slots=16 -c max_wal_senders=16
+Start the test environment:
+```bash
+cd tests/integration
+docker compose up -d
+docker compose ps
 ```
 
-Then run the ignored suite with `PG2CB_TEST_SOURCE_DSN` set to that database:
-
-```text
-cargo test -p cloudberry-etl-source-postgres --test postgres18 -- --ignored --test-threads=1
+Wait for health checks:
+```bash
+docker compose ps
+# Both containers should show "healthy"
 ```
 
-Stop the disposable container with `docker stop pg2cb-it-pg18`. The container uses `--rm`, so its
-database is removed and cannot be recovered after it stops.
+Connect to databases:
+```bash
+# PostgreSQL 18 source
+psql "postgresql://postgres:pg2cb_test@127.0.0.1:55432/source"
 
-Cloudberry and Citus suites remain validation-gated until their pinned environments and full
-correctness matrices are checked in here.
+# Cloudberry 2.1 target
+psql "postgresql://postgres:pg2cb_test@127.0.0.1:55433/target"
+```
+
+Stop and clean up:
+```bash
+docker compose down -v
+```
+
+## Container Details
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| pg18-source | postgres:18-alpine | 55432 | Source database with logical replication |
+| cloudberry-target | apache/cloudberry:2.1.0-incubating | 55433 | Target data warehouse |
+
+## Test Data
+
+The PG18 container is initialized with sample tables:
+- `integration.test_simple` - basic table with PK
+- `integration.test_composite_pk` - composite primary key
+- `integration.test_types` - all supported PostgreSQL types
+
+## Citus Environment
+
+For Citus-specific tests, see `citus/` subdirectory:
+```bash
+cd citus
+./verify.sh  # Starts coordinator + 2 workers, runs verification
+```
+
+## Environment Variables
+
+Both containers use default test credentials:
+- Username: `postgres`
+- Password: `pg2cb_test`
+- Database: `source` (PG18), `target` (Cloudberry)
+
+**DO NOT use these credentials in production.**
