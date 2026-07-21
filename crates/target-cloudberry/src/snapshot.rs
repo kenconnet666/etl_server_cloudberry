@@ -375,6 +375,48 @@ impl SnapshotTargetPlan {
     }
 }
 
+/// Create the schema, (re)build the shadow table and register its durable
+/// progress row inside a caller-owned transaction that already holds the
+/// pipeline fence. Shared by both the whole-table [`begin_snapshot_apply`] and
+/// the bounded [`begin_snapshot_pages`] entry points so the shadow identity,
+/// rebuild rules and progress registration stay byte-for-byte identical.
+///
+/// A committed shadow is rebuilt from the registered group's exported snapshot
+/// boundary because schema identity alone does not prove which exported
+/// snapshot produced the rows.
+async fn prepare_shadow_load(
+    transaction: &Transaction<'_>,
+    plan: &SnapshotTargetPlan,
+    ownership: &SnapshotOwnership,
+) -> Result<SnapshotTableProgress, SnapshotTargetError> {
+    let manifest = manifest::load_snapshot_group(transaction, ownership.snapshot_group_id).await?;
+    manifest::validate_apply_membership(&manifest, plan, ownership)?;
+    if manifest.state == manifest::SnapshotGroupState::Active {
+        return Err(SnapshotTargetError::SnapshotGroupAlreadyActive(
+            ownership.snapshot_group_id,
+        ));
+    }
+    create_schema(transaction, &plan.target.schema).await?;
+
+    let target_state = load_relation_state(transaction, &plan.target).await?;
+    validate_target_for_load(&target_state, plan, ownership)?;
+
+    let shadow_state = load_relation_state(transaction, &plan.shadow.target).await?;
+    if validate_shadow_for_rebuild(&shadow_state, plan, ownership)? {
+        let RelationState::Managed(record) = &shadow_state else {
+            unreachable!("only a managed shadow can be rebuilt")
+        };
+        remove_managed_shadow(transaction, &plan.shadow.target, record).await?;
+    }
+
+    for prerequisite in &plan.shadow.prerequisites {
+        ensure_prerequisite_type(transaction, prerequisite, ownership).await?;
+    }
+    transaction.batch_execute(&plan.shadow.create_sql).await?;
+    register_shadow(transaction, plan, ownership).await?;
+    progress::register_snapshot_table_progress(transaction, plan, ownership).await
+}
+
 /// Open the target transaction and create every object needed by the shadow load.
 ///
 /// A committed shadow is rebuilt from the registered group's exported snapshot boundary.
@@ -386,32 +428,7 @@ pub async fn begin_snapshot_apply<'client>(
     validate_ownership(ownership)?;
     let transaction = client.transaction().await?;
     lock_pipeline_fence(&transaction, ownership.fence).await?;
-    let manifest = manifest::load_snapshot_group(&transaction, ownership.snapshot_group_id).await?;
-    manifest::validate_apply_membership(&manifest, &plan, ownership)?;
-    if manifest.state == manifest::SnapshotGroupState::Active {
-        return Err(SnapshotTargetError::SnapshotGroupAlreadyActive(
-            ownership.snapshot_group_id,
-        ));
-    }
-    create_schema(&transaction, &plan.target.schema).await?;
-
-    let target_state = load_relation_state(&transaction, &plan.target).await?;
-    validate_target_for_load(&target_state, &plan, ownership)?;
-
-    let shadow_state = load_relation_state(&transaction, &plan.shadow.target).await?;
-    if validate_shadow_for_rebuild(&shadow_state, &plan, ownership)? {
-        let RelationState::Managed(record) = &shadow_state else {
-            unreachable!("only a managed shadow can be rebuilt")
-        };
-        remove_managed_shadow(&transaction, &plan.shadow.target, record).await?;
-    }
-
-    for prerequisite in &plan.shadow.prerequisites {
-        ensure_prerequisite_type(&transaction, prerequisite, ownership).await?;
-    }
-    transaction.batch_execute(&plan.shadow.create_sql).await?;
-    register_shadow(&transaction, &plan, ownership).await?;
-    progress::register_snapshot_table_progress(&transaction, &plan, ownership).await?;
+    prepare_shadow_load(&transaction, &plan, ownership).await?;
     Ok(SnapshotApply {
         transaction,
         plan,
@@ -419,6 +436,107 @@ pub async fn begin_snapshot_apply<'client>(
         mode: SnapshotApplyMode::Copy,
         copied_rows: None,
     })
+}
+
+/// Prepare a shadow table for a bounded, resumable page-by-page load and commit
+/// that preparation so each subsequent page can run in its own transaction.
+///
+/// Unlike [`begin_snapshot_apply`], which binds shadow creation and the whole
+/// COPY into one transaction, the bounded path must survive a process crash
+/// between pages. Preparation (schema + shadow + progress row) is therefore
+/// committed up front; [`SnapshotPageLoader::apply_page`] then advances the
+/// durable cursor one bounded page per transaction, and a lost commit response
+/// is reconciled by [`SnapshotPageApplyOutcome::ResumeAt`].
+pub async fn begin_snapshot_pages(
+    client: &mut Client,
+    plan: SnapshotTargetPlan,
+    ownership: &SnapshotOwnership,
+) -> Result<SnapshotPageLoader, SnapshotTargetError> {
+    validate_ownership(ownership)?;
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, ownership.fence).await?;
+    let progress = prepare_shadow_load(&transaction, &plan, ownership).await?;
+    transaction.commit().await?;
+    Ok(SnapshotPageLoader {
+        plan,
+        ownership: ownership.clone(),
+        cursor: progress.cursor,
+        completed: progress.completed,
+    })
+}
+
+/// Durable, resumable driver for a bounded page-by-page shadow load. Holds the
+/// last committed cursor so the caller can derive the next source range and
+/// prove forward progress. Each [`apply_page`](Self::apply_page) runs in its own
+/// transaction and commits the copied rows together with the advanced cursor.
+#[derive(Debug, Clone)]
+pub struct SnapshotPageLoader {
+    plan: SnapshotTargetPlan,
+    ownership: SnapshotOwnership,
+    cursor: Vec<String>,
+    completed: bool,
+}
+
+impl SnapshotPageLoader {
+    /// The last durably committed cursor. Empty means the scan starts at the
+    /// table head; the caller maps this to `None` for the source pager.
+    #[must_use]
+    pub fn cursor(&self) -> &[String] {
+        &self.cursor
+    }
+
+    /// Whether the durable progress row is already marked complete. A resumed
+    /// loader that finds this true must skip straight to activation.
+    #[must_use]
+    pub const fn is_completed(&self) -> bool {
+        self.completed
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &SnapshotTargetPlan {
+        &self.plan
+    }
+
+    /// Copy one bounded page into the shadow and advance the durable cursor in a
+    /// single transaction. `next_cursor` is the source-derived boundary for this
+    /// page (the final PK of the page, or the current cursor for an empty tail);
+    /// `completed` must mean the source session proved this range is the fixed
+    /// tail of its repeatable-read snapshot. Updates the in-memory cursor to the
+    /// committed value and returns the outcome so callers can react to a
+    /// reconciled lost commit ([`SnapshotPageApplyOutcome::ResumeAt`]).
+    pub async fn apply_page<S, E>(
+        &mut self,
+        client: &mut Client,
+        next_cursor: Vec<String>,
+        completed: bool,
+        stream: S,
+    ) -> Result<SnapshotPageApplyOutcome, SnapshotTargetError>
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+        E: Display,
+    {
+        let transaction = client.transaction().await?;
+        lock_pipeline_fence(&transaction, self.ownership.fence).await?;
+        let outcome = progress::copy_snapshot_page(
+            &transaction,
+            &self.plan,
+            &self.ownership,
+            &self.cursor,
+            next_cursor,
+            completed,
+            stream,
+        )
+        .await?;
+        transaction.commit().await?;
+        let progress = match &outcome {
+            SnapshotPageApplyOutcome::Applied(progress)
+            | SnapshotPageApplyOutcome::ResumeAt(progress)
+            | SnapshotPageApplyOutcome::AlreadyCompleted(progress) => progress,
+        };
+        self.cursor = progress.cursor.clone();
+        self.completed = progress.completed;
+        Ok(outcome)
+    }
 }
 
 /// Target transaction whose COPY stream must finish before commit is allowed.
