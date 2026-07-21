@@ -5,7 +5,7 @@
 //!
 //! The test is ignored by default and never removes objects it did not create.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, panic::AssertUnwindSafe};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -25,6 +25,7 @@ use cloudberry_etl_source_postgres::{
         TransactionDecoder, parse_logical_payload,
     },
 };
+use futures::FutureExt;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
@@ -81,10 +82,15 @@ async fn postgres18_source_contract_and_binary_pgoutput() -> SourceResult<()> {
         }
     });
     let objects = TestObjects::new();
-    let result = run_test(&client, &objects).await;
+    let result = AssertUnwindSafe(run_test(&client, &objects))
+        .catch_unwind()
+        .await;
     cleanup(&client, &objects).await;
     connection_task.abort();
-    result
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
@@ -92,6 +98,47 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
     assert_eq!(preflight.identity.server_version_num / 10_000, 18);
     assert_eq!(preflight.server_encoding, "UTF8");
     assert_eq!(preflight.wal_level.to_ascii_lowercase(), "logical");
+
+    // Upgrade the database-level capture before creating test objects. The disposable instance
+    // may still contain a UUID-named trigger from an earlier service binary; the canonical
+    // installer removes only marker-owned legacy pairs under an advisory transaction lock.
+    let canonical_spec = DdlInstallSpec::default();
+    let _ = ensure_ddl_capture(client, &canonical_spec).await?;
+    let canonical_triggers: i64 = client
+        .query_one(
+            "SELECT count(*)::int8
+               FROM pg_event_trigger
+              WHERE evtname IN ($1, $2)
+                AND obj_description(oid, 'pg_event_trigger') = $3",
+            &[
+                &canonical_spec.trigger_name,
+                &canonical_spec.drop_trigger_name()?,
+                &cloudberry_etl_source_postgres::ddl::DDL_CAPTURE_MARKER,
+            ],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(canonical_triggers, 2);
+
+    let install = objects.install_spec();
+    client
+        .batch_execute(&format!(
+            "CREATE EVENT TRIGGER {} ON ddl_command_end
+             EXECUTE FUNCTION pg2cb_meta.emit_ddl_event()",
+            quote_identifier(&objects.trigger_name)
+        ))
+        .await?;
+    let ownership_conflict = ensure_ddl_capture(client, &install).await;
+    client
+        .batch_execute(&format!(
+            "DROP EVENT TRIGGER {}",
+            quote_identifier(&objects.trigger_name)
+        ))
+        .await?;
+    assert!(
+        ownership_conflict.is_err(),
+        "an unmarked event trigger must never be overwritten"
+    );
 
     let qi_schema = quote_identifier(&objects.business_schema);
     let qi_table = quote_identifier(&objects.table_name);
@@ -107,7 +154,6 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
              )"
         ))
         .await?;
-    let install = objects.install_spec();
     assert!(ensure_ddl_capture(client, &install).await?);
     assert!(!ensure_ddl_capture(client, &install).await?);
     let capture_objects: i64 = client
@@ -365,26 +411,50 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
         .find(|message| message.command_tag == "ALTER PUBLICATION")
         .expect("external publication DDL must be captured");
     assert!(publication_ddl.affected_schemas.is_empty());
-    for command_tag in ["CREATE SCHEMA", "CREATE TYPE", "CREATE TABLE"] {
+    for command_tag in [
+        "CREATE SCHEMA",
+        "CREATE TYPE",
+        "CREATE TABLE",
+        "DROP TABLE",
+        "DROP TYPE",
+        "DROP SCHEMA",
+    ] {
+        let audit = client
+            .query_one(
+                &format!(
+                    "SELECT count(*)::int8,
+                            COALESCE(bool_and(payload->'affected_schemas' =
+                                jsonb_build_array($2::text)), false)
+                       FROM {}.ddl_audit
+                      WHERE command_tag = $1",
+                    quote_identifier(&objects.metadata_schema)
+                ),
+                &[&command_tag, &objects.other_schema],
+            )
+            .await?;
+        let audit_count: i64 = audit.try_get(0)?;
+        let audit_scope_matches: bool = audit.try_get(1)?;
+        assert_eq!(audit_count, 1, "{command_tag} must be captured once");
+        assert!(
+            audit_scope_matches,
+            "unexpected audit scope for {command_tag}"
+        );
+
+        // Event triggers are database-wide. Other independently managed capture installations
+        // can therefore add equivalent logical messages to this disposable slot; the audit table
+        // above identifies and verifies the installation owned by this test.
         let message = ddl_messages
             .iter()
-            .find(|message| message.command_tag == command_tag)
+            .find(|message| {
+                message.command_tag == command_tag
+                    && message.affected_schemas.as_slice()
+                        == std::slice::from_ref(&objects.other_schema)
+            })
             .unwrap_or_else(|| panic!("missing {command_tag} DDL message"));
         assert_eq!(
             message.affected_schemas.as_slice(),
             std::slice::from_ref(&objects.other_schema),
             "unexpected scope for {command_tag}: {message:?}"
-        );
-    }
-    for command_tag in ["DROP TABLE", "DROP TYPE", "DROP SCHEMA"] {
-        let messages: Vec<_> = ddl_messages
-            .iter()
-            .filter(|message| message.command_tag == command_tag)
-            .collect();
-        assert_eq!(messages.len(), 1, "{command_tag} must not be duplicated");
-        assert_eq!(
-            messages[0].affected_schemas.as_slice(),
-            std::slice::from_ref(&objects.other_schema)
         );
     }
     assert!(matches!(

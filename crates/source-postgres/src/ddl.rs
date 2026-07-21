@@ -8,12 +8,16 @@ use cloudberry_etl_core::change::DdlMessage;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
-use crate::{SourceError, SourceResult, sql::quote_identifier};
+use crate::{
+    SourceError, SourceResult,
+    sql::{quote_identifier, quote_literal},
+};
 
 pub const DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v1";
 pub const DDL_MESSAGE_VERSION: u16 = 1;
 /// Marker stored on both event triggers and their functions.
-pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v3";
+pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v4";
+pub const CANONICAL_DDL_TRIGGER_NAME: &str = "pg2cb_ddl_command_end";
 
 #[derive(Debug, Clone)]
 pub struct DdlInstallSpec {
@@ -22,11 +26,19 @@ pub struct DdlInstallSpec {
     pub allow_citus_worker_guard: bool,
 }
 
+#[derive(Debug)]
+struct DdlFunctionSources {
+    schema_snapshot: String,
+    schema_fingerprint: String,
+    emit_ddl_event: String,
+    emit_sql_drop_event: String,
+}
+
 impl Default for DdlInstallSpec {
     fn default() -> Self {
         Self {
             metadata_schema: "pg2cb_meta".to_owned(),
-            trigger_name: "pg2cb_ddl_command_end".to_owned(),
+            trigger_name: CANONICAL_DDL_TRIGGER_NAME.to_owned(),
             allow_citus_worker_guard: true,
         }
     }
@@ -46,43 +58,27 @@ impl DdlInstallSpec {
         Ok(name)
     }
 
-    /// Render an idempotent installer. All user-provided names are identifiers; no SQL values are
-    /// interpolated. The returned batch is intended to run on the source coordinator only.
-    pub fn install_sql(&self) -> SourceResult<String> {
-        self.validate()?;
-        let schema = quote_identifier(&self.metadata_schema)?;
-        let trigger = quote_identifier(&self.trigger_name)?;
-        let drop_trigger = quote_identifier(&self.drop_trigger_name()?)?;
-        let function = quote_identifier("emit_ddl_event")?;
-        let drop_function = quote_identifier("emit_sql_drop_event")?;
-        let snapshot = quote_identifier("schema_snapshot")?;
-        let fingerprint = quote_identifier("schema_fingerprint")?;
-        let worker_guard = if self.allow_citus_worker_guard {
+    fn worker_guard_sql(&self) -> &'static str {
+        if self.allow_citus_worker_guard {
             "        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus')
            AND to_regclass('pg_catalog.pg_dist_node') IS NULL THEN
             RETURN;
         END IF;"
         } else {
             "        NULL;"
-        };
-        Ok(format!(
-            r#"CREATE SCHEMA IF NOT EXISTS {schema};
+        }
+    }
 
-CREATE TABLE IF NOT EXISTS {schema}.ddl_audit (
-    event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    transaction_id bigint NOT NULL DEFAULT txid_current(),
-    emitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    command_tag text NOT NULL,
-    relation_ids oid[] NOT NULL,
-    schema_fingerprint text NOT NULL,
-    payload jsonb NOT NULL
-);
+    /// Keep the exact function source beside the installer. The current-state check compares
+    /// pg_proc.prosrc with these strings, so a stale body cannot pass on its marker alone.
+    fn function_sources(&self) -> SourceResult<DdlFunctionSources> {
+        self.validate()?;
+        let schema = quote_identifier(&self.metadata_schema)?;
+        let snapshot = quote_identifier("schema_snapshot")?;
+        let fingerprint = quote_identifier("schema_fingerprint")?;
+        let worker_guard = self.worker_guard_sql();
 
-CREATE OR REPLACE FUNCTION {schema}.{snapshot}(target_oid oid)
-RETURNS jsonb
-LANGUAGE sql
-STABLE
-AS $pg2cb$
+        let schema_snapshot = r#"
     SELECT jsonb_build_object(
         'relation_id', c.oid::text,
         'schema', n.nspname,
@@ -116,15 +112,240 @@ AS $pg2cb$
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.oid = target_oid;
-$pg2cb$;
+"#
+        .to_owned();
+
+        let schema_fingerprint = format!(
+            "\n    SELECT md5(COALESCE({schema}.{snapshot}(target_oid), '{{}}'::jsonb)::text);\n"
+        );
+
+        let emit_ddl_event = format!(
+            r#"
+DECLARE
+    commands jsonb;
+    relation_ids oid[];
+    affected_schemas text[];
+    fingerprint text;
+    payload jsonb;
+BEGIN
+    -- DROP is emitted by the sql_drop trigger below. This prevents one logical DDL event from
+    -- being emitted twice when PostgreSQL invokes both event-trigger phases.
+    IF TG_TAG LIKE 'DROP %' THEN
+        RETURN;
+    END IF;
+    IF current_setting('pg2cb.internal_ddl', true) = 'on' THEN
+        RETURN;
+    END IF;
+{worker_guard}
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'class_id', classid::text,
+        'object_id', objid::text,
+        'object_type', object_type,
+        'schema_name', schema_name,
+        'object_identity', object_identity,
+        'command_tag', command_tag
+    ) ORDER BY classid, objid, objsubid), '[]'::jsonb)
+      INTO commands
+      FROM pg_event_trigger_ddl_commands();
+
+    SELECT COALESCE(array_agg(objid ORDER BY objid), '{{}}'::oid[])
+      INTO relation_ids
+      FROM pg_event_trigger_ddl_commands()
+     WHERE classid = 'pg_class'::regclass;
+
+    SELECT COALESCE(array_agg(DISTINCT affected_schema ORDER BY affected_schema), '{{}}'::text[])
+      INTO affected_schemas
+      FROM (
+          SELECT CASE
+              WHEN object_type = 'schema' THEN (parse_ident(object_identity, true))[1]
+              ELSE schema_name
+          END AS affected_schema
+            FROM pg_event_trigger_ddl_commands()
+      ) objects
+     WHERE affected_schema IS NOT NULL AND affected_schema <> '';
+
+    SELECT md5(COALESCE(
+        (SELECT jsonb_agg({schema}.{fingerprint}(objid) ORDER BY objid)::text
+           FROM pg_event_trigger_ddl_commands()
+          WHERE classid = 'pg_class'::regclass),
+        '[]')) INTO fingerprint;
+    payload := jsonb_build_object(
+        'version', {version},
+        'command_tag', TG_TAG,
+        'relation_ids', to_jsonb(ARRAY(SELECT value::text FROM unnest(relation_ids) AS value)),
+        'affected_schemas', to_jsonb(affected_schemas),
+        'schema_fingerprint', fingerprint,
+        'commands', commands
+    );
+
+    INSERT INTO {schema}.ddl_audit(command_tag, relation_ids, schema_fingerprint, payload)
+    VALUES (TG_TAG, relation_ids, fingerprint, payload);
+
+    PERFORM pg_logical_emit_message(true, '{prefix}', payload::text);
+END;
+"#,
+            worker_guard = worker_guard,
+            schema = schema,
+            fingerprint = fingerprint,
+            version = DDL_MESSAGE_VERSION,
+            prefix = DDL_MESSAGE_PREFIX,
+        );
+
+        let emit_sql_drop_event = format!(
+            r#"
+DECLARE
+    dropped jsonb;
+    relation_ids oid[];
+    affected_schemas text[];
+    fingerprint text;
+    payload jsonb;
+BEGIN
+    IF current_setting('pg2cb.internal_ddl', true) = 'on' THEN
+        RETURN;
+    END IF;
+{worker_guard}
+    -- Retain schema/table/type objects: these are the objects whose removal can invalidate the
+    -- mirrored catalog. Other DROP commands still produce an empty-scope message, which the
+    -- engine treats as unknown and therefore fail-closed.
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'class_id', classid::text,
+        'object_id', objid::text,
+        'object_sub_id', objsubid,
+        'object_type', object_type,
+        'schema_name', schema_name,
+        'object_name', object_name,
+        'object_identity', object_identity,
+        'original', original,
+        'normal', normal
+    ) ORDER BY classid, objid, objsubid), '[]'::jsonb)
+      INTO dropped
+      FROM pg_event_trigger_dropped_objects()
+     WHERE object_type IN (
+         'schema', 'table', 'partitioned table', 'foreign table',
+         'type', 'domain', 'composite type'
+     );
+
+    SELECT COALESCE(array_agg(objid ORDER BY objid), '{{}}'::oid[])
+      INTO relation_ids
+      FROM pg_event_trigger_dropped_objects()
+     WHERE classid = 'pg_class'::regclass
+       AND objsubid = 0
+       AND object_type IN ('table', 'partitioned table', 'foreign table');
+
+    SELECT COALESCE(array_agg(DISTINCT affected_schema ORDER BY affected_schema), '{{}}'::text[])
+      INTO affected_schemas
+      FROM (
+          SELECT CASE
+              WHEN object_type = 'schema' THEN (parse_ident(object_identity, true))[1]
+              ELSE schema_name
+          END AS affected_schema
+            FROM pg_event_trigger_dropped_objects()
+           WHERE object_type IN (
+               'schema', 'table', 'partitioned table', 'foreign table',
+               'type', 'domain', 'composite type'
+           )
+      ) objects
+     WHERE affected_schema IS NOT NULL AND affected_schema <> '';
+
+    fingerprint := md5(dropped::text);
+    payload := jsonb_build_object(
+        'version', {version},
+        'command_tag', TG_TAG,
+        'relation_ids', to_jsonb(ARRAY(SELECT value::text FROM unnest(relation_ids) AS value)),
+        'affected_schemas', to_jsonb(affected_schemas),
+        'schema_fingerprint', fingerprint,
+        'commands', dropped
+    );
+
+    INSERT INTO {schema}.ddl_audit(command_tag, relation_ids, schema_fingerprint, payload)
+    VALUES (TG_TAG, relation_ids, fingerprint, payload);
+
+    PERFORM pg_logical_emit_message(true, '{prefix}', payload::text);
+END;
+"#,
+            worker_guard = worker_guard,
+            schema = schema,
+            version = DDL_MESSAGE_VERSION,
+            prefix = DDL_MESSAGE_PREFIX,
+        );
+
+        Ok(DdlFunctionSources {
+            schema_snapshot,
+            schema_fingerprint,
+            emit_ddl_event,
+            emit_sql_drop_event,
+        })
+    }
+
+
+    fn singleton_cleanup_sql(&self) -> String {
+        if self.trigger_name != CANONICAL_DDL_TRIGGER_NAME {
+            return String::new();
+        }
+        format!(
+            r#"DO $pg2cb$
+DECLARE
+    managed_trigger record;
+BEGIN
+    FOR managed_trigger IN
+        SELECT e.evtname
+          FROM pg_event_trigger e
+         WHERE e.evtname NOT IN ('{canonical}', '{canonical}_drop')
+           AND COALESCE(obj_description(e.oid, 'pg_event_trigger'), '')
+               LIKE 'pg2cloudberry_ddl_capture_v%'
+    LOOP
+        EXECUTE format('DROP EVENT TRIGGER %I', managed_trigger.evtname);
+    END LOOP;
+END;
+$pg2cb$;"#,
+            canonical = CANONICAL_DDL_TRIGGER_NAME,
+        )
+    }
+
+    /// Render an idempotent installer. All user-provided names are identifiers; no SQL values are
+    /// interpolated. The returned batch is intended to run on the source coordinator only.
+    pub fn install_sql(&self) -> SourceResult<String> {
+        self.validate()?;
+        let sources = self.function_sources()?;
+        let schema = quote_identifier(&self.metadata_schema)?;
+        let trigger = quote_identifier(&self.trigger_name)?;
+        let drop_trigger_name = self.drop_trigger_name()?;
+        let drop_trigger = quote_identifier(&drop_trigger_name)?;
+        let trigger_name_literal = quote_literal(&self.trigger_name)?;
+        let drop_trigger_name_literal = quote_literal(&drop_trigger_name)?;
+        let function = quote_identifier("emit_ddl_event")?;
+        let drop_function = quote_identifier("emit_sql_drop_event")?;
+        let snapshot = quote_identifier("schema_snapshot")?;
+        let fingerprint = quote_identifier("schema_fingerprint")?;
+        let schema_snapshot_source = &sources.schema_snapshot;
+        let schema_fingerprint_source = &sources.schema_fingerprint;
+        let emit_ddl_event_source = &sources.emit_ddl_event;
+        let emit_sql_drop_event_source = &sources.emit_sql_drop_event;
+        let singleton_cleanup = self.singleton_cleanup_sql();
+        Ok(format!(
+            r#"CREATE SCHEMA IF NOT EXISTS {schema};
+
+CREATE TABLE IF NOT EXISTS {schema}.ddl_audit (
+    event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    transaction_id bigint NOT NULL DEFAULT txid_current(),
+    emitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    command_tag text NOT NULL,
+    relation_ids oid[] NOT NULL,
+    schema_fingerprint text NOT NULL,
+    payload jsonb NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION {schema}.{snapshot}(target_oid oid)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $pg2cb${schema_snapshot_source}$pg2cb$;
 
 CREATE OR REPLACE FUNCTION {schema}.{fingerprint}(target_oid oid)
 RETURNS text
 LANGUAGE sql
 STABLE
-AS $pg2cb$
-    SELECT md5(COALESCE({schema}.{snapshot}(target_oid), '{{}}'::jsonb)::text);
-$pg2cb$;
+AS $pg2cb${schema_fingerprint_source}$pg2cb$;
 
 CREATE OR REPLACE FUNCTION {schema}.{function}()
 RETURNS event_trigger
@@ -273,6 +494,25 @@ BEGIN
 END;
 $pg2cb$;
 
+{singleton_cleanup}
+
+DO $pg2cb$
+DECLARE
+    conflicting_trigger text;
+BEGIN
+    SELECT e.evtname
+      INTO conflicting_trigger
+      FROM pg_event_trigger e
+     WHERE e.evtname IN ({trigger_name_literal}, {drop_trigger_name_literal})
+       AND COALESCE(obj_description(e.oid, 'pg_event_trigger'), '')
+           NOT LIKE 'pg2cloudberry_ddl_capture_v%'
+     LIMIT 1;
+    IF conflicting_trigger IS NOT NULL THEN
+        RAISE EXCEPTION 'event trigger % is not managed by pg2cloudberry', conflicting_trigger;
+    END IF;
+END;
+$pg2cb$;
+
 DROP EVENT TRIGGER IF EXISTS {drop_trigger};
 DROP EVENT TRIGGER IF EXISTS {trigger};
 CREATE EVENT TRIGGER {trigger}
@@ -289,6 +529,8 @@ COMMENT ON FUNCTION {schema}.{drop_function}() IS '{marker}';
             version = DDL_MESSAGE_VERSION,
             prefix = DDL_MESSAGE_PREFIX,
             marker = DDL_CAPTURE_MARKER,
+            trigger_name_literal = trigger_name_literal,
+            drop_trigger_name_literal = drop_trigger_name_literal,
         ))
     }
 
@@ -310,9 +552,35 @@ COMMENT ON FUNCTION {schema}.{drop_function}() IS '{marker}';
 pub async fn ensure_ddl_capture(client: &Client, spec: &DdlInstallSpec) -> SourceResult<bool> {
     spec.validate()?;
     let drop_trigger = spec.drop_trigger_name()?;
-    let current: bool = client
-        .query_one(
-            "SELECT count(*) = 2
+    let install_sql = spec.install_sql()?;
+    client.batch_execute("BEGIN").await?;
+    let result = async {
+        client
+            .batch_execute("SELECT pg_advisory_xact_lock(hashtextextended(current_database(), 0))")
+            .await?;
+        if let Some(row) = client
+            .query_opt(
+                "SELECT n.nspname
+                   FROM pg_event_trigger e
+                   JOIN pg_proc p ON p.oid = e.evtfoid
+                   JOIN pg_namespace n ON n.oid = p.pronamespace
+                  WHERE e.evtname IN ($1, $2)
+                    AND COALESCE(obj_description(e.oid, 'pg_event_trigger'), '')
+                        LIKE 'pg2cloudberry_ddl_capture_v%'
+                    AND n.nspname <> $3
+                  LIMIT 1",
+                &[&spec.trigger_name, &drop_trigger, &spec.metadata_schema],
+            )
+            .await?
+        {
+            let existing_schema: String = row.try_get(0)?;
+            return Err(SourceError::Ddl(format!(
+                "DDL capture is already owned by metadata schema `{existing_schema}`"
+            )));
+        }
+        let current: bool = client
+            .query_one(
+                "SELECT count(*) = 2
                FROM (VALUES
                     ($1::text, 'ddl_command_end'::text, 'emit_ddl_event'::text),
                     ($2::text, 'sql_drop'::text, 'emit_sql_drop_event'::text)
@@ -327,37 +595,40 @@ pub async fn ensure_ddl_capture(client: &Client, spec: &DdlInstallSpec) -> Sourc
                 AND p.proname::text = expected.function_name
                 AND obj_description(e.oid, 'pg_event_trigger') = $4
                 AND obj_description(p.oid, 'pg_proc') = $4",
-            &[
-                &spec.trigger_name,
-                &drop_trigger,
-                &spec.metadata_schema,
-                &DDL_CAPTURE_MARKER,
-            ],
-        )
-        .await?
-        .try_get(0)?;
-    if current {
-        return Ok(false);
-    }
-    let install_sql = spec.install_sql()?;
-    client.batch_execute("BEGIN").await?;
-    let result = async {
+                &[
+                    &spec.trigger_name,
+                    &drop_trigger,
+                    &spec.metadata_schema,
+                    &DDL_CAPTURE_MARKER,
+                ],
+            )
+            .await?
+            .try_get(0)?;
         client
             .batch_execute("SELECT set_config('pg2cb.internal_ddl', 'on', true)")
             .await?;
+        if current {
+            if spec.trigger_name == CANONICAL_DDL_TRIGGER_NAME {
+                client.batch_execute(&spec.singleton_cleanup_sql()).await?;
+            }
+            return Ok::<bool, SourceError>(false);
+        }
         client.batch_execute(&install_sql).await?;
-        Ok::<(), SourceError>(())
+        Ok::<bool, SourceError>(true)
     }
     .await;
-    if let Err(error) = result {
-        let _ = client.batch_execute("ROLLBACK").await;
-        return Err(error);
-    }
+    let installed = match result {
+        Ok(installed) => installed,
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(error);
+        }
+    };
     if let Err(error) = client.batch_execute("COMMIT").await {
         let _ = client.batch_execute("ROLLBACK").await;
         return Err(error.into());
     }
-    Ok(true)
+    Ok(installed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

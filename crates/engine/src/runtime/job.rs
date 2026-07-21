@@ -17,7 +17,7 @@ use cloudberry_etl_source_postgres::{
     SourceError,
     catalog::{CatalogOptions, PreflightOptions, PreflightReport, TableInventory, preflight},
     connection::connect_replication,
-    ddl::{DdlInstallSpec, ensure_ddl_capture},
+    ddl::{CANONICAL_DDL_TRIGGER_NAME, DdlInstallSpec, ensure_ddl_capture},
     publication::{
         LogicalSlotState, PublicationSpec, drop_logical_slot, ensure_publication,
         inspect_logical_slot, validate_publication,
@@ -664,7 +664,7 @@ impl PostgresCloudberryJob {
     ) -> Result<(), RuntimeJobError> {
         let spec = DdlInstallSpec {
             metadata_schema: self.source_settings.metadata_schema.clone(),
-            trigger_name: format!("pg2cb_ddl_{}", self.source.id.as_uuid().simple()),
+            trigger_name: CANONICAL_DDL_TRIGGER_NAME.to_owned(),
             allow_citus_worker_guard: true,
         };
         let installed = ensure_ddl_capture(source, &spec).await?;

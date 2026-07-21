@@ -83,10 +83,12 @@ impl PipelineSupervisor {
                 "reaped finished pipeline before restart"
             );
         }
+        let telemetry = self.telemetry_for(pipeline_id).await;
         let mut pipelines = self.pipelines.lock().await;
         if pipelines.contains_key(&pipeline_id) {
             return Err(SupervisorError::AlreadyRunning(pipeline_id));
         }
+        telemetry.mark_started();
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move { job.run(task_cancellation).await });
@@ -97,8 +99,6 @@ impl PipelineSupervisor {
                 handle,
             },
         );
-        drop(pipelines);
-        self.telemetry_for(pipeline_id).await.mark_started();
         Ok(())
     }
 

@@ -21,6 +21,7 @@ cloudberry-etl-engine.workspace = true
 cloudberry-etl-metadata.workspace = true
 cloudberry-etl-source-postgres.workspace = true
 cloudberry-etl-target-cloudberry.workspace = true
+deadpool-postgres.workspace = true
 native-tls.workspace = true
 postgres-native-tls.workspace = true
 rand.workspace = true

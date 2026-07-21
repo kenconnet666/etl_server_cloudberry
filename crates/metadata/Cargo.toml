@@ -11,6 +11,7 @@ base64.workspace = true
 chacha20poly1305.workspace = true
 chrono.workspace = true
 cloudberry-etl-core.workspace = true
+deadpool-postgres.workspace = true
 rand.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -22,6 +23,7 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tokio.workspace = true
 
 [lints]

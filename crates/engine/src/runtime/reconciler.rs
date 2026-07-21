@@ -523,6 +523,10 @@ mod tests {
 
     #[async_trait]
     impl ControlStore for FakeStore {
+        async fn check_readiness(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+
         async fn put_source(&self, _source: &SourceProfile) -> Result<(), StoreError> {
             Ok(())
         }

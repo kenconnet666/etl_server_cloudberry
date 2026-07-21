@@ -29,6 +29,7 @@ bytes = { version = "1", features = ["serde"] }
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+deadpool-postgres = "0.14.1"
 futures = "0.3"
 http = "1"
 native-tls = "0.2"

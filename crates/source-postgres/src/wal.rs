@@ -415,6 +415,18 @@ impl TransactionAssembler {
                         row.relation_id, row.generation
                     )));
                 }
+                // Independent managed capture triggers can overlap during upgrades and emit the
+                // same DDL message in one transaction. Keep one barrier, but retain messages with
+                // a different fingerprint or schema scope.
+                if let TransactionChange::Ddl(message) = &change
+                    && self.pending.as_ref().is_some_and(|pending| {
+                        pending.changes.iter().any(|existing| {
+                            matches!(existing, TransactionChange::Ddl(previous) if previous == message)
+                        })
+                    })
+                {
+                    return Ok(None);
+                }
                 let pending = self.pending.as_mut().expect("checked above");
                 if pending.changes.len() >= self.limits.max_changes {
                     return Err(SourceError::unsupported(format!(
@@ -1018,6 +1030,41 @@ mod tests {
         assert_eq!(committed.transaction.xid, 11);
         assert_eq!(committed.transaction.changes.len(), 3);
         assert!(assembler.finish().is_ok());
+    }
+
+    #[test]
+    fn assembler_deduplicates_identical_ddl_messages_in_one_transaction() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let message = DdlMessage {
+            version: 1,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "same".to_owned(),
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler.push(begin(1, 7)).unwrap();
+        assembler
+            .push(DecodedMessage::Ddl(message.clone()))
+            .unwrap();
+        assembler.push(DecodedMessage::Ddl(message)).unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(2, 3)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        assert_eq!(
+            committed
+                .transaction
+                .changes
+                .iter()
+                .filter(|change| matches!(change, TransactionChange::Ddl(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

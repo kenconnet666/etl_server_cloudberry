@@ -22,8 +22,9 @@ use cloudberry_etl_engine::{
 use cloudberry_etl_metadata::{
     crypto::MasterKey,
     migration::{CONTROL_SCHEMA_VERSION, migrate_control_database},
-    store::{ControlStore, PostgresControlStore},
+    store::{ControlStore, PostgresControlStore, configure_control_session},
 };
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use secrecy::{ExposeSecret, SecretString};
@@ -129,8 +130,10 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     let control_dsn = config.control_database_url()?;
     let client = connect_database(&control_dsn).await?;
     ensure_control_database_migrated(&client).await?;
+    drop(client);
 
-    let control: Arc<dyn ControlStore> = Arc::new(PostgresControlStore::new(client));
+    let control_pool = build_control_pool(&control_dsn)?;
+    let control: Arc<dyn ControlStore> = Arc::new(PostgresControlStore::new(control_pool));
     let master_key = Arc::new(MasterKey::from_base64(&config.master_key()?)?);
     let supervisor = Arc::new(PipelineSupervisor::new());
     let state = AppState {
@@ -138,6 +141,7 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
         master_key: Arc::clone(&master_key),
         supervisor: Arc::clone(&supervisor),
         connection_tester: Arc::new(PostgresConnectionTester),
+        metrics_gate: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let auth = AuthState::new(
         config.admin.username.clone(),
@@ -234,6 +238,32 @@ async fn connect_database(dsn: &SecretString) -> Result<Client> {
         }
     });
     Ok(client)
+}
+
+fn build_control_pool(dsn: &SecretString) -> Result<Pool> {
+    let mut pg_config: PgConfig = dsn
+        .expose_secret()
+        .parse()
+        .context("invalid PostgreSQL connection string")?;
+    configure_control_session(&mut pg_config);
+    let connector = TlsConnector::builder()
+        .build()
+        .context("failed to initialize TLS")?;
+    let manager = Manager::from_config(
+        pg_config,
+        MakeTlsConnector::new(connector),
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Verified,
+        },
+    );
+    Pool::builder(manager)
+        .max_size(8)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(Duration::from_secs(5)))
+        .create_timeout(Some(Duration::from_secs(5)))
+        .recycle_timeout(Some(Duration::from_secs(5)))
+        .build()
+        .context("failed to build control database connection pool")
 }
 
 async fn ensure_control_database_migrated(client: &Client) -> Result<()> {

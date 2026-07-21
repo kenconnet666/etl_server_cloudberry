@@ -7,6 +7,7 @@ use cloudberry_etl_engine::supervisor::PipelineSupervisor;
 use cloudberry_etl_metadata::{crypto::MasterKey, store::ControlStore};
 use secrecy::SecretString;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionReport {
@@ -27,6 +28,7 @@ pub struct AppState {
     pub master_key: Arc<MasterKey>,
     pub supervisor: Arc<PipelineSupervisor>,
     pub connection_tester: Arc<dyn ConnectionTester>,
+    pub metrics_gate: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {

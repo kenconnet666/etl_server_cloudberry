@@ -3,8 +3,8 @@
 //! Run with a disposable control database:
 //! `PG2CB_TEST_CONTROL_DSN=postgres://... cargo test -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored`
 
-use std::error::Error;
 use std::time::Duration;
+use std::{error::Error, panic::AssertUnwindSafe};
 
 use chrono::Utc;
 use cloudberry_etl_core::{
@@ -16,8 +16,10 @@ use cloudberry_etl_metadata::{
     crypto::EncryptedSecret,
     migration::migrate_control_database,
     model::{PipelineDefinition, SourceProfile, TargetProfile},
-    store::{ControlStore, PostgresControlStore, StoreError},
+    store::{ControlStore, PostgresControlStore, StoreError, configure_control_session},
 };
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use futures::FutureExt;
 use serde_json::json;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
@@ -41,12 +43,48 @@ async fn desired_state_and_rebuild_have_independent_revisions() -> Result<(), Bo
 
     migrate_control_database(&mut client).await?;
     let ids = TestIds::new();
-    let store = PostgresControlStore::new(client);
-    let result = run_test(&store, &audit_client, &ids).await;
+    let application_name = format!("pg2cb-control-it-{}", ids.suffix);
+    let mut pool_config: tokio_postgres::Config = dsn.parse()?;
+    pool_config.application_name(&application_name);
+    configure_control_session(&mut pool_config);
+    let manager = Manager::from_config(
+        pool_config,
+        NoTls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Verified,
+        },
+    );
+    let pool = Pool::builder(manager)
+        .max_size(1)
+        .runtime(Runtime::Tokio1)
+        .wait_timeout(Some(Duration::from_secs(5)))
+        .create_timeout(Some(Duration::from_secs(5)))
+        .recycle_timeout(Some(Duration::from_secs(5)))
+        .build()?;
+    let session = pool.get().await?;
+    let row = session
+        .query_one(
+            "SELECT current_setting('statement_timeout'), \
+                    current_setting('lock_timeout'), \
+                    current_setting('idle_in_transaction_session_timeout')",
+            &[],
+        )
+        .await?;
+    assert_eq!(row.get::<_, &str>(0), "5s");
+    assert_eq!(row.get::<_, &str>(1), "2s");
+    assert_eq!(row.get::<_, &str>(2), "5s");
+    drop(session);
+    let store = PostgresControlStore::new(pool);
+    let result = AssertUnwindSafe(run_test(&store, &audit_client, &ids, &application_name))
+        .catch_unwind()
+        .await;
     cleanup(&audit_client, &ids).await;
     connection_task.abort();
     audit_task.abort();
-    result
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 struct TestIds {
@@ -71,7 +109,9 @@ async fn run_test(
     store: &PostgresControlStore,
     audit_client: &Client,
     ids: &TestIds,
+    application_name: &str,
 ) -> Result<(), Box<dyn Error>> {
+    store.check_readiness().await?;
     let now = Utc::now();
     store
         .put_source(&SourceProfile {
@@ -121,6 +161,30 @@ async fn run_test(
         .await?
         .expect("first holder acquires lease");
     store.release_lease(&first_lease).await?;
+
+    let backend_pid: i32 = audit_client
+        .query_one(
+            "SELECT pid
+               FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND application_name = $1
+                AND pid <> pg_backend_pid()
+              ORDER BY backend_start DESC
+              LIMIT 1",
+            &[&application_name],
+        )
+        .await?
+        .get(0);
+    let terminated: bool = audit_client
+        .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+        .await?
+        .get(0);
+    assert!(terminated, "control pool backend was not terminated");
+    let recovered = tokio::time::timeout(Duration::from_secs(5), store.list_pipelines()).await??;
+    assert!(
+        recovered.iter().any(|pipeline| pipeline.id == ids.pipeline),
+        "control store did not recover after its backend was terminated"
+    );
 
     let second_holder = Uuid::new_v4();
     let second_lease = store

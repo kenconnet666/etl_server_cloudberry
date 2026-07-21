@@ -1,6 +1,6 @@
 //! Management API routes.
 
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -31,6 +31,8 @@ use crate::{
     state::{AppState, ConnectionReport},
 };
 use cloudberry_etl_engine::telemetry::PipelineRuntimeSnapshot;
+
+const READINESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn router(state: AppState, auth: AuthState) -> Router {
     let auth_middleware = middleware::from_fn_with_state(auth.clone(), require_session);
@@ -75,22 +77,26 @@ async fn live() -> StatusCode {
 }
 
 async fn ready(State(state): State<AppState>) -> StatusCode {
-    match state.control.list_pipelines().await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(error) => {
+    match tokio::time::timeout(READINESS_TIMEOUT, state.control.check_readiness()).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT,
+        Ok(Err(error)) => {
             tracing::warn!(%error, "readiness check could not reach the control database");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(_) => {
+            tracing::warn!("readiness check timed out");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let (sources, targets, pipelines) = tokio::try_join!(
-        state.control.list_sources(),
-        state.control.list_targets(),
-        state.control.list_pipelines()
-    )
-    .map_err(store_error)?;
+    let _permit = Arc::clone(&state.metrics_gate)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::unavailable("a metrics scrape is already in progress"))?;
+    let sources = state.control.list_sources().await.map_err(store_error)?;
+    let targets = state.control.list_targets().await.map_err(store_error)?;
+    let pipelines = state.control.list_pipelines().await.map_err(store_error)?;
     let desired_running = pipelines
         .iter()
         .filter(|pipeline| pipeline.desired_running)
@@ -792,10 +798,22 @@ mod tests {
 
     struct CommandStore {
         pipeline: Mutex<PipelineDefinition>,
+        ready: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl ControlStore for CommandStore {
+        async fn check_readiness(&self) -> Result<(), StoreError> {
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(StoreError::IncompatibleSchemaVersion {
+                    expected: 2,
+                    actual: 1,
+                })
+            }
+        }
+
         async fn put_source(&self, _source: &SourceProfile) -> Result<(), StoreError> {
             Ok(())
         }
@@ -900,7 +918,7 @@ mod tests {
         }
     }
 
-    fn command_state() -> (AppState, PipelineId) {
+    fn command_state() -> (AppState, PipelineId, Arc<CommandStore>) {
         let now = Utc::now();
         let pipeline = PipelineDefinition {
             id: PipelineId::new(),
@@ -917,22 +935,26 @@ mod tests {
         let id = pipeline.id;
         let key = MasterKey::from_base64(&SecretString::from(STANDARD.encode([7_u8; 32])))
             .expect("test key is valid");
+        let control = Arc::new(CommandStore {
+            pipeline: Mutex::new(pipeline),
+            ready: std::sync::atomic::AtomicBool::new(true),
+        });
         (
             AppState {
-                control: Arc::new(CommandStore {
-                    pipeline: Mutex::new(pipeline),
-                }),
+                control: control.clone(),
                 master_key: Arc::new(key),
                 supervisor: Arc::new(PipelineSupervisor::new()),
                 connection_tester: Arc::new(NoopConnectionTester),
+                metrics_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             },
             id,
+            control,
         )
     }
 
     #[tokio::test]
     async fn start_and_pause_only_change_desired_state() {
-        let (state, id) = command_state();
+        let (state, id, _) = command_state();
 
         let Json(started) = set_pipeline_desired_running(&state, id, true)
             .await
@@ -950,8 +972,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_checks_control_plane_not_local_pipeline_ownership() {
+        let (state, id, control) = command_state();
+        assert_eq!(ready(State(state.clone())).await, StatusCode::NO_CONTENT);
+
+        let Json(_) = set_pipeline_desired_running(&state, id, true)
+            .await
+            .expect("start succeeds");
+        assert_eq!(ready(State(state.clone())).await, StatusCode::NO_CONTENT);
+
+        let telemetry = state.supervisor.telemetry_for(id).await;
+        telemetry.mark_started();
+        assert_eq!(ready(State(state.clone())).await, StatusCode::NO_CONTENT);
+        telemetry.mark_degraded("source connection lost");
+        assert_eq!(ready(State(state.clone())).await, StatusCode::NO_CONTENT);
+
+        control
+            .ready
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(ready(State(state)).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rejects_overlapping_metrics_scrapes_before_querying_the_store() {
+        let (state, _, _) = command_state();
+        let _permit = Arc::clone(&state.metrics_gate)
+            .acquire_owned()
+            .await
+            .expect("metrics gate is open");
+
+        let error = match metrics(State(state)).await {
+            Err(error) => error,
+            Ok(_) => panic!("overlapping scrape was accepted"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn rebuild_changes_only_snapshot_generation_and_returns_operation_id() {
-        let (state, id) = command_state();
+        let (state, id, _) = command_state();
 
         let (headers, Json(rebuilt)) = rebuild_pipeline(State(state), Path(id))
             .await
@@ -969,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn exposes_runtime_progress_without_leaking_error_text_into_metrics() {
-        let (state, id) = command_state();
+        let (state, id, _) = command_state();
         let telemetry = state.supervisor.telemetry_for(id).await;
         telemetry.mark_started();
         telemetry.mark_running();

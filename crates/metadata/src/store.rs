@@ -1,6 +1,6 @@
 //! Control-plane persistence and fencing leases.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,12 +9,14 @@ use cloudberry_etl_core::{
     mapping::SourcePrefix,
     pipeline::SourceTopology,
 };
+use deadpool_postgres::{Client as PoolClient, Pool};
 use thiserror::Error;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::Row;
 use uuid::Uuid;
 
 use crate::{
     crypto::EncryptedSecret,
+    migration::CONTROL_SCHEMA_VERSION,
     model::{
         OperationRecord, PipelineDefinition, PipelineLease, RebuildRequest, SourceProfile,
         TargetProfile,
@@ -25,6 +27,8 @@ use crate::{
 pub enum StoreError {
     #[error("control database operation failed: {0}")]
     Database(#[from] tokio_postgres::Error),
+    #[error("control database connection pool failed: {0}")]
+    Pool(#[from] deadpool_postgres::PoolError),
     #[error("invalid persisted source prefix: {0}")]
     InvalidPrefix(#[from] cloudberry_etl_core::CoreError),
     #[error("unknown source topology `{0}`")]
@@ -33,10 +37,32 @@ pub enum StoreError {
     InvalidLeaseDuration,
     #[error("pipeline configuration revision is stale")]
     StaleRevision,
+    #[error("control database schema version {actual} is incompatible; expected {expected}")]
+    IncompatibleSchemaVersion { expected: i64, actual: i64 },
+}
+
+const CONTROL_SESSION_OPTIONS: &str = "-c statement_timeout=5000 \
+    -c lock_timeout=2000 \
+    -c idle_in_transaction_session_timeout=5000";
+
+/// Applies bounded server-side execution time to every pooled control session.
+/// Existing connection options are retained, while these final values enforce
+/// the limits required by lease renewal and HTTP cancellation semantics.
+pub fn configure_control_session(config: &mut tokio_postgres::Config) {
+    let mut options = config.get_options().unwrap_or_default().to_owned();
+    if !options.is_empty() {
+        options.push(' ');
+    }
+    options.push_str(CONTROL_SESSION_OPTIONS);
+    config.options(options);
+    if config.get_application_name().is_none() {
+        config.application_name("pg2cb-control");
+    }
 }
 
 #[async_trait]
 pub trait ControlStore: Send + Sync {
+    async fn check_readiness(&self) -> Result<(), StoreError>;
     async fn put_source(&self, source: &SourceProfile) -> Result<(), StoreError>;
     async fn list_sources(&self) -> Result<Vec<SourceProfile>, StoreError>;
     async fn put_target(&self, target: &TargetProfile) -> Result<(), StoreError>;
@@ -74,22 +100,44 @@ pub trait ControlStore: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct PostgresControlStore {
-    client: Arc<Client>,
+    pool: Pool,
 }
 
 impl PostgresControlStore {
     #[must_use]
-    pub fn new(client: Client) -> Self {
-        Self {
-            client: Arc::new(client),
-        }
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+
+    async fn client(&self) -> Result<PoolClient, StoreError> {
+        Ok(self.pool.get().await?)
     }
 }
 
 #[async_trait]
 impl ControlStore for PostgresControlStore {
+    async fn check_readiness(&self) -> Result<(), StoreError> {
+        let client = self.client().await?;
+        let actual: i64 = client
+            .query_one(
+                "SELECT COALESCE(max(version), 0) \
+                   FROM cloudberry_etl_control.schema_migrations",
+                &[],
+            )
+            .await?
+            .get(0);
+        if actual != CONTROL_SCHEMA_VERSION {
+            return Err(StoreError::IncompatibleSchemaVersion {
+                expected: CONTROL_SCHEMA_VERSION,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     async fn put_source(&self, source: &SourceProfile) -> Result<(), StoreError> {
-        self.client
+        let client = self.client().await?;
+        client
             .execute(
                 r#"INSERT INTO cloudberry_etl_control.sources (
                     id, name, prefix, database_name, topology, dsn_key_version, dsn_nonce,
@@ -121,7 +169,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn list_sources(&self) -> Result<Vec<SourceProfile>, StoreError> {
-        self.client
+        let client = self.client().await?;
+        client
             .query(
                 r#"SELECT id,name,prefix,database_name,topology,dsn_key_version,dsn_nonce,
                           dsn_ciphertext,settings,enabled,created_at,updated_at
@@ -136,7 +185,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn put_target(&self, target: &TargetProfile) -> Result<(), StoreError> {
-        self.client
+        let client = self.client().await?;
+        client
             .execute(
                 r#"INSERT INTO cloudberry_etl_control.targets (
                     id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,
@@ -165,8 +215,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn list_targets(&self) -> Result<Vec<TargetProfile>, StoreError> {
-        Ok(self
-            .client
+        let client = self.client().await?;
+        Ok(client
             .query(
                 r#"SELECT id,name,database_name,dsn_key_version,dsn_nonce,dsn_ciphertext,
                           settings,enabled,created_at,updated_at
@@ -181,6 +231,7 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn put_pipeline(&self, pipeline: &PipelineDefinition) -> Result<(), StoreError> {
+        let client = self.client().await?;
         let definition = serde_json::json!({
             "id": pipeline.id,
             "name": pipeline.name,
@@ -190,8 +241,7 @@ impl ControlStore for PostgresControlStore {
             "snapshot_generation": pipeline.snapshot_generation,
             "settings": pipeline.settings,
         });
-        let affected = self
-            .client
+        let affected = client
             .execute(
                 r#"WITH changed AS (
                     INSERT INTO cloudberry_etl_control.pipelines (
@@ -234,8 +284,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn list_pipelines(&self) -> Result<Vec<PipelineDefinition>, StoreError> {
-        Ok(self
-            .client
+        let client = self.client().await?;
+        Ok(client
             .query(
                 r#"SELECT id,name,source_id,target_id,desired_running,config_revision,
                           snapshot_generation,settings,created_at,updated_at
@@ -254,8 +304,8 @@ impl ControlStore for PostgresControlStore {
         pipeline_id: PipelineId,
         desired_running: bool,
     ) -> Result<Option<PipelineDefinition>, StoreError> {
-        let row = self
-            .client
+        let client = self.client().await?;
+        let row = client
             .query_opt(
                 r#"UPDATE cloudberry_etl_control.pipelines
                       SET desired_running=$2, updated_at=clock_timestamp()
@@ -272,9 +322,9 @@ impl ControlStore for PostgresControlStore {
         &self,
         pipeline_id: PipelineId,
     ) -> Result<Option<RebuildRequest>, StoreError> {
+        let client = self.client().await?;
         let operation_id = OperationId::new();
-        let row = self
-            .client
+        let row = client
             .query_opt(
                 r#"WITH bumped AS (
                          UPDATE cloudberry_etl_control.pipelines
@@ -324,8 +374,8 @@ impl ControlStore for PostgresControlStore {
         pipeline_id: PipelineId,
         snapshot_generation: i64,
     ) -> Result<u64, StoreError> {
-        let row = self
-            .client
+        let client = self.client().await?;
+        let row = client
             .query_one(
                 r#"WITH completed AS (
                        UPDATE cloudberry_etl_control.operations
@@ -360,8 +410,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn list_operations(&self) -> Result<Vec<OperationRecord>, StoreError> {
-        Ok(self
-            .client
+        let client = self.client().await?;
+        Ok(client
             .query(
                 r#"SELECT id,pipeline_id,operation_type,state,detail,created_at,updated_at
                      FROM cloudberry_etl_control.operations
@@ -381,9 +431,9 @@ impl ControlStore for PostgresControlStore {
         holder_id: Uuid,
         ttl: Duration,
     ) -> Result<Option<PipelineLease>, StoreError> {
+        let client = self.client().await?;
         let ttl_seconds = duration_seconds(ttl)?;
-        let row = self
-            .client
+        let row = client
             .query_opt(
                 r#"INSERT INTO cloudberry_etl_control.pipeline_leases (
                     pipeline_id,holder_id,fencing_token,expires_at
@@ -406,9 +456,9 @@ impl ControlStore for PostgresControlStore {
         lease: &PipelineLease,
         ttl: Duration,
     ) -> Result<Option<PipelineLease>, StoreError> {
+        let client = self.client().await?;
         let ttl_seconds = duration_seconds(ttl)?;
-        let row = self
-            .client
+        let row = client
             .query_opt(
                 r#"UPDATE cloudberry_etl_control.pipeline_leases SET
                     expires_at=clock_timestamp() + $4 * interval '1 second',
@@ -428,7 +478,8 @@ impl ControlStore for PostgresControlStore {
     }
 
     async fn release_lease(&self, lease: &PipelineLease) -> Result<(), StoreError> {
-        self.client
+        let client = self.client().await?;
+        client
             .execute(
                 r#"UPDATE cloudberry_etl_control.pipeline_leases
                       SET expires_at = clock_timestamp(),
@@ -554,5 +605,21 @@ mod tests {
         assert!(duration_seconds(Duration::from_secs(1)).is_ok());
         assert!(duration_seconds(Duration::ZERO).is_err());
         assert!(duration_seconds(Duration::from_secs(86_401)).is_err());
+    }
+
+    #[test]
+    fn control_session_options_are_bounded_and_preserve_existing_options() {
+        let mut config = tokio_postgres::Config::new();
+        config.options("-c search_path=public");
+        configure_control_session(&mut config);
+
+        let options = config
+            .get_options()
+            .expect("session options are configured");
+        assert!(options.starts_with("-c search_path=public "));
+        assert!(options.contains("statement_timeout=5000"));
+        assert!(options.contains("lock_timeout=2000"));
+        assert!(options.contains("idle_in_transaction_session_timeout=5000"));
+        assert_eq!(config.get_application_name(), Some("pg2cb-control"));
     }
 }
