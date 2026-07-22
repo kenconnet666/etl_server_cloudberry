@@ -1572,13 +1572,14 @@ impl PostgresCloudberryJob {
     ) -> Result<(), RuntimeJobError> {
         let row = target
             .query_one(
-                "SELECT current_database(), version(), current_setting('gp_role', true)",
+                "SELECT current_database(), version(), current_setting('gp_role', true), current_setting('server_encoding')",
                 &[],
             )
             .await?;
         let database: String = row.try_get(0)?;
         let version: String = row.try_get(1)?;
         let gp_role: Option<String> = row.try_get(2)?;
+        let server_encoding: String = row.try_get(3)?;
         if database != self.target.database_name {
             return Err(RuntimeJobError::TargetDatabaseMismatch {
                 expected: self.target.database_name.clone(),
@@ -1586,7 +1587,11 @@ impl PostgresCloudberryJob {
             });
         }
         let normalized = version.to_ascii_lowercase();
-        if gp_role.is_none() || !normalized.contains("cloudberry") || !normalized.contains("2.1.") {
+        if gp_role.as_deref() != Some("dispatch")
+            || !server_encoding.eq_ignore_ascii_case("UTF8")
+            || !normalized.contains("cloudberry")
+            || !normalized.contains("2.1.")
+        {
             return Err(RuntimeJobError::UnsupportedTarget);
         }
         Ok(())

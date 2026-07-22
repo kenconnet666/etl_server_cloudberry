@@ -10,12 +10,15 @@ use std::{cmp::Ordering, collections::HashSet, mem::size_of};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 
 use cloudberry_etl_core::change::Cell;
 
 const DIGEST_FORMAT: &[u8] = b"pg2cb-reconcile-digest-v1";
+const MULTISET_DIGEST_FORMAT: &[u8] = b"pg2cb-reconcile-multiset-v1";
+const MULTISET_CONTEXT_DOMAIN: &[u8] = b"context-seed";
+const MULTISET_ROW_DOMAIN: &[u8] = b"canonical-row";
 
 /// A materialized row produced by a canonical SQL text reader.
 ///
@@ -204,6 +207,107 @@ impl PageLimits {
 pub struct ChunkDigest {
     pub row_count: u64,
     pub sha256: [u8; 32],
+}
+
+/// A constant-memory, order-independent digest of canonical rows.
+///
+/// The two accumulators receive the 256-bit halves of each SHA-512 row hash,
+/// each interpreted as a big-endian integer and added modulo 2^256.
+/// `payload_bytes` counts the canonical UTF-8 bytes in keys and non-NULL
+/// values; descriptor and framing bytes are not included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalMultisetDigest {
+    pub row_count: u64,
+    pub payload_bytes: u64,
+    pub accumulator_a: [u8; 32],
+    pub accumulator_b: [u8; 32],
+}
+
+/// Streaming builder for [`CanonicalMultisetDigest`].
+///
+/// It retains only the digest context, counters, and two fixed-size
+/// accumulators. Rows may be pushed in any order and across arbitrary batch
+/// boundaries.
+#[derive(Debug, Clone)]
+pub struct CanonicalMultisetDigestBuilder<'context> {
+    context: &'context DigestContext,
+    row_count: u64,
+    payload_bytes: u64,
+    accumulator_a: [u8; 32],
+    accumulator_b: [u8; 32],
+}
+
+impl<'context> CanonicalMultisetDigestBuilder<'context> {
+    pub fn new(context: &'context DigestContext) -> Result<Self, ReconcileError> {
+        context.validate()?;
+
+        let mut hasher = Sha512::new();
+        hash_multiset_context(&mut hasher, MULTISET_CONTEXT_DOMAIN, context)?;
+        let (accumulator_a, accumulator_b) = split_sha512(hasher.finalize().into());
+
+        Ok(Self {
+            context,
+            row_count: 0,
+            payload_bytes: 0,
+            accumulator_a,
+            accumulator_b,
+        })
+    }
+
+    /// Validates and incorporates one row without retaining it.
+    ///
+    /// All fallible work is completed before builder state is changed.
+    pub fn push(&mut self, row: &CanonicalRow) -> Result<(), ReconcileError> {
+        let row_index = usize::try_from(self.row_count).unwrap_or(usize::MAX);
+        validate_row(self.context, row, row_index)?;
+
+        let row_payload_bytes = canonical_payload_bytes(row)?;
+        let row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or(ReconcileError::DigestLengthOverflow)?;
+        let payload_bytes = self
+            .payload_bytes
+            .checked_add(row_payload_bytes)
+            .ok_or(ReconcileError::DigestLengthOverflow)?;
+
+        let mut hasher = Sha512::new();
+        hash_multiset_context(&mut hasher, MULTISET_ROW_DOMAIN, self.context)?;
+        hash_canonical_row(&mut hasher, self.context, row)?;
+        let (row_a, row_b) = split_sha512(hasher.finalize().into());
+
+        let mut accumulator_a = self.accumulator_a;
+        let mut accumulator_b = self.accumulator_b;
+        add_mod_256(&mut accumulator_a, &row_a);
+        add_mod_256(&mut accumulator_b, &row_b);
+
+        self.row_count = row_count;
+        self.payload_bytes = payload_bytes;
+        self.accumulator_a = accumulator_a;
+        self.accumulator_b = accumulator_b;
+        Ok(())
+    }
+
+    pub fn finish(self) -> CanonicalMultisetDigest {
+        CanonicalMultisetDigest {
+            row_count: self.row_count,
+            payload_bytes: self.payload_bytes,
+            accumulator_a: self.accumulator_a,
+            accumulator_b: self.accumulator_b,
+        }
+    }
+}
+
+/// Digests an arbitrary stream of canonical rows as a multiset.
+pub fn digest_multiset<'row>(
+    context: &DigestContext,
+    rows: impl IntoIterator<Item = &'row CanonicalRow>,
+) -> Result<CanonicalMultisetDigest, ReconcileError> {
+    let mut builder = CanonicalMultisetDigestBuilder::new(context)?;
+    for row in rows {
+        builder.push(row)?;
+    }
+    Ok(builder.finish())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,40 +535,11 @@ where
 
     let mut hasher = Sha256::new();
     hash_bytes(&mut hasher, DIGEST_FORMAT)?;
-    hash_bytes(&mut hasher, context.version_domain.as_bytes())?;
-    hash_bytes(&mut hasher, context.schema_fingerprint.as_bytes())?;
-    hash_columns(&mut hasher, b'K', &context.key_columns)?;
-    hash_columns(&mut hasher, b'V', &context.value_columns)?;
+    hash_digest_context(&mut hasher, context)?;
     hash_len(&mut hasher, rows.len())?;
 
     for row in rows {
-        hasher.update(b"R");
-        hash_len(&mut hasher, row.key.len())?;
-        for (column, key) in context.key_columns.iter().zip(&row.key) {
-            hash_typed_text(&mut hasher, b'K', column, key)?;
-        }
-        hash_len(&mut hasher, row.values.len())?;
-        for (column, value) in context.value_columns.iter().zip(&row.values) {
-            match value {
-                Cell::Null => {
-                    hasher.update(b"N");
-                    hash_column_identity(&mut hasher, column)?;
-                }
-                Cell::Text(value) => hash_typed_text(&mut hasher, b'T', column, value)?,
-                Cell::Binary(_) => {
-                    return Err(ReconcileError::BinaryCell {
-                        component: "value",
-                        index: column.ordinal as usize,
-                    });
-                }
-                Cell::UnchangedToast => {
-                    return Err(ReconcileError::UnchangedToast {
-                        component: "value",
-                        index: column.ordinal as usize,
-                    });
-                }
-            }
-        }
+        hash_canonical_row(&mut hasher, context, row)?;
     }
 
     Ok(ChunkDigest {
@@ -653,18 +728,7 @@ where
     F: Fn(&[Bytes], &[Bytes]) -> Ordering + ?Sized,
 {
     for (row_index, row) in rows.iter().enumerate() {
-        validate_key_arity_and_text(context, &row.key, row_index)?;
-        if row.values.len() != context.value_columns.len() {
-            return Err(ReconcileError::Arity {
-                row: row_index,
-                component: "value",
-                expected: context.value_columns.len(),
-                actual: row.values.len(),
-            });
-        }
-        for (index, value) in row.values.iter().enumerate() {
-            validate_value(index, value)?;
-        }
+        validate_row(context, row, row_index)?;
 
         if let Some(previous) = row_index.checked_sub(1).map(|index| &rows[index]) {
             match compare_keys(&previous.key, &row.key) {
@@ -679,6 +743,50 @@ where
         }
     }
     Ok(())
+}
+
+fn validate_row(
+    context: &DigestContext,
+    row: &CanonicalRow,
+    row_index: usize,
+) -> Result<(), ReconcileError> {
+    validate_key_arity_and_text(context, &row.key, row_index)?;
+    if row.values.len() != context.value_columns.len() {
+        return Err(ReconcileError::Arity {
+            row: row_index,
+            component: "value",
+            expected: context.value_columns.len(),
+            actual: row.values.len(),
+        });
+    }
+    for (index, value) in row.values.iter().enumerate() {
+        validate_value(index, value)?;
+    }
+    Ok(())
+}
+
+fn canonical_payload_bytes(row: &CanonicalRow) -> Result<u64, ReconcileError> {
+    let mut total = 0u64;
+    for value in &row.key {
+        let len = u64::try_from(value.len()).map_err(|_| ReconcileError::DigestLengthOverflow)?;
+        total = total
+            .checked_add(len)
+            .ok_or(ReconcileError::DigestLengthOverflow)?;
+    }
+    for (index, value) in row.values.iter().enumerate() {
+        match value {
+            Cell::Null => {}
+            Cell::Text(value) => {
+                let len =
+                    u64::try_from(value.len()).map_err(|_| ReconcileError::DigestLengthOverflow)?;
+                total = total
+                    .checked_add(len)
+                    .ok_or(ReconcileError::DigestLengthOverflow)?;
+            }
+            Cell::Binary(_) | Cell::UnchangedToast => validate_value(index, value)?,
+        }
+    }
+    Ok(total)
 }
 
 fn validate_key_arity_and_text(
@@ -813,8 +921,63 @@ fn push_repair(
     Ok(())
 }
 
+fn hash_digest_context(
+    hasher: &mut impl Digest,
+    context: &DigestContext,
+) -> Result<(), ReconcileError> {
+    hash_bytes(hasher, context.version_domain.as_bytes())?;
+    hash_bytes(hasher, context.schema_fingerprint.as_bytes())?;
+    hash_columns(hasher, b'K', &context.key_columns)?;
+    hash_columns(hasher, b'V', &context.value_columns)
+}
+
+fn hash_multiset_context(
+    hasher: &mut impl Digest,
+    domain: &[u8],
+    context: &DigestContext,
+) -> Result<(), ReconcileError> {
+    hash_bytes(hasher, MULTISET_DIGEST_FORMAT)?;
+    hash_bytes(hasher, domain)?;
+    hash_digest_context(hasher, context)
+}
+
+fn hash_canonical_row(
+    hasher: &mut impl Digest,
+    context: &DigestContext,
+    row: &CanonicalRow,
+) -> Result<(), ReconcileError> {
+    hasher.update(b"R");
+    hash_len(hasher, row.key.len())?;
+    for (column, key) in context.key_columns.iter().zip(&row.key) {
+        hash_typed_text(hasher, b'K', column, key)?;
+    }
+    hash_len(hasher, row.values.len())?;
+    for (column, value) in context.value_columns.iter().zip(&row.values) {
+        match value {
+            Cell::Null => {
+                hasher.update(b"N");
+                hash_column_identity(hasher, column)?;
+            }
+            Cell::Text(value) => hash_typed_text(hasher, b'T', column, value)?,
+            Cell::Binary(_) => {
+                return Err(ReconcileError::BinaryCell {
+                    component: "value",
+                    index: column.ordinal as usize,
+                });
+            }
+            Cell::UnchangedToast => {
+                return Err(ReconcileError::UnchangedToast {
+                    component: "value",
+                    index: column.ordinal as usize,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn hash_columns(
-    hasher: &mut Sha256,
+    hasher: &mut impl Digest,
     role: u8,
     columns: &[DigestColumn],
 ) -> Result<(), ReconcileError> {
@@ -827,7 +990,7 @@ fn hash_columns(
 }
 
 fn hash_typed_text(
-    hasher: &mut Sha256,
+    hasher: &mut impl Digest,
     marker: u8,
     column: &DigestColumn,
     value: &[u8],
@@ -837,21 +1000,41 @@ fn hash_typed_text(
     hash_bytes(hasher, value)
 }
 
-fn hash_column_identity(hasher: &mut Sha256, column: &DigestColumn) -> Result<(), ReconcileError> {
+fn hash_column_identity(
+    hasher: &mut impl Digest,
+    column: &DigestColumn,
+) -> Result<(), ReconcileError> {
     hasher.update(column.ordinal.to_be_bytes());
     hash_bytes(hasher, column.portable_type_tag.as_bytes())
 }
 
-fn hash_len(hasher: &mut Sha256, len: usize) -> Result<(), ReconcileError> {
+fn hash_len(hasher: &mut impl Digest, len: usize) -> Result<(), ReconcileError> {
     let len = u64::try_from(len).map_err(|_| ReconcileError::DigestLengthOverflow)?;
     hasher.update(len.to_be_bytes());
     Ok(())
 }
 
-fn hash_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ReconcileError> {
+fn hash_bytes(hasher: &mut impl Digest, value: &[u8]) -> Result<(), ReconcileError> {
     hash_len(hasher, value.len())?;
     hasher.update(value);
     Ok(())
+}
+
+fn split_sha512(digest: [u8; 64]) -> ([u8; 32], [u8; 32]) {
+    let mut left = [0u8; 32];
+    let mut right = [0u8; 32];
+    left.copy_from_slice(&digest[..32]);
+    right.copy_from_slice(&digest[32..]);
+    (left, right)
+}
+
+fn add_mod_256(accumulator: &mut [u8; 32], addend: &[u8; 32]) {
+    let mut carry = 0u16;
+    for index in (0..32).rev() {
+        let sum = u16::from(accumulator[index]) + u16::from(addend[index]) + carry;
+        accumulator[index] = sum as u8;
+        carry = sum >> 8;
+    }
 }
 
 #[cfg(test)]
@@ -1073,6 +1256,212 @@ mod tests {
         assert_ne!(digest, empty);
         assert_ne!(digest, copy_null);
         assert_ne!(empty, copy_null);
+    }
+
+    #[test]
+    fn multiset_digest_is_order_independent_and_streamable() {
+        let context = context();
+        let rows = vec![row(b"1", text(b"alpha")), row(b"22", Cell::Null)];
+
+        let forward = digest_multiset(&context, &rows).unwrap();
+        let reverse = digest_multiset(&context, rows.iter().rev()).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.row_count, 2);
+        assert_eq!(forward.payload_bytes, 8);
+
+        let mut builder = CanonicalMultisetDigestBuilder::new(&context).unwrap();
+        builder.push(&rows[0]).unwrap();
+        builder.push(&rows[1]).unwrap();
+        assert_eq!(builder.finish(), forward);
+    }
+
+    #[test]
+    fn multiset_digest_preserves_duplicate_multiplicity() {
+        let context = context();
+        let sample = row(b"1", text(b"value"));
+        let once = digest_multiset(&context, [&sample]).unwrap();
+        let twice = digest_multiset(&context, [&sample, &sample]).unwrap();
+
+        assert_ne!(once, twice);
+        assert_eq!(once.row_count, 1);
+        assert_eq!(twice.row_count, 2);
+        assert_eq!(twice.payload_bytes, once.payload_bytes * 2);
+    }
+
+    #[test]
+    fn multiset_digest_separates_null_empty_and_copy_null_text() {
+        let context = context();
+        let null = row(b"1", Cell::Null);
+        let empty = row(b"1", text(b""));
+        let copy_null = row(b"1", text(b"\\N"));
+
+        let null_digest = digest_multiset(&context, [&null]).unwrap();
+        let empty_digest = digest_multiset(&context, [&empty]).unwrap();
+        let copy_null_digest = digest_multiset(&context, [&copy_null]).unwrap();
+        assert_ne!(null_digest, empty_digest);
+        assert_ne!(null_digest, copy_null_digest);
+        assert_ne!(empty_digest, copy_null_digest);
+    }
+
+    #[test]
+    fn multiset_digest_is_sensitive_to_keys_values_and_context() {
+        let base = context();
+        let base_row = row(b"1", text(b"a"));
+        let digest = digest_multiset(&base, [&base_row]).unwrap();
+
+        let different_key = row(b"2", text(b"a"));
+        assert_ne!(digest, digest_multiset(&base, [&different_key]).unwrap());
+
+        let different_value = row(b"1", text(b"b"));
+        assert_ne!(digest, digest_multiset(&base, [&different_value]).unwrap());
+
+        let mut different_domain = base.clone();
+        different_domain.version_domain.push_str("-v2");
+        assert_ne!(
+            digest,
+            digest_multiset(&different_domain, [&base_row]).unwrap()
+        );
+
+        let mut different_schema = base.clone();
+        different_schema.schema_fingerprint.push_str("-changed");
+        assert_ne!(
+            digest,
+            digest_multiset(&different_schema, [&base_row]).unwrap()
+        );
+
+        let mut different_type = base.clone();
+        different_type.value_columns[0].portable_type_tag = "pg_catalog.varchar".to_owned();
+        assert_ne!(
+            digest,
+            digest_multiset(&different_type, [&base_row]).unwrap()
+        );
+    }
+
+    #[test]
+    fn multiset_digest_is_sensitive_to_descriptor_order_and_empty_schema() {
+        let mut two_columns = context();
+        two_columns.value_columns = vec![
+            DigestColumn {
+                ordinal: 1,
+                portable_type_tag: "pg_catalog.text".to_owned(),
+            },
+            DigestColumn {
+                ordinal: 2,
+                portable_type_tag: "pg_catalog.int8".to_owned(),
+            },
+        ];
+        let two_values = CanonicalRow {
+            key: vec![Bytes::from_static(b"1")],
+            values: vec![text(b"x"), text(b"2")],
+        };
+        let ordered = digest_multiset(&two_columns, [&two_values]).unwrap();
+        two_columns.value_columns.swap(0, 1);
+        assert_ne!(
+            ordered,
+            digest_multiset(&two_columns, [&two_values]).unwrap()
+        );
+
+        let base = context();
+        let empty = digest_multiset(&base, std::iter::empty()).unwrap();
+        let mut different_schema = base.clone();
+        different_schema.schema_fingerprint.push_str("-changed");
+        assert_ne!(
+            empty,
+            digest_multiset(&different_schema, std::iter::empty()).unwrap()
+        );
+    }
+
+    #[test]
+    fn multiset_digest_rejects_noncanonical_rows_without_mutation() {
+        let context = context();
+        let valid = row(b"1", text(b"a"));
+        let mut builder = CanonicalMultisetDigestBuilder::new(&context).unwrap();
+        builder.push(&valid).unwrap();
+        let before_error = builder.clone().finish();
+
+        let missing_key = CanonicalRow {
+            key: vec![],
+            values: vec![text(b"a")],
+        };
+        assert!(matches!(
+            builder.push(&missing_key),
+            Err(ReconcileError::Arity {
+                component: "key",
+                expected: 1,
+                actual: 0,
+                ..
+            })
+        ));
+
+        let missing_value = CanonicalRow {
+            key: vec![Bytes::from_static(b"2")],
+            values: vec![],
+        };
+        assert!(matches!(
+            builder.push(&missing_value),
+            Err(ReconcileError::Arity {
+                component: "value",
+                expected: 1,
+                actual: 0,
+                ..
+            })
+        ));
+        assert_eq!(builder.clone().finish(), before_error);
+
+        let binary = row(b"2", Cell::Binary(Bytes::from_static(b"a")));
+        assert!(matches!(
+            builder.push(&binary),
+            Err(ReconcileError::BinaryCell {
+                component: "value",
+                ..
+            })
+        ));
+
+        let unchanged_toast = row(b"2", Cell::UnchangedToast);
+        assert!(matches!(
+            builder.push(&unchanged_toast),
+            Err(ReconcileError::UnchangedToast {
+                component: "value",
+                ..
+            })
+        ));
+
+        let invalid_utf8 = CanonicalRow {
+            key: vec![Bytes::from_static(b"\xff")],
+            values: vec![text(b"a")],
+        };
+        assert!(matches!(
+            builder.push(&invalid_utf8),
+            Err(ReconcileError::InvalidUtf8 {
+                component: "key",
+                ..
+            })
+        ));
+
+        let invalid_value_utf8 = row(b"2", Cell::Text(Bytes::from_static(b"\xff")));
+        assert!(matches!(
+            builder.push(&invalid_value_utf8),
+            Err(ReconcileError::InvalidUtf8 {
+                component: "value",
+                ..
+            })
+        ));
+        assert_eq!(builder.finish(), before_error);
+    }
+
+    #[test]
+    fn mod_256_addition_propagates_carry_and_wraps() {
+        let mut carry = [0u8; 32];
+        carry[31] = u8::MAX;
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        add_mod_256(&mut carry, &one);
+        assert_eq!(carry[30], 1);
+        assert_eq!(carry[31], 0);
+
+        let mut wrap = [u8::MAX; 32];
+        add_mod_256(&mut wrap, &one);
+        assert_eq!(wrap, [0u8; 32]);
     }
 
     #[test]

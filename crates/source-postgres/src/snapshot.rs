@@ -10,6 +10,7 @@
 //! gap. A fresh initial-load session restarts its scan from the beginning.
 
 use std::{
+    collections::HashSet,
     error::Error,
     marker::PhantomData,
     mem::size_of,
@@ -18,7 +19,9 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use cloudberry_etl_core::schema::{ColumnSchema, PgType, QualifiedName, TableSchema};
+use cloudberry_etl_core::schema::{
+    ColumnSchema, PgType, QualifiedName, TableSchema, validate_identifier,
+};
 use futures::{Stream, TryStreamExt};
 use tokio_postgres::{
     Client, CopyOutStream, IsolationLevel, Transaction,
@@ -146,7 +149,7 @@ impl Default for SnapshotSettings {
 impl SnapshotSettings {
     fn sql(self) -> String {
         format!(
-            "SET LOCAL DateStyle = '{}'; SET LOCAL IntervalStyle = '{}'; SET LOCAL TimeZone = '{}'; SET LOCAL extra_float_digits = {}; SET LOCAL bytea_output = '{}'; SET LOCAL client_encoding = '{}';",
+            "SET LOCAL DateStyle = '{}, YMD'; SET LOCAL IntervalStyle = '{}'; SET LOCAL TimeZone = '{}'; SET LOCAL extra_float_digits = {}; SET LOCAL bytea_output = '{}'; SET LOCAL client_encoding = '{}';",
             self.date_style.sql(),
             self.interval_style.sql(),
             self.time_zone.sql(),
@@ -399,6 +402,118 @@ enum CanonicalProjection {
     AllColumns,
 }
 
+/// The exact column contract consumed by the whole-table reconciliation digest.
+///
+/// Keys are ordered by primary-key ordinal. Values exclude the keys and are ordered by PostgreSQL
+/// attribute number, so source and target readers can build identical digest contexts without
+/// relying on catalog result order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationCopyColumns<'schema> {
+    key_columns: Vec<&'schema ColumnSchema>,
+    value_columns: Vec<&'schema ColumnSchema>,
+}
+
+impl<'schema> ReconciliationCopyColumns<'schema> {
+    #[must_use]
+    pub fn key_columns(&self) -> &[&'schema ColumnSchema] {
+        &self.key_columns
+    }
+
+    #[must_use]
+    pub fn value_columns(&self) -> &[&'schema ColumnSchema] {
+        &self.value_columns
+    }
+
+    fn ordered_columns(&self) -> impl Iterator<Item = &'schema ColumnSchema> + '_ {
+        self.key_columns.iter().chain(&self.value_columns).copied()
+    }
+}
+
+/// Validate and derive the source projection used by whole-table reconciliation COPY.
+///
+/// This is deliberately stricter than the initial-load COPY helper. Reconciliation is allowed to
+/// compare only a fully admitted table contract; malformed synthetic schemas fail before SQL is
+/// prepared instead of risking a digest over ambiguous columns.
+pub fn reconciliation_copy_columns(
+    schema: &TableSchema,
+) -> SourceResult<ReconciliationCopyColumns<'_>> {
+    validate_reconciliation_identifiers(schema)?;
+    schema
+        .validate_supported()
+        .map_err(|error| SourceError::contract(error.to_string()))?;
+
+    let mut names = HashSet::with_capacity(schema.columns.len());
+    let mut attnums = HashSet::with_capacity(schema.columns.len());
+    for column in &schema.columns {
+        if !names.insert(column.name.as_str()) {
+            return Err(SourceError::contract(format!(
+                "reconciliation COPY table {} has duplicate column name `{}`",
+                schema.name, column.name
+            )));
+        }
+        if column.attnum <= 0 {
+            return Err(SourceError::contract(format!(
+                "reconciliation COPY column {} has invalid attribute number {}",
+                column.name, column.attnum
+            )));
+        }
+        if !attnums.insert(column.attnum) {
+            return Err(SourceError::contract(format!(
+                "reconciliation COPY table {} has duplicate attribute number {}",
+                schema.name, column.attnum
+            )));
+        }
+    }
+
+    let mut key_columns = schema.primary_key();
+    if key_columns.is_empty() {
+        return Err(SourceError::contract(format!(
+            "reconciliation COPY table {} has no primary key",
+            schema.name
+        )));
+    }
+    key_columns.sort_by_key(|column| column.primary_key_ordinal);
+    for (index, column) in key_columns.iter().enumerate() {
+        let ordinal = u16::try_from(index + 1)
+            .map_err(|_| SourceError::contract("reconciliation primary-key ordinal exceeds u16"))?;
+        if column.primary_key_ordinal != Some(ordinal) {
+            return Err(SourceError::contract(format!(
+                "reconciliation COPY primary-key ordinals are not unique and contiguous at column {}",
+                column.name
+            )));
+        }
+        if column.nullable {
+            return Err(SourceError::contract(format!(
+                "reconciliation COPY primary-key column {} is nullable",
+                column.name
+            )));
+        }
+    }
+
+    let mut value_columns = schema
+        .columns
+        .iter()
+        .filter(|column| column.primary_key_ordinal.is_none())
+        .collect::<Vec<_>>();
+    value_columns.sort_by_key(|column| column.attnum);
+
+    Ok(ReconciliationCopyColumns {
+        key_columns,
+        value_columns,
+    })
+}
+
+fn validate_reconciliation_identifiers(schema: &TableSchema) -> SourceResult<()> {
+    for identifier in std::iter::once(schema.name.schema.as_str())
+        .chain(std::iter::once(schema.name.name.as_str()))
+        .chain(schema.columns.iter().map(|column| column.name.as_str()))
+    {
+        validate_identifier(identifier)
+            .map_err(|error| SourceError::contract(error.to_string()))?;
+    }
+    Ok(())
+}
+
 pub struct SnapshotSession<'client> {
     transaction: Transaction<'client>,
     snapshot_id: String,
@@ -462,6 +577,36 @@ impl<'client> SnapshotSession<'client> {
         schema: &TableSchema,
     ) -> SourceResult<SnapshotCopy<'session>> {
         let sql = Self::copy_text_sql(schema)?;
+        let statement = self.transaction.prepare(&sql).await?;
+        let stream = self.transaction.copy_out(&statement).await?;
+        Ok(SnapshotCopy {
+            stream: Box::pin(stream),
+            _session: PhantomData,
+        })
+    }
+
+    /// Build the whole-table canonical text COPY used only by reconciliation.
+    ///
+    /// Rows are intentionally unsorted: the reconciliation digest is a multiset digest. Avoiding
+    /// `ORDER BY` prevents a full-table sort while the explicit projection keeps field order exact.
+    pub fn reconciliation_copy_text_sql(schema: &TableSchema) -> SourceResult<String> {
+        let projection = reconciliation_copy_columns(schema)?;
+        let columns = projection
+            .ordered_columns()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        Self::copy_sql_columns(&schema.name, &columns, CopyFormat::Text)
+    }
+
+    /// Stream a whole source table in canonical reconciliation column order.
+    ///
+    /// The stream remains owned by this repeatable-read `SnapshotSession`, including sessions that
+    /// imported a temporary replication slot's exported snapshot.
+    pub async fn copy_reconciliation_table<'session>(
+        &'session mut self,
+        schema: &TableSchema,
+    ) -> SourceResult<SnapshotCopy<'session>> {
+        let sql = Self::reconciliation_copy_text_sql(schema)?;
         let statement = self.transaction.prepare(&sql).await?;
         let stream = self.transaction.copy_out(&statement).await?;
         Ok(SnapshotCopy {
@@ -1230,6 +1375,26 @@ mod tests {
         }
     }
 
+    fn reconciliation_schema() -> TableSchema {
+        TableSchema {
+            relation_id: 84,
+            generation: 3,
+            name: QualifiedName::new("Sales\"Data", "Order\"Rows").unwrap(),
+            kind: TableKind::Ordinary,
+            replica_identity: ReplicaIdentity::Default,
+            // Physical order deliberately differs from both PK ordinal order and the final
+            // reconciliation projection.
+            columns: vec![
+                supported_column(1, "Payload", 25, "text", PgTypeKind::Text, None),
+                supported_column(2, "Seq No", 20, "int8", PgTypeKind::Int8, Some(2)),
+                supported_column(3, "Tenant\"Id", 23, "int4", PgTypeKind::Int4, Some(1)),
+                supported_column(4, "Other Value", 25, "text", PgTypeKind::Text, None),
+            ],
+            distribution_key: Vec::new(),
+            partition_key: Vec::new(),
+        }
+    }
+
     fn column(
         attnum: i16,
         name: &str,
@@ -1242,6 +1407,30 @@ mod tests {
             name: name.to_owned(),
             data_type: PgType {
                 oid: u32::try_from(attnum).unwrap(),
+                name: QualifiedName::new("pg_catalog", type_name).unwrap(),
+                kind,
+            },
+            nullable: primary_key_ordinal.is_none(),
+            primary_key_ordinal,
+            generated: GeneratedColumn::None,
+            identity: IdentityColumn::None,
+            collation: None,
+        }
+    }
+
+    fn supported_column(
+        attnum: i16,
+        name: &str,
+        oid: u32,
+        type_name: &str,
+        kind: PgTypeKind,
+        primary_key_ordinal: Option<u16>,
+    ) -> ColumnSchema {
+        ColumnSchema {
+            attnum,
+            name: name.to_owned(),
+            data_type: PgType {
+                oid,
                 name: QualifiedName::new("pg_catalog", type_name).unwrap(),
                 kind,
             },
@@ -1284,9 +1473,77 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_copy_puts_composite_key_first_without_sorting_rows() {
+        let schema = reconciliation_schema();
+        let projection = reconciliation_copy_columns(&schema).unwrap();
+        let key_names = projection
+            .key_columns()
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        let value_names = projection
+            .value_columns()
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(key_names, ["Tenant\"Id", "Seq No"]);
+        assert_eq!(value_names, ["Payload", "Other Value"]);
+
+        let sql = SnapshotSession::reconciliation_copy_text_sql(&schema).unwrap();
+        assert_eq!(
+            sql,
+            "COPY (SELECT \"Tenant\"\"Id\", \"Seq No\", \"Payload\", \"Other Value\" FROM \"Sales\"\"Data\".\"Order\"\"Rows\") TO STDOUT WITH (FORMAT text, HEADER false, DELIMITER E'\\t', NULL E'\\\\N')"
+        );
+        assert!(!sql.contains("ORDER BY"));
+    }
+
+    #[test]
+    fn reconciliation_copy_rejects_ambiguous_or_unsupported_schemas() {
+        let mut invalid = reconciliation_schema();
+        invalid.columns.clear();
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        for column in &mut invalid.columns {
+            column.primary_key_ordinal = None;
+        }
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[3].name = invalid.columns[0].name.clone();
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[3].name.clear();
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[3].attnum = invalid.columns[0].attnum;
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[2].primary_key_ordinal = Some(2);
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[2].nullable = true;
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.columns[0].data_type.kind = PgTypeKind::Unsupported {
+            reason: "test-only unsupported payload".to_owned(),
+        };
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+
+        invalid = reconciliation_schema();
+        invalid.name.name = "unsafe\0table".to_owned();
+        assert!(reconciliation_copy_columns(&invalid).is_err());
+    }
+
+    #[test]
     fn controlled_settings_pin_every_textual_representation() {
         let sql = SnapshotSettings::default().sql();
-        assert!(sql.contains("DateStyle = 'ISO'"));
+        assert!(sql.contains("DateStyle = 'ISO, YMD'"));
         assert!(sql.contains("IntervalStyle = 'postgres'"));
         assert!(sql.contains("TimeZone = 'UTC'"));
         assert!(sql.contains("extra_float_digits = 3"));

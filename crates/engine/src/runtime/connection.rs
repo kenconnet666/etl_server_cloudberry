@@ -11,6 +11,8 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio_postgres::{Client, Config};
 
+use cloudberry_etl_source_postgres::connection::canonical_startup_options;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointRole {
     Source,
@@ -51,10 +53,12 @@ pub async fn connect_sql(
     dsn: &SecretString,
     endpoint: EndpointRole,
 ) -> Result<Client, SqlConnectError> {
-    let config: Config = dsn
+    let mut config: Config = dsn
         .expose_secret()
         .parse()
         .map_err(|_| SqlConnectError::InvalidDsn { endpoint })?;
+    let options = canonical_startup_options(config.get_options());
+    config.options(options);
     let connector = TlsConnector::builder()
         .build()
         .map_err(|source| SqlConnectError::Tls { endpoint, source })?;
@@ -82,5 +86,21 @@ mod tests {
         assert!(matches!(error, SqlConnectError::InvalidDsn { .. }));
         assert!(!error.to_string().contains(marker));
         assert!(!format!("{error:?}").contains(marker));
+    }
+
+    #[test]
+    fn sql_connections_append_the_shared_canonical_profile() {
+        let mut config: Config = "host=localhost options='-c DateStyle=SQL,DMY'"
+            .parse()
+            .unwrap();
+        let options = canonical_startup_options(config.get_options());
+        config.options(options);
+        let options = config.get_options().unwrap();
+        assert!(options.starts_with("-c DateStyle=SQL,DMY"));
+        assert!(
+            options.ends_with(
+                cloudberry_etl_source_postgres::connection::CANONICAL_TEXT_STARTUP_OPTIONS
+            )
+        );
     }
 }

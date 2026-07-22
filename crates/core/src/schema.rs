@@ -203,6 +203,9 @@ impl TableSchema {
                 column.name
             )));
         }
+        for column in &primary_key {
+            self.validate_primary_key_column(column)?;
+        }
         if self.kind == TableKind::CitusDistributed
             && !self
                 .distribution_key
@@ -210,6 +213,52 @@ impl TableSchema {
                 .all(|attnum| primary_key.iter().any(|column| column.attnum == *attnum))
         {
             return Err(self.unsupported("Citus primary key must contain the distribution key"));
+        }
+        Ok(())
+    }
+
+    fn validate_primary_key_column(&self, column: &ColumnSchema) -> CoreResult<()> {
+        let expected_builtin = match &column.data_type.kind {
+            PgTypeKind::Int2 => Some(("int2", 21)),
+            PgTypeKind::Int4 => Some(("int4", 23)),
+            PgTypeKind::Int8 => Some(("int8", 20)),
+            PgTypeKind::Uuid => Some(("uuid", 2950)),
+            PgTypeKind::Text => Some(("text", 25)),
+            PgTypeKind::VarChar { .. } => Some(("varchar", 1043)),
+            _ => None,
+        };
+        let Some((expected_name, expected_oid)) = expected_builtin else {
+            return Err(self.unsupported(format!(
+                "primary-key column {} uses {}; production key folding currently supports only pg_catalog.int2, pg_catalog.int4, pg_catalog.int8, pg_catalog.uuid, and pg_catalog.text/varchar with an explicit C or POSIX collation",
+                column.name, column.data_type.name
+            )));
+        };
+        if column.data_type.name.schema != "pg_catalog"
+            || column.data_type.name.name != expected_name
+            || column.data_type.oid != expected_oid
+        {
+            return Err(self.unsupported(format!(
+                "primary-key column {} has type identity {} (OID {}), expected pg_catalog.{expected_name} (OID {expected_oid})",
+                column.name, column.data_type.name, column.data_type.oid
+            )));
+        }
+        if matches!(
+            &column.data_type.kind,
+            PgTypeKind::Text | PgTypeKind::VarChar { .. }
+        ) && !matches!(
+            column.collation.as_ref(),
+            Some(collation)
+                if collation.schema == "pg_catalog"
+                    && matches!(collation.name.as_str(), "C" | "POSIX")
+        ) {
+            let collation = column
+                .collation
+                .as_ref()
+                .map_or_else(|| "<none>".to_owned(), ToString::to_string);
+            return Err(self.unsupported(format!(
+                "primary-key column {} uses collation {collation}; text/varchar keys require explicit pg_catalog.C or pg_catalog.POSIX",
+                column.name
+            )));
         }
         Ok(())
     }
@@ -249,6 +298,28 @@ mod tests {
             oid: 23,
             name: QualifiedName::new("pg_catalog", "int4").unwrap(),
             kind: PgTypeKind::Int4,
+        }
+    }
+
+    fn table_with_key(data_type: PgType, collation: Option<QualifiedName>) -> TableSchema {
+        TableSchema {
+            relation_id: 1,
+            generation: 1,
+            name: QualifiedName::new("public", "key_contract").unwrap(),
+            kind: TableKind::Ordinary,
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![ColumnSchema {
+                attnum: 1,
+                name: "id".into(),
+                data_type,
+                nullable: false,
+                primary_key_ordinal: Some(1),
+                generated: GeneratedColumn::None,
+                identity: IdentityColumn::None,
+                collation,
+            }],
+            distribution_key: vec![],
+            partition_key: vec![],
         }
     }
 
@@ -292,6 +363,97 @@ mod tests {
             .map(|column| column.name.as_str())
             .collect();
         assert_eq!(names, ["id", "tenant_id"]);
+    }
+
+    #[test]
+    fn primary_key_contract_accepts_only_canonical_builtin_keys() {
+        for (oid, name, kind) in [
+            (21, "int2", PgTypeKind::Int2),
+            (23, "int4", PgTypeKind::Int4),
+            (20, "int8", PgTypeKind::Int8),
+            (2950, "uuid", PgTypeKind::Uuid),
+        ] {
+            let data_type = PgType {
+                oid,
+                name: QualifiedName::new("pg_catalog", name).unwrap(),
+                kind,
+            };
+            table_with_key(data_type, None)
+                .validate_supported()
+                .unwrap();
+        }
+
+        for (oid, name, kind) in [
+            (25, "text", PgTypeKind::Text),
+            (1043, "varchar", PgTypeKind::VarChar { length: Some(64) }),
+        ] {
+            for collation in ["C", "POSIX"] {
+                let data_type = PgType {
+                    oid,
+                    name: QualifiedName::new("pg_catalog", name).unwrap(),
+                    kind: kind.clone(),
+                };
+                table_with_key(
+                    data_type,
+                    Some(QualifiedName::new("pg_catalog", collation).unwrap()),
+                )
+                .validate_supported()
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn primary_key_contract_rejects_noncanonical_types_collations_and_identities() {
+        let numeric = PgType {
+            oid: 1700,
+            name: QualifiedName::new("pg_catalog", "numeric").unwrap(),
+            kind: PgTypeKind::Numeric {
+                precision: Some(12),
+                scale: Some(2),
+            },
+        };
+        let error = table_with_key(numeric, None)
+            .validate_supported()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("production key folding"));
+
+        let text = PgType {
+            oid: 25,
+            name: QualifiedName::new("pg_catalog", "text").unwrap(),
+            kind: PgTypeKind::Text,
+        };
+        let error = table_with_key(
+            text,
+            Some(QualifiedName::new("pg_catalog", "default").unwrap()),
+        )
+        .validate_supported()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("require explicit pg_catalog.C or pg_catalog.POSIX"));
+
+        let disguised = PgType {
+            oid: 90_001,
+            name: QualifiedName::new("application", "int8").unwrap(),
+            kind: PgTypeKind::Int8,
+        };
+        let error = table_with_key(disguised, None)
+            .validate_supported()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected pg_catalog.int8"));
+
+        let wrong_oid = PgType {
+            oid: 90_001,
+            name: QualifiedName::new("pg_catalog", "int8").unwrap(),
+            kind: PgTypeKind::Int8,
+        };
+        let error = table_with_key(wrong_oid, None)
+            .validate_supported()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected pg_catalog.int8 (OID 20)"));
     }
 
     #[test]

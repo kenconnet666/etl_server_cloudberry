@@ -8,6 +8,7 @@ pub mod citus;
 pub mod connection;
 pub mod ddl;
 pub mod publication;
+pub mod reconciliation_boundary;
 pub mod snapshot;
 pub mod snapshot_slot;
 pub mod spool;

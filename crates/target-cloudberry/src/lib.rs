@@ -4,6 +4,8 @@ pub mod chunk;
 pub mod copy;
 pub mod managed;
 pub mod migration;
+pub mod reconciliation;
+pub mod reconciliation_reader;
 pub mod schema;
 pub mod schema_event;
 pub mod snapshot;

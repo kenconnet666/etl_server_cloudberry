@@ -353,6 +353,93 @@ CREATE INDEX IF NOT EXISTS table_schema_transitions_unfinished_idx
     WHERE state <> 'completed';
 "#;
 
+/// Latest durable whole-table reconciliation state for one source relation.
+///
+/// Reconciliation deliberately persists only run boundaries and final aggregate statistics, not
+/// per-page progress. A restart treats `aligning` and `scanning` as interrupted and starts a new
+/// fenced run after explicitly superseding the old one. The table uses heap because this metadata
+/// is update-heavy; every unique key contains the Cloudberry distribution key.
+pub const TARGET_V10_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.table_reconciliation_state (
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    source_relation_id bigint NOT NULL CHECK (source_relation_id > 0),
+    target_schema text NOT NULL CHECK (target_schema <> ''),
+    target_table text NOT NULL CHECK (target_table <> ''),
+    target_relation_oid bigint NOT NULL CHECK (target_relation_oid > 0),
+    table_generation bigint NOT NULL CHECK (table_generation > 0),
+    schema_fingerprint text NOT NULL CHECK (schema_fingerprint <> ''),
+    run_id uuid NOT NULL,
+    state text NOT NULL CHECK (state IN (
+        'aligning', 'scanning', 'matched', 'reload_pending',
+        'reloaded', 'failed', 'superseded'
+    )),
+    source_node_id integer NOT NULL,
+    temporary_slot_name text NOT NULL
+        CHECK (temporary_slot_name ~ '^[a-z][a-z0-9_]*$'),
+    source_system_identifier numeric(20, 0) NOT NULL
+        CHECK (source_system_identifier > 0),
+    source_timeline bigint NOT NULL
+        CHECK (source_timeline > 0 AND source_timeline <= 4294967295),
+    source_snapshot_lsn pg_lsn NOT NULL,
+    target_checkpoint_lsn pg_lsn,
+    source_rows bigint CHECK (source_rows >= 0),
+    source_bytes bigint CHECK (source_bytes >= 0),
+    source_digest bytea CHECK (octet_length(source_digest) = 64),
+    target_rows bigint CHECK (target_rows >= 0),
+    target_bytes bigint CHECK (target_bytes >= 0),
+    target_digest bytea CHECK (octet_length(target_digest) = 64),
+    started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    last_consistent_at timestamptz,
+    last_mismatch_at timestamptz,
+    next_due_at timestamptz,
+    failure_reason text
+        CHECK (failure_reason IS NULL OR octet_length(failure_reason) <= 4096),
+    consecutive_failures bigint NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (pipeline_id, topology_generation, source_relation_id),
+    UNIQUE (pipeline_id, topology_generation, target_schema, target_table),
+    CHECK (
+        (source_rows IS NULL AND source_bytes IS NULL AND source_digest IS NULL)
+        OR
+        (source_rows IS NOT NULL AND source_bytes IS NOT NULL AND source_digest IS NOT NULL)
+    ),
+    CHECK (
+        (target_rows IS NULL AND target_bytes IS NULL AND target_digest IS NULL)
+        OR
+        (target_rows IS NOT NULL AND target_bytes IS NOT NULL AND target_digest IS NOT NULL)
+    ),
+    CHECK ((source_rows IS NULL) = (target_rows IS NULL)),
+    CHECK ((state IN ('aligning', 'scanning')) = (source_rows IS NULL)
+        OR state IN ('failed', 'superseded')),
+    CHECK ((state = 'aligning') = (target_checkpoint_lsn IS NULL)
+        OR state IN ('failed', 'superseded')),
+    CHECK ((state IN ('matched', 'reloaded', 'failed', 'superseded'))
+        = (completed_at IS NOT NULL)),
+    CHECK ((state IN ('failed', 'superseded')) = (failure_reason IS NOT NULL)),
+    CHECK ((state IN ('matched', 'reloaded', 'failed')) = (next_due_at IS NOT NULL)),
+    CHECK (state <> 'matched' OR last_consistent_at IS NOT NULL),
+    CHECK (state NOT IN ('reload_pending', 'reloaded') OR last_mismatch_at IS NOT NULL),
+    CHECK (state <> 'reloaded' OR last_consistent_at IS NOT NULL)
+)
+USING heap
+DISTRIBUTED BY (pipeline_id);
+
+CREATE INDEX IF NOT EXISTS table_reconciliation_due_idx
+    ON pg2cb_meta.table_reconciliation_state (
+        pipeline_id, topology_generation, next_due_at, source_relation_id
+    )
+    WHERE state IN ('matched', 'reloaded', 'failed');
+
+CREATE INDEX IF NOT EXISTS table_reconciliation_recovery_idx
+    ON pg2cb_meta.table_reconciliation_state (
+        pipeline_id, topology_generation, state, started_at, source_relation_id
+    )
+    WHERE state IN ('aligning', 'scanning', 'reload_pending');
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -404,6 +491,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "table_schema_transition_ledger",
         sql: TARGET_V9_SQL,
+    },
+    Migration {
+        version: 10,
+        name: "table_reconciliation_state",
+        sql: TARGET_V10_SQL,
     },
 ];
 
@@ -565,7 +657,7 @@ mod tests {
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 9);
+        assert_eq!(MIGRATIONS.len(), 10);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[1].version, 2);
         assert_eq!(MIGRATIONS[2].version, 3);
@@ -575,6 +667,7 @@ mod tests {
         assert_eq!(MIGRATIONS[6].version, 7);
         assert_eq!(MIGRATIONS[7].version, 8);
         assert_eq!(MIGRATIONS[8].version, 9);
+        assert_eq!(MIGRATIONS[9].version, 10);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
@@ -611,6 +704,10 @@ mod tests {
             Sha256::digest(MIGRATIONS[8].sql),
             Sha256::digest(TARGET_V9_SQL)
         );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[9].sql),
+            Sha256::digest(TARGET_V10_SQL)
+        );
     }
 
     #[test]
@@ -645,5 +742,37 @@ mod tests {
         assert!(TARGET_V9_SQL.contains("barrier_lsn pg_lsn NOT NULL"));
         assert!(TARGET_V9_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
         assert!(TARGET_V9_SQL.contains("table_schema_transitions_unfinished_idx"));
+    }
+
+    #[test]
+    fn v10_defines_colocated_heap_reconciliation_state() {
+        assert!(
+            TARGET_V10_SQL
+                .contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.table_reconciliation_state")
+        );
+        assert!(
+            TARGET_V10_SQL
+                .contains("PRIMARY KEY (pipeline_id, topology_generation, source_relation_id)")
+        );
+        assert!(
+            TARGET_V10_SQL
+                .contains("UNIQUE (pipeline_id, topology_generation, target_schema, target_table)")
+        );
+        assert!(TARGET_V10_SQL.contains("USING heap"));
+        assert!(TARGET_V10_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
+        assert!(TARGET_V10_SQL.contains("source_system_identifier numeric(20, 0)"));
+        assert!(
+            TARGET_V10_SQL
+                .contains("table_generation bigint NOT NULL CHECK (table_generation > 0)")
+        );
+        assert!(TARGET_V10_SQL.contains("temporary_slot_name ~ '^[a-z][a-z0-9_]*$'"));
+        assert!(TARGET_V10_SQL.contains("octet_length(failure_reason) <= 4096"));
+        assert!(TARGET_V10_SQL.contains("source_snapshot_lsn pg_lsn NOT NULL"));
+        assert!(TARGET_V10_SQL.contains("target_checkpoint_lsn pg_lsn"));
+        assert!(TARGET_V10_SQL.contains("octet_length(source_digest) = 64"));
+        assert!(TARGET_V10_SQL.contains("octet_length(target_digest) = 64"));
+        assert!(TARGET_V10_SQL.contains("'aligning', 'scanning', 'matched'"));
+        assert!(TARGET_V10_SQL.contains("'reloaded', 'failed', 'superseded'"));
+        assert!(TARGET_V10_SQL.contains("table_reconciliation_recovery_idx"));
     }
 }

@@ -6,6 +6,20 @@ use tokio_postgres::Client as SqlClient;
 
 use crate::{SourceError, SourceResult};
 
+/// Startup settings that make pgoutput text and target text input independent of role defaults.
+/// Keep these aligned with `snapshot::SnapshotSettings`.
+pub const CANONICAL_TEXT_STARTUP_OPTIONS: &str = "-c client_encoding=UTF8 -c DateStyle=ISO,YMD -c IntervalStyle=postgres -c TimeZone=UTC -c extra_float_digits=3 -c bytea_output=hex";
+
+/// Append the canonical profile after caller options so correctness-critical settings win when
+/// a DSN or role supplies a conflicting default. Other caller options remain intact.
+#[must_use]
+pub fn canonical_startup_options(existing: Option<&str>) -> String {
+    existing.map_or_else(
+        || CANONICAL_TEXT_STARTUP_OPTIONS.to_owned(),
+        |existing| format!("{existing} {CANONICAL_TEXT_STARTUP_OPTIONS}"),
+    )
+}
+
 /// Verify that the source is PostgreSQL 18.x.
 ///
 /// This service only supports PostgreSQL 18 as the source. Other versions (17, 19, etc.)
@@ -48,6 +62,8 @@ pub async fn connect_replication(dsn: &str) -> SourceResult<Client> {
     // rather than requiring operators to maintain a second DSN containing
     // `replication=database`.
     config.replication_mode(ReplicationMode::Logical);
+    let options = canonical_startup_options(config.get_options());
+    config.options(options);
     let tls = native_tls::TlsConnector::builder().build()?;
     let (client, connection) = config.connect(MakeTlsConnector::new(tls)).await?;
     tokio::spawn(async move {
@@ -56,4 +72,20 @@ pub async fn connect_replication(dsn: &str) -> SourceResult<Client> {
         }
     });
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_options_override_conflicting_role_or_dsn_defaults() {
+        let options = canonical_startup_options(Some(
+            "-c statement_timeout=30000 -c DateStyle=SQL,DMY -c TimeZone=Asia/Shanghai",
+        ));
+        assert!(options.starts_with("-c statement_timeout=30000"));
+        assert!(options.ends_with(CANONICAL_TEXT_STARTUP_OPTIONS));
+        assert!(options.contains("-c DateStyle=ISO,YMD"));
+        assert!(options.contains("-c TimeZone=UTC"));
+    }
 }

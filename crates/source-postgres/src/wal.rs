@@ -32,6 +32,9 @@ use crate::{
     SourceError, SourceResult,
     ddl::{decode_ddl_message, is_ddl_message_prefix},
     publication::start_replication_sql,
+    reconciliation_boundary::{
+        ReconciliationMarker, decode_reconciliation_marker, is_reconciliation_marker_prefix,
+    },
     spool::{
         ChangeSource, ResourceState, SpoolError, SpoolJournal, SpoolLimits, SpoolWriter,
         framed_change_bytes,
@@ -110,6 +113,7 @@ pub enum DecodedMessage {
         options: i8,
     },
     Ddl(DdlMessage),
+    ReconciliationMarker(ReconciliationMarker),
     Keepalive {
         wal_end: PgLsn,
         timestamp_micros: i64,
@@ -915,15 +919,20 @@ impl TransactionDecoder {
                 self.require_transaction("MESSAGE")?;
                 let prefix = body.prefix()?.to_owned();
                 let content = body.content()?.as_bytes();
-                if !is_ddl_message_prefix(&prefix) {
-                    return Err(SourceError::ReplicationProtocol(format!(
-                        "unknown logical message prefix `{prefix}`"
-                    )));
+                if is_ddl_message_prefix(&prefix) {
+                    return Ok(DecodedMessage::Ddl(decode_ddl_message(
+                        prefix.as_str(),
+                        content,
+                    )?));
                 }
-                Ok(DecodedMessage::Ddl(decode_ddl_message(
-                    prefix.as_str(),
-                    content,
-                )?))
+                if is_reconciliation_marker_prefix(&prefix) {
+                    return Ok(DecodedMessage::ReconciliationMarker(
+                        decode_reconciliation_marker(prefix.as_str(), content)?,
+                    ));
+                }
+                Err(SourceError::ReplicationProtocol(format!(
+                    "unknown logical message prefix `{prefix}`"
+                )))
             }
             LogicalReplicationMessage::Origin(body) => {
                 Err(SourceError::ReplicationProtocol(format!(
@@ -1324,6 +1333,29 @@ mod tests {
         assert_eq!(committed.transaction.xid, 11);
         assert_eq!(committed.transaction.changes.len(), 3);
         assert!(assembler.finish().is_ok());
+    }
+
+    #[test]
+    fn reconciliation_marker_preserves_commit_boundary_without_target_changes() {
+        let identity = SourceNodeIdentity {
+            node_id: 7,
+            system_identifier: 99,
+            timeline: 3,
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler.push(begin(10, 11)).unwrap();
+        assembler
+            .push(DecodedMessage::ReconciliationMarker(ReconciliationMarker {
+                marker_id: Uuid::parse_str("018f7777-7777-7777-8777-777777777777").unwrap(),
+                boundary_lsn: PgLsn::new(9),
+            }))
+            .unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(20, 21)).unwrap()
+        else {
+            panic!("marker commit did not produce a transaction boundary");
+        };
+        assert!(committed.transaction.changes.is_empty());
+        assert_eq!(committed.transaction.final_position.lsn, PgLsn::new(21));
     }
 
     #[test]

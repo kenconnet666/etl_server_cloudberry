@@ -105,6 +105,7 @@ struct TypeDescriptor {
     schema: String,
     name: String,
     typtype: String,
+    category: String,
     base_oid: Option<u32>,
     element_oid: Option<u32>,
     labels: Vec<String>,
@@ -312,9 +313,7 @@ where
                     a.attgenerated::text,
                     a.attidentity::text,
                     c.relreplident::text,
-                    CASE WHEN i.indisprimary
-                         THEN (array_position(i.indkey::int2[], a.attnum) + 1)::int4
-                    END AS pk_ordinal,
+                    pk.ordinal AS pk_ordinal,
                     coll_ns.nspname AS collation_schema,
                     coll.collname AS collation_name,
                     COALESCE((SELECT partattrs::text FROM pg_partitioned_table p WHERE p.partrelid = c.oid), '{}') AS partition_attrs
@@ -323,6 +322,13 @@ where
                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
                LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
                                       AND i.indisvalid AND i.indisready AND i.indimmediate
+               LEFT JOIN LATERAL (
+                   SELECT key_position.ordinality::int4 AS ordinal
+                     FROM unnest(i.indkey::int2[]) WITH ORDINALITY
+                          AS key_position(attnum, ordinality)
+                    WHERE key_position.attnum = a.attnum
+                      AND key_position.ordinality <= i.indnkeyatts
+               ) pk ON true
                LEFT JOIN pg_collation coll ON coll.oid = a.attcollation AND a.attcollation <> 0
                LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
                WHERE c.relkind IN ('r', 'p')
@@ -463,13 +469,14 @@ where
     let rows = client
         .query(
             "SELECT t.oid::int8, ns.nspname, t.typname, t.typtype::text,
+                    t.typcategory::text,
                     NULLIF(t.typbasetype, 0)::int8, NULLIF(t.typelem, 0)::int8,
                     COALESCE(array_agg(e.enumlabel ORDER BY e.enumsortorder)
                              FILTER (WHERE e.enumlabel IS NOT NULL), ARRAY[]::text[])
                FROM pg_type t
                JOIN pg_namespace ns ON ns.oid = t.typnamespace
                LEFT JOIN pg_enum e ON e.enumtypid = t.oid
-              GROUP BY t.oid, ns.nspname, t.typname, t.typtype,
+              GROUP BY t.oid, ns.nspname, t.typname, t.typtype, t.typcategory,
                        t.typbasetype, t.typelem",
             &[],
         )
@@ -478,11 +485,11 @@ where
     for row in rows {
         let oid = parse_u32_value(row.try_get::<_, i64>(0)?, "type oid")?;
         let base_oid = row
-            .try_get::<_, Option<i64>>(4)?
+            .try_get::<_, Option<i64>>(5)?
             .map(|value| parse_u32_value(value, "base type oid"))
             .transpose()?;
         let element_oid = row
-            .try_get::<_, Option<i64>>(5)?
+            .try_get::<_, Option<i64>>(6)?
             .map(|value| parse_u32_value(value, "element type oid"))
             .transpose()?;
         descriptors.insert(
@@ -492,9 +499,10 @@ where
                 schema: row.try_get(1)?,
                 name: row.try_get(2)?,
                 typtype: row.try_get(3)?,
+                category: row.try_get(4)?,
                 base_oid,
                 element_oid,
-                labels: row.try_get(6)?,
+                labels: row.try_get(7)?,
                 constraints: constraints_by_type.remove(&oid).unwrap_or_default(),
             },
         );
@@ -509,11 +517,11 @@ fn resolve_type(
 ) -> SourceResult<PgType> {
     let name = QualifiedName::new(descriptor.schema.clone(), descriptor.name.clone())
         .map_err(|error| SourceError::contract(error.to_string()))?;
-    let kind = match descriptor.typtype.as_str() {
-        "e" => PgTypeKind::Enum {
+    let kind = match (descriptor.typtype.as_str(), descriptor.category.as_str()) {
+        ("e", _) => PgTypeKind::Enum {
             labels: descriptor.labels.clone(),
         },
-        "d" => {
+        ("d", _) => {
             let base = descriptor
                 .base_oid
                 .and_then(|oid| all.get(&oid))
@@ -525,7 +533,7 @@ fn resolve_type(
                 constraints: descriptor.constraints.clone(),
             }
         }
-        "b" if descriptor.element_oid.is_some() => {
+        ("b", "A") if descriptor.element_oid.is_some() => {
             let element = descriptor
                 .element_oid
                 .and_then(|oid| all.get(&oid))
@@ -536,7 +544,21 @@ fn resolve_type(
                 element: Box::new(resolve_type(element, all, -1)?),
             }
         }
-        _ => scalar_kind(&descriptor.name, typmod),
+        ("b", _) if descriptor.schema == "pg_catalog" => {
+            scalar_kind(descriptor.oid, &descriptor.name, typmod)
+        }
+        ("b", _) => PgTypeKind::Unsupported {
+            reason: format!(
+                "user-defined base type {}.{} is not a registered PostgreSQL builtin",
+                descriptor.schema, descriptor.name
+            ),
+        },
+        (typtype, _) => PgTypeKind::Unsupported {
+            reason: format!(
+                "PostgreSQL type {}.{} has unsupported typtype {typtype}",
+                descriptor.schema, descriptor.name
+            ),
+        },
     };
     Ok(PgType {
         oid: descriptor.oid,
@@ -545,64 +567,64 @@ fn resolve_type(
     })
 }
 
-fn scalar_kind(name: &str, typmod: i64) -> PgTypeKind {
-    match name {
-        "bool" => PgTypeKind::Bool,
-        "int2" => PgTypeKind::Int2,
-        "int4" => PgTypeKind::Int4,
-        "int8" => PgTypeKind::Int8,
-        "numeric" => {
+fn scalar_kind(oid: u32, name: &str, typmod: i64) -> PgTypeKind {
+    match (oid, name) {
+        (16, "bool") => PgTypeKind::Bool,
+        (21, "int2") => PgTypeKind::Int2,
+        (23, "int4") => PgTypeKind::Int4,
+        (20, "int8") => PgTypeKind::Int8,
+        (1700, "numeric") => {
             let (precision, scale) = numeric_typmod(typmod);
             PgTypeKind::Numeric { precision, scale }
         }
-        "float4" => PgTypeKind::Float4,
-        "float8" => PgTypeKind::Float8,
-        "text" => PgTypeKind::Text,
-        "varchar" => PgTypeKind::VarChar {
+        (700, "float4") => PgTypeKind::Float4,
+        (701, "float8") => PgTypeKind::Float8,
+        (25, "text") => PgTypeKind::Text,
+        (1043, "varchar") => PgTypeKind::VarChar {
             length: typmod_length(typmod),
         },
-        "bpchar" => PgTypeKind::Char {
+        (1042, "bpchar") => PgTypeKind::Char {
             length: typmod_length(typmod),
         },
-        "bytea" => PgTypeKind::Bytea,
-        "date" => PgTypeKind::Date,
-        "time" => PgTypeKind::Time {
+        (17, "bytea") => PgTypeKind::Bytea,
+        (1082, "date") => PgTypeKind::Date,
+        (1083, "time") => PgTypeKind::Time {
             precision: time_precision(typmod),
             with_time_zone: false,
         },
-        "timetz" => PgTypeKind::Time {
+        (1266, "timetz") => PgTypeKind::Time {
             precision: time_precision(typmod),
             with_time_zone: true,
         },
-        "timestamp" => PgTypeKind::Timestamp {
+        (1114, "timestamp") => PgTypeKind::Timestamp {
             precision: time_precision(typmod),
             with_time_zone: false,
         },
-        "timestamptz" => PgTypeKind::Timestamp {
+        (1184, "timestamptz") => PgTypeKind::Timestamp {
             precision: time_precision(typmod),
             with_time_zone: true,
         },
-        "interval" => PgTypeKind::Interval {
+        (1186, "interval") => PgTypeKind::Interval {
             precision: time_precision(typmod),
         },
-        "uuid" => PgTypeKind::Uuid,
-        "json" => PgTypeKind::Json,
-        "jsonb" => PgTypeKind::Jsonb,
-        "inet" => PgTypeKind::Inet,
-        "cidr" => PgTypeKind::Cidr,
-        "macaddr" => PgTypeKind::MacAddr,
-        "macaddr8" => PgTypeKind::MacAddr8,
-        "bit" => PgTypeKind::Bit {
+        (2950, "uuid") => PgTypeKind::Uuid,
+        (114, "json") => PgTypeKind::Json,
+        (3802, "jsonb") => PgTypeKind::Jsonb,
+        (869, "inet") => PgTypeKind::Inet,
+        (650, "cidr") => PgTypeKind::Cidr,
+        (829, "macaddr") => PgTypeKind::MacAddr,
+        (774, "macaddr8") => PgTypeKind::MacAddr8,
+        (1560, "bit") => PgTypeKind::Bit {
             length: typmod_length(typmod),
             varying: false,
         },
-        "varbit" => PgTypeKind::Bit {
+        (1562, "varbit") => PgTypeKind::Bit {
             length: typmod_length(typmod),
             varying: true,
         },
-        "xml" => PgTypeKind::Xml,
+        (142, "xml") => PgTypeKind::Xml,
         _ => PgTypeKind::Unsupported {
-            reason: format!("unregistered PostgreSQL type {name}"),
+            reason: format!("unregistered PostgreSQL builtin type {name} with OID {oid}"),
         },
     }
 }
@@ -613,8 +635,9 @@ fn numeric_typmod(typmod: i64) -> (Option<u16>, Option<i16>) {
     }
     let value = typmod - 4;
     let precision = u16::try_from((value >> 16) & 0xffff).ok();
-    let scale = i16::try_from(value & 0xffff).ok();
-    (precision, scale)
+    let encoded_scale = i16::try_from(value & 0x07ff).expect("11-bit numeric scale fits i16");
+    let scale = (encoded_scale ^ 0x0400) - 0x0400;
+    (precision, Some(scale))
 }
 
 fn typmod_length(typmod: i64) -> Option<u32> {
@@ -808,10 +831,43 @@ mod tests {
         assert_eq!(typmod_length(-1), None);
         assert_eq!(numeric_typmod(-1), (None, None));
         assert_eq!(numeric_typmod(4 + (12 << 16) + 2), (Some(12), Some(2)));
+        assert_eq!(numeric_typmod(4 + (12 << 16) + 2046), (Some(12), Some(-2)));
     }
 
     #[test]
     fn unknown_types_fail_closed() {
-        assert!(!scalar_kind("postgis_geometry", -1).is_supported());
+        assert!(!scalar_kind(90_000, "postgis_geometry", -1).is_supported());
+    }
+
+    #[test]
+    fn scalar_type_resolution_requires_a_pg_catalog_builtin() {
+        let disguised = TypeDescriptor {
+            oid: 90_001,
+            schema: "application".to_owned(),
+            name: "int8".to_owned(),
+            typtype: "b".to_owned(),
+            category: "N".to_owned(),
+            base_oid: None,
+            element_oid: None,
+            labels: Vec::new(),
+            constraints: Vec::new(),
+        };
+        let resolved = resolve_type(&disguised, &HashMap::new(), -1).unwrap();
+        assert!(matches!(resolved.kind, PgTypeKind::Unsupported { .. }));
+
+        let builtin = TypeDescriptor {
+            schema: "pg_catalog".to_owned(),
+            oid: 20,
+            ..disguised
+        };
+        let resolved = resolve_type(&builtin, &HashMap::new(), -1).unwrap();
+        assert_eq!(resolved.kind, PgTypeKind::Int8);
+
+        let wrong_oid = TypeDescriptor {
+            oid: 90_001,
+            ..builtin
+        };
+        let resolved = resolve_type(&wrong_oid, &HashMap::new(), -1).unwrap();
+        assert!(matches!(resolved.kind, PgTypeKind::Unsupported { .. }));
     }
 }

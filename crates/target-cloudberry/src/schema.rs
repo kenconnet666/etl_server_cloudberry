@@ -441,11 +441,26 @@ mod tests {
         }
     }
 
-    fn column(attnum: i16, name: &str, kind: PgTypeKind, pk: Option<u16>) -> ColumnSchema {
+    fn builtin_oid(name: &str) -> u32 {
+        match name {
+            "int4" => 23,
+            "int8" => 20,
+            "varchar" => 1043,
+            other => panic!("test fixture has no builtin OID for {other}"),
+        }
+    }
+
+    fn column(
+        attnum: i16,
+        name: &str,
+        type_name: &str,
+        kind: PgTypeKind,
+        pk: Option<u16>,
+    ) -> ColumnSchema {
         ColumnSchema {
             attnum,
             name: name.to_owned(),
-            data_type: pg_type(attnum as u32, name, kind),
+            data_type: pg_type(builtin_oid(type_name), type_name, kind),
             nullable: pk.is_none(),
             primary_key_ordinal: pk,
             generated: GeneratedColumn::None,
@@ -544,9 +559,15 @@ mod tests {
     #[test]
     fn builds_aoco_table_distributed_by_the_complete_pk() {
         let source = table(vec![
-            column(1, "tenant_id", PgTypeKind::Int4, Some(2)),
-            column(2, "payload", PgTypeKind::VarChar { length: Some(64) }, None),
-            column(3, "id", PgTypeKind::Int8, Some(1)),
+            column(1, "tenant_id", "int4", PgTypeKind::Int4, Some(2)),
+            column(
+                2,
+                "payload",
+                "varchar",
+                PgTypeKind::VarChar { length: Some(64) },
+                None,
+            ),
+            column(3, "id", "int8", PgTypeKind::Int8, Some(1)),
         ]);
         let plan = plan_create_table(
             &source,
@@ -577,7 +598,7 @@ mod tests {
 
     #[test]
     fn explicit_storage_profiles_render_only_the_supported_access_methods() {
-        let source = table(vec![column(1, "id", PgTypeKind::Int8, Some(1))]);
+        let source = table(vec![column(1, "id", "int8", PgTypeKind::Int8, Some(1))]);
         for (storage, clause) in [
             (
                 TargetStorage::AoColumn,
@@ -601,7 +622,7 @@ mod tests {
 
     #[test]
     fn rejects_validation_gated_table_kinds() {
-        let mut source = table(vec![column(1, "id", PgTypeKind::Int8, Some(1))]);
+        let mut source = table(vec![column(1, "id", "int8", PgTypeKind::Int8, Some(1))]);
         source.kind = TableKind::CitusReference;
         assert_eq!(
             plan_create_table(&source, QualifiedName::new("target", "orders").unwrap()),

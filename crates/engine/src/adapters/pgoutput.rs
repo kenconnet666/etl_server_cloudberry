@@ -14,7 +14,9 @@ use cloudberry_etl_source_postgres::{
 use futures::StreamExt;
 use tokio::time::{Instant, sleep};
 
-use crate::pipeline::{PipelineError, TransactionSource};
+use crate::pipeline::{
+    PipelineError, ReplicationStopBoundary, StopBoundaryStatus, TransactionSource,
+};
 use crate::telemetry::PipelineTelemetryHandle;
 
 #[async_trait]
@@ -67,6 +69,7 @@ pub struct PgOutputTransactionSource {
     forced_resource_wait: Option<ResourceState>,
     resource_wait_active: bool,
     ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
+    stop_boundary: Option<ReplicationStopBoundary>,
     #[cfg(test)]
     injected_actual_capacity_failures: usize,
 }
@@ -121,6 +124,21 @@ impl PgOutputTransactionSource {
         self.durable_applied_lsn
     }
 
+    /// Attach a shared, one-shot stop boundary controller.
+    pub fn with_stop_boundary(
+        mut self,
+        stop_boundary: ReplicationStopBoundary,
+    ) -> Result<Self, PipelineError> {
+        if self.stop_boundary.is_some() {
+            return Err(PipelineError::StopBoundary(
+                "source already has a stop boundary".to_owned(),
+            ));
+        }
+        stop_boundary.attach_source(self.durable_applied_lsn)?;
+        self.stop_boundary = Some(stop_boundary);
+        Ok(self)
+    }
+
     fn from_transport(
         transport: impl EventTransport + 'static,
         assembler: TransactionAssembler,
@@ -164,6 +182,7 @@ impl PgOutputTransactionSource {
             forced_resource_wait: None,
             resource_wait_active: false,
             ingest_observer,
+            stop_boundary: None,
             #[cfg(test)]
             injected_actual_capacity_failures: 0,
         }
@@ -306,6 +325,14 @@ impl TransactionSource for PgOutputTransactionSource {
     ) -> Result<Option<cloudberry_etl_source_postgres::wal::CommittedTransaction>, PipelineError>
     {
         loop {
+            if self.stop_boundary.as_ref().is_some_and(|boundary| {
+                matches!(
+                    boundary.status(),
+                    StopBoundaryStatus::Draining { .. } | StopBoundaryStatus::Reached { .. }
+                )
+            }) {
+                return Ok(None);
+            }
             if self.pending_message.is_none() {
                 let Some(message) = self.transport.next_message().await else {
                     self.assembler
@@ -355,8 +382,16 @@ impl TransactionSource for PgOutputTransactionSource {
                     if matches!(&committed.change_source, ChangeSource::Spool(_)) {
                         self.observe_ingest(SourceIngestPoint::AfterSpoolCommit)?;
                     }
-                    self.delivered_commits
-                        .push_back(committed.transaction.final_position.lsn);
+                    let final_lsn = committed.transaction.final_position.lsn;
+                    if let Some(stop_boundary) = &self.stop_boundary
+                        && stop_boundary.observe_transaction(final_lsn)?
+                    {
+                        // The target checkpoint has not advanced past the boundary, so this
+                        // transaction must remain replayable from WAL. In particular, dropping a
+                        // spool handle here does not remove its committed journal artifacts.
+                        return Ok(None);
+                    }
+                    self.delivered_commits.push_back(final_lsn);
                     return Ok(Some(*committed));
                 }
                 Some(AssembledEvent::Keepalive {
@@ -386,11 +421,22 @@ impl TransactionSource for PgOutputTransactionSource {
         {
             self.delivered_commits.pop_front();
         }
-        self.send_durable_status().await
+        self.send_durable_status().await?;
+        if let Some(stop_boundary) = &self.stop_boundary {
+            stop_boundary.record_durable(position.lsn)?;
+        }
+        Ok(())
     }
 
     async fn heartbeat(&mut self) -> Result<(), PipelineError> {
         self.send_durable_status().await
+    }
+
+    fn finish_stop_boundary(&mut self) -> Result<(), PipelineError> {
+        if let Some(stop_boundary) = &self.stop_boundary {
+            stop_boundary.mark_reached()?;
+        }
+        Ok(())
     }
 }
 
@@ -539,6 +585,180 @@ mod tests {
             assert_eq!(status.apply_lsn, PgLsn::new(expected));
             assert!(!status.reply_requested);
         }
+    }
+
+    #[tokio::test]
+    async fn memory_and_empty_transactions_stop_before_the_first_commit_beyond_boundary() {
+        let stop_boundary = ReplicationStopBoundary::new();
+        stop_boundary.set(PgLsn::new(11)).unwrap();
+        let transport = FakeTransport {
+            messages: VecDeque::from([
+                Ok(DecodedMessage::Begin {
+                    final_lsn: PgLsn::new(10),
+                    timestamp: timestamp(10),
+                    xid: 7,
+                }),
+                Ok(DecodedMessage::Commit {
+                    commit_lsn: PgLsn::new(10),
+                    end_lsn: PgLsn::new(11),
+                    timestamp: timestamp(11),
+                    flags: 0,
+                }),
+                Ok(DecodedMessage::Begin {
+                    final_lsn: PgLsn::new(12),
+                    timestamp: timestamp(12),
+                    xid: 8,
+                }),
+                Ok(DecodedMessage::Commit {
+                    commit_lsn: PgLsn::new(12),
+                    end_lsn: PgLsn::new(13),
+                    timestamp: timestamp(13),
+                    flags: 0,
+                }),
+            ]),
+            statuses: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut source =
+            PgOutputTransactionSource::from_transport(transport, assembler(), PgLsn::new(5))
+                .with_stop_boundary(stop_boundary.clone())
+                .unwrap();
+
+        let at_boundary = source.next_transaction().await.unwrap().unwrap();
+        assert!(at_boundary.transaction.changes.is_empty());
+        assert!(matches!(at_boundary.change_source, ChangeSource::Memory(_)));
+        assert_eq!(at_boundary.final_position.lsn, PgLsn::new(11));
+        assert!(source.next_transaction().await.unwrap().is_none());
+        assert_eq!(source.delivered_commits, [PgLsn::new(11)]);
+        assert_eq!(
+            stop_boundary.status(),
+            StopBoundaryStatus::Draining {
+                boundary: PgLsn::new(11)
+            }
+        );
+
+        let beyond_boundary = identity().position(PgLsn::new(13));
+        assert!(matches!(
+            source.acknowledge(&beyond_boundary).await,
+            Err(PipelineError::Acknowledge(_))
+        ));
+        source
+            .acknowledge(&at_boundary.final_position)
+            .await
+            .unwrap();
+        source.finish_stop_boundary().unwrap();
+        assert_eq!(
+            stop_boundary.status(),
+            StopBoundaryStatus::Reached {
+                boundary: PgLsn::new(11),
+                durable_lsn: PgLsn::new(11),
+            }
+        );
+        assert!(source.next_transaction().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spooled_transaction_beyond_boundary_is_not_delivered_or_cleaned_up() {
+        let root = temp_root();
+        let journal = SpoolJournal::open(
+            &root,
+            SpoolIdentity {
+                pipeline_id: PipelineId::new(),
+                topology_generation: 1,
+                node_id: identity().node_id,
+                system_identifier: identity().system_identifier,
+                timeline: identity().timeline,
+            },
+            SpoolLimits {
+                memory_high_water_bytes: 1,
+                segment_target_bytes: 128,
+                disk_high_water_bytes: 1024 * 1024,
+                minimum_free_disk_bytes: 1,
+            },
+        )
+        .unwrap();
+        let spool_directory = journal.directory().to_owned();
+        let spooling_assembler = TransactionAssembler::with_spool(
+            identity(),
+            TransactionLimits {
+                max_changes: 1,
+                max_bytes: usize::MAX,
+            },
+            journal,
+        )
+        .unwrap();
+        let transport = FakeTransport {
+            messages: VecDeque::from([
+                Ok(DecodedMessage::Relation(RelationEvent {
+                    relation_id: 42,
+                    namespace: "public".to_owned(),
+                    name: "items".to_owned(),
+                    generation: 1,
+                    replica_identity: WireReplicaIdentityKind::Default,
+                    columns: Vec::new(),
+                })),
+                Ok(DecodedMessage::Begin {
+                    final_lsn: PgLsn::new(10),
+                    timestamp: timestamp(10),
+                    xid: 7,
+                }),
+                Ok(DecodedMessage::Insert {
+                    relation_id: 42,
+                    generation: 1,
+                    new: Tuple { cells: Vec::new() },
+                }),
+                Ok(DecodedMessage::Insert {
+                    relation_id: 42,
+                    generation: 1,
+                    new: Tuple { cells: Vec::new() },
+                }),
+                Ok(DecodedMessage::Commit {
+                    commit_lsn: PgLsn::new(10),
+                    end_lsn: PgLsn::new(11),
+                    timestamp: timestamp(11),
+                    flags: 0,
+                }),
+            ]),
+            statuses: Arc::new(Mutex::new(Vec::new())),
+        };
+        let stop_boundary = ReplicationStopBoundary::new();
+        stop_boundary.set(PgLsn::new(10)).unwrap();
+        let mut source =
+            PgOutputTransactionSource::from_transport(transport, spooling_assembler, PgLsn::new(5))
+                .with_stop_boundary(stop_boundary.clone())
+                .unwrap();
+
+        assert!(source.next_transaction().await.unwrap().is_none());
+        assert!(source.delivered_commits.is_empty());
+        assert_eq!(source.durable_applied_lsn(), PgLsn::new(5));
+        assert_eq!(
+            stop_boundary.status(),
+            StopBoundaryStatus::Draining {
+                boundary: PgLsn::new(10)
+            }
+        );
+        let artifacts = fs::read_dir(&spool_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(artifacts.iter().any(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "manifest")
+        }));
+        assert!(
+            artifacts
+                .iter()
+                .any(|path| path.extension().is_some_and(|extension| extension == "seg"))
+        );
+        assert!(matches!(
+            source
+                .acknowledge(&identity().position(PgLsn::new(11)))
+                .await,
+            Err(PipelineError::Acknowledge(_))
+        ));
+
+        drop(source);
+        assert!(artifacts.iter().all(|path| path.exists()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ pub mod connection;
 pub mod job;
 pub mod planning;
 pub mod reconciler;
+pub mod reconciliation;
 pub mod settings;
 
 pub use connection::{EndpointRole, SqlConnectError, connect_sql};

@@ -1434,13 +1434,28 @@ mod tests {
 
     use super::*;
 
-    fn column(attnum: i16, name: &str, kind: PgTypeKind, pk: Option<u16>) -> ColumnSchema {
+    fn builtin_oid(name: &str) -> u32 {
+        match name {
+            "int8" => 20,
+            "text" => 25,
+            "bytea" => 17,
+            other => panic!("test fixture has no builtin OID for {other}"),
+        }
+    }
+
+    fn column(
+        attnum: i16,
+        name: &str,
+        type_name: &str,
+        kind: PgTypeKind,
+        pk: Option<u16>,
+    ) -> ColumnSchema {
         ColumnSchema {
             attnum,
             name: name.to_owned(),
             data_type: PgType {
-                oid: u32::try_from(attnum).unwrap(),
-                name: QualifiedName::new("pg_catalog", name).unwrap(),
+                oid: builtin_oid(type_name),
+                name: QualifiedName::new("pg_catalog", type_name).unwrap(),
                 kind,
             },
             nullable: pk.is_none(),
@@ -1459,9 +1474,9 @@ mod tests {
             kind: TableKind::Ordinary,
             replica_identity: ReplicaIdentity::Default,
             columns: vec![
-                column(1, "id", PgTypeKind::Int8, Some(1)),
-                column(2, "payload", PgTypeKind::Text, None),
-                column(3, "raw", PgTypeKind::Bytea, None),
+                column(1, "id", "int8", PgTypeKind::Int8, Some(1)),
+                column(2, "payload", "text", PgTypeKind::Text, None),
+                column(3, "raw", "bytea", PgTypeKind::Bytea, None),
             ],
             distribution_key: Vec::new(),
             partition_key: Vec::new(),

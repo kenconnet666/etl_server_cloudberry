@@ -13,7 +13,7 @@ use replication_postgres::SimpleQueryMessage;
 
 use crate::{SourceError, SourceResult, connection::connect_replication, sql::quote_identifier};
 
-const OUTPUT_PLUGIN: &str = "pgoutput";
+pub(crate) const OUTPUT_PLUGIN: &str = "pgoutput";
 
 /// The server-side values returned by `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +220,7 @@ pub fn create_exported_snapshot_sql(slot_name: &str) -> SourceResult<String> {
     ))
 }
 
-fn drop_replication_slot_sql(slot_name: &str) -> SourceResult<String> {
+pub(crate) fn drop_replication_slot_sql(slot_name: &str) -> SourceResult<String> {
     validate_slot_name(slot_name)?;
     Ok(format!(
         "DROP_REPLICATION_SLOT {}",
@@ -228,7 +228,7 @@ fn drop_replication_slot_sql(slot_name: &str) -> SourceResult<String> {
     ))
 }
 
-fn validate_slot_name(slot_name: &str) -> SourceResult<()> {
+pub(crate) fn validate_slot_name(slot_name: &str) -> SourceResult<()> {
     if slot_name.is_empty()
         || slot_name.len() > 63
         || !slot_name
@@ -292,7 +292,7 @@ fn required_field<'value>(name: &str, value: Option<&'value str>) -> SourceResul
     })
 }
 
-fn parse_create_slot_response(
+pub(crate) fn parse_create_slot_response(
     messages: &[SimpleQueryMessage],
     requested_slot: &str,
 ) -> SourceResult<ReplicationSlotSnapshot> {

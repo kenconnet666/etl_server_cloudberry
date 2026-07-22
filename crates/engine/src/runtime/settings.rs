@@ -35,6 +35,12 @@ const DEFAULT_WAL_REBUILD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_WAL_MINIMUM_SAFE_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_QUARANTINE_RETENTION_DAYS: u32 = 30;
 const DEFAULT_QUARANTINE_GC_MAX_TABLES: u32 = 100;
+const DEFAULT_RECONCILIATION_INTERVAL_SECONDS: u64 = 300;
+const DEFAULT_RECONCILIATION_RETRY_SECONDS: u64 = 30;
+const DEFAULT_RECONCILIATION_BOUNDARY_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_RECONCILIATION_SCAN_TIMEOUT_SECONDS: u64 = 900;
+const DEFAULT_RECONCILIATION_MAX_LAG_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_RECONCILIATION_MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
 
 /// Hard limits prevent a malformed control record from allocating unbounded memory or delaying
 /// progress indefinitely.  The limits are deliberately public so operators and tests can use the
@@ -49,6 +55,12 @@ pub const MAX_WAL_CHECK_INTERVAL_SECONDS: u64 = 3600;
 pub const MAX_WAL_RETENTION_BYTES: u64 = 1 << 50;
 pub const MAX_QUARANTINE_RETENTION_DAYS: u32 = 3650;
 pub const MAX_QUARANTINE_GC_TABLES: u32 = 1000;
+pub const MAX_RECONCILIATION_INTERVAL_SECONDS: u64 = 7 * 24 * 60 * 60;
+pub const MAX_RECONCILIATION_RETRY_SECONDS: u64 = 24 * 60 * 60;
+pub const MAX_RECONCILIATION_BOUNDARY_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+pub const MAX_RECONCILIATION_SCAN_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+pub const MAX_RECONCILIATION_LAG_BYTES: u64 = 1 << 50;
+pub const MAX_RECONCILIATION_ROW_BYTES: usize = 1 << 30;
 
 const SYSTEM_SCHEMAS: &[&str] = &[
     "pg_catalog",
@@ -238,6 +250,7 @@ impl TargetSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineSettings {
     pub batch: BatchSettings,
+    pub reconciliation: ReconciliationSettings,
     pub table_mappings: Vec<TableMapping>,
 }
 
@@ -252,6 +265,7 @@ impl PipelineSettings {
 
     pub fn validate(&self) -> Result<(), SettingsError> {
         self.batch.validate("batch")?;
+        self.reconciliation.validate("reconciliation")?;
         let mut sources = HashSet::with_capacity(self.table_mappings.len());
         let mut targets = HashSet::with_capacity(self.table_mappings.len());
         for (index, mapping) in self.table_mappings.iter().enumerate() {
@@ -369,6 +383,100 @@ pub struct TransactionSettings {
     pub segment_target_bytes: usize,
     pub disk_high_water_bytes: u64,
     pub minimum_free_disk_bytes: u64,
+}
+
+/// Periodic whole-table consistency verification.
+///
+/// A run establishes an exact source WAL boundary, catches the target up to that boundary, and
+/// compares constant-memory canonical multiset digests. A mismatch schedules the existing
+/// table-local shadow reload path; reconciliation never edits an active AOCO table in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconciliationSettings {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub retry_seconds: u64,
+    pub boundary_timeout_seconds: u64,
+    pub scan_timeout_seconds: u64,
+    pub max_lag_bytes: u64,
+    /// Maximum decoded size of one COPY text record. This bounds parser memory, not table size.
+    pub max_row_bytes: usize,
+}
+
+impl Default for ReconciliationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+            retry_seconds: DEFAULT_RECONCILIATION_RETRY_SECONDS,
+            boundary_timeout_seconds: DEFAULT_RECONCILIATION_BOUNDARY_TIMEOUT_SECONDS,
+            scan_timeout_seconds: DEFAULT_RECONCILIATION_SCAN_TIMEOUT_SECONDS,
+            max_lag_bytes: DEFAULT_RECONCILIATION_MAX_LAG_BYTES,
+            max_row_bytes: DEFAULT_RECONCILIATION_MAX_ROW_BYTES,
+        }
+    }
+}
+
+impl ReconciliationSettings {
+    pub fn validate(&self, path: &str) -> Result<(), SettingsError> {
+        validate_bounded_u64(
+            path,
+            "interval_seconds",
+            self.interval_seconds,
+            MAX_RECONCILIATION_INTERVAL_SECONDS,
+        )?;
+        validate_bounded_u64(
+            path,
+            "retry_seconds",
+            self.retry_seconds,
+            MAX_RECONCILIATION_RETRY_SECONDS,
+        )?;
+        validate_bounded_u64(
+            path,
+            "boundary_timeout_seconds",
+            self.boundary_timeout_seconds,
+            MAX_RECONCILIATION_BOUNDARY_TIMEOUT_SECONDS,
+        )?;
+        validate_bounded_u64(
+            path,
+            "scan_timeout_seconds",
+            self.scan_timeout_seconds,
+            MAX_RECONCILIATION_SCAN_TIMEOUT_SECONDS,
+        )?;
+        validate_bounded_u64(
+            path,
+            "max_lag_bytes",
+            self.max_lag_bytes,
+            MAX_RECONCILIATION_LAG_BYTES,
+        )?;
+        if !(1..=MAX_RECONCILIATION_ROW_BYTES).contains(&self.max_row_bytes) {
+            return invalid(
+                format!("{path}.max_row_bytes"),
+                format!("must be between 1 and {MAX_RECONCILIATION_ROW_BYTES}"),
+            );
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn interval(self) -> Duration {
+        Duration::from_secs(self.interval_seconds)
+    }
+
+    #[must_use]
+    pub const fn retry_delay(self) -> Duration {
+        Duration::from_secs(self.retry_seconds)
+    }
+
+    #[must_use]
+    pub const fn boundary_timeout(self) -> Duration {
+        Duration::from_secs(self.boundary_timeout_seconds)
+    }
+
+    #[must_use]
+    pub const fn scan_timeout(self) -> Duration {
+        Duration::from_secs(self.scan_timeout_seconds)
+    }
 }
 
 impl Default for TransactionSettings {
@@ -695,6 +803,22 @@ fn invalid<T>(path: impl Into<String>, reason: impl Into<String>) -> Result<T, S
     })
 }
 
+fn validate_bounded_u64(
+    path: &str,
+    field: &str,
+    value: u64,
+    maximum: u64,
+) -> Result<(), SettingsError> {
+    if (1..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        invalid(
+            format!("{path}.{field}"),
+            format!("must be between 1 and {maximum}"),
+        )
+    }
+}
+
 impl fmt::Display for ReplicationNames {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -740,6 +864,17 @@ mod tests {
         }));
         assert!(invalid.is_err());
 
+        let invalid_reconciliation = PipelineSettings::parse(&json!({
+            "reconciliation": {"interval_seconds": 0},
+            "table_mappings": []
+        }));
+        assert!(invalid_reconciliation.is_err());
+        let oversized_reconciliation_row = PipelineSettings::parse(&json!({
+            "reconciliation": {"max_row_bytes": MAX_RECONCILIATION_ROW_BYTES + 1},
+            "table_mappings": []
+        }));
+        assert!(oversized_reconciliation_row.is_err());
+
         let too_large = SourceSettings::parse(&json!({
             "transaction": {"max_bytes": MAX_TRANSACTION_BYTES + 1}
         }));
@@ -770,6 +905,16 @@ mod tests {
         );
         assert!(TargetSettings::parse(&json!({"default_table_storage": "heap"})).is_err());
         assert!(TargetSettings::parse(&json!({"default_table_storage": "pax"})).is_err());
+
+        let reconciliation = PipelineSettings::parse(&json!({})).unwrap().reconciliation;
+        assert!(reconciliation.enabled);
+        assert_eq!(
+            reconciliation.interval(),
+            Duration::from_secs(DEFAULT_RECONCILIATION_INTERVAL_SECONDS)
+        );
+        assert!(!reconciliation.retry_delay().is_zero());
+        assert!(!reconciliation.boundary_timeout().is_zero());
+        assert!(!reconciliation.scan_timeout().is_zero());
     }
 
     #[test]

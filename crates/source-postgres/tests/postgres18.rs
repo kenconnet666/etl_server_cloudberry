@@ -17,7 +17,7 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_source_postgres::{
     SourceResult,
-    catalog::{CatalogOptions, PreflightOptions, load_tables, preflight},
+    catalog::{CatalogOptions, PreflightOptions, inspect_tables, load_tables, preflight},
     ddl::{DDL_CAPTURE_MARKER, DdlInstallSpec, ensure_ddl_capture, load_current_relation_schemas},
     publication::{
         PublicationSpec, create_logical_slot, drop_logical_slot, ensure_publication,
@@ -96,6 +96,127 @@ async fn postgres18_source_contract_and_binary_pgoutput() -> SourceResult<()> {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL 18 instance and PG2CB_TEST_SOURCE_DSN"]
+async fn postgres18_catalog_admission_is_fail_closed() -> SourceResult<()> {
+    let dsn = std::env::var("PG2CB_TEST_SOURCE_DSN").map_err(|_| {
+        cloudberry_etl_source_postgres::SourceError::Contract(
+            "PG2CB_TEST_SOURCE_DSN is required for the ignored integration test".to_owned(),
+        )
+    })?;
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("catalog admission PostgreSQL connection ended: {error}");
+        }
+    });
+    let schema = format!("pg2cb_contract_{}", Uuid::now_v7().simple());
+    let result = AssertUnwindSafe(run_catalog_admission_test(&client, &schema))
+        .catch_unwind()
+        .await;
+    let _ = client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            quote_identifier(&schema)
+        ))
+        .await;
+    connection_task.abort();
+    match result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+async fn run_catalog_admission_test(client: &Client, schema: &str) -> SourceResult<()> {
+    let schema_sql = quote_identifier(schema);
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema_sql};
+             CREATE TYPE {schema_sql}.int8 AS (payload text);
+             CREATE TABLE {schema_sql}.safe_int (id bigint PRIMARY KEY, payload text);
+             CREATE TABLE {schema_sql}.safe_uuid (id uuid PRIMARY KEY, payload text);
+             CREATE TABLE {schema_sql}.safe_text_c (id text COLLATE \"C\" PRIMARY KEY);
+             CREATE TABLE {schema_sql}.safe_varchar_posix (
+                 id varchar(64) COLLATE \"POSIX\" PRIMARY KEY
+             );
+             CREATE TABLE {schema_sql}.negative_scale_payload (
+                 id bigint PRIMARY KEY,
+                 amount numeric(12,-2)
+             );
+             CREATE TABLE {schema_sql}.default_text_key (id text PRIMARY KEY);
+             CREATE TABLE {schema_sql}.numeric_key (id numeric(12,2) PRIMARY KEY);
+             CREATE TABLE {schema_sql}.included_key (
+                 id bigint,
+                 payload text,
+                 PRIMARY KEY (id) INCLUDE (payload)
+             );
+             CREATE TABLE {schema_sql}.disguised_builtin (
+                 id bigint PRIMARY KEY,
+                 payload {schema_sql}.int8
+             );"
+        ))
+        .await?;
+
+    let inventory = inspect_tables(
+        client,
+        &CatalogOptions {
+            include_schemas: Some(HashSet::from([schema.to_owned()])),
+            ..CatalogOptions::default()
+        },
+    )
+    .await?;
+    let supported = inventory
+        .supported
+        .iter()
+        .map(|table| table.name.name.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        supported,
+        HashSet::from([
+            "included_key",
+            "negative_scale_payload",
+            "safe_int",
+            "safe_text_c",
+            "safe_uuid",
+            "safe_varchar_posix",
+        ])
+    );
+
+    let negative_scale = inventory
+        .supported
+        .iter()
+        .find(|table| table.name.name == "negative_scale_payload")
+        .expect("negative-scale payload table remains source-compatible");
+    assert!(matches!(
+        negative_scale.columns[1].data_type.kind,
+        PgTypeKind::Numeric {
+            precision: Some(12),
+            scale: Some(-2)
+        }
+    ));
+
+    let included_key = inventory
+        .supported
+        .iter()
+        .find(|table| table.name.name == "included_key")
+        .expect("primary-key INCLUDE columns remain ordinary non-key payload columns");
+    assert_eq!(included_key.primary_key().len(), 1);
+    assert_eq!(included_key.columns[0].primary_key_ordinal, Some(1));
+    assert_eq!(included_key.columns[1].primary_key_ordinal, None);
+
+    let rejected = inventory
+        .rejected
+        .iter()
+        .map(|table| (table.name.name.as_str(), table.reason.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert!(
+        rejected["default_text_key"].contains("require explicit pg_catalog.C or pg_catalog.POSIX")
+    );
+    assert!(rejected["numeric_key"].contains("production key folding"));
+    assert!(rejected["disguised_builtin"].contains("unsupported type"));
+    Ok(())
+}
+
 async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
     let preflight = preflight(client, &PreflightOptions::default()).await?;
     assert_eq!(preflight.identity.server_version_num / 10_000, 18);
@@ -149,11 +270,12 @@ async fn run_test(client: &Client, objects: &TestObjects) -> SourceResult<()> {
         .batch_execute(&format!(
             "CREATE SCHEMA {qi_schema};
              CREATE TABLE {qi_schema}.{qi_table} (
-                 id bigint PRIMARY KEY,
+                 id bigint,
                  payload text NOT NULL,
                  amount numeric(10,2),
                  doubled numeric(12,2)
-                     GENERATED ALWAYS AS ((amount * 2)::numeric(12,2)) STORED
+                     GENERATED ALWAYS AS ((amount * 2)::numeric(12,2)) STORED,
+                 PRIMARY KEY (id) INCLUDE (payload)
              )"
         ))
         .await?;
@@ -362,6 +484,7 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     let table_relation_id = table_schema.relation_id;
     assert_eq!(table_schema.primary_key().len(), 1);
     assert_eq!(table_schema.columns[0].primary_key_ordinal, Some(1));
+    assert_eq!(table_schema.columns[1].primary_key_ordinal, None);
     assert_eq!(table_schema.columns[3].name, "doubled");
     assert_eq!(table_schema.columns[3].generated, GeneratedColumn::Stored);
     assert!(matches!(
@@ -468,6 +591,7 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     let mut ddl_tags = HashSet::new();
     let mut generated_value = None;
     let mut relation_ids = HashSet::new();
+    let mut table_relation_flags = None;
 
     for row in rows {
         let payload: Vec<u8> = row.try_get("data")?;
@@ -475,6 +599,15 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
         let decoded = decoder.decode(wire)?;
         if let DecodedMessage::Relation(relation) = &decoded {
             relation_ids.insert(relation.relation_id);
+            if relation.relation_id == table_relation_id {
+                table_relation_flags = Some(
+                    relation
+                        .columns
+                        .iter()
+                        .map(|column| (column.name.clone(), column.flags))
+                        .collect::<Vec<_>>(),
+                );
+            }
         }
         match &decoded {
             DecodedMessage::Ddl(message) => {
@@ -506,6 +639,16 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     }
     assembler.finish()?;
     assert!(!relation_ids.is_empty(), "no Relation message was decoded");
+    assert_eq!(
+        table_relation_flags,
+        Some(vec![
+            ("id".to_owned(), 1),
+            ("payload".to_owned(), 0),
+            ("amount".to_owned(), 0),
+            ("doubled".to_owned(), 0),
+        ]),
+        "pgoutput must flag only indnkeyatts columns as replica-identity keys"
+    );
     assert!(
         saw_insert && saw_update && saw_delete,
         "missing row operation in pgoutput"
