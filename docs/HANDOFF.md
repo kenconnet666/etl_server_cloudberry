@@ -68,12 +68,14 @@ cargo test --workspace --lib
 - **schema_events ledger** ✅ target V8 migration + `target-cloudberry/src/schema_event.rs`（record/load/list_unfinished/advance_state，forward-only 状态机）+ 集成测试。
 - **dynamic binding registry** ✅ `TableBindingRegistry` insert/remove/swap（运行时可 swap binding，维持唯一性不变量）。
 - **SchemaBarrier 结构化** ✅ 带 `command_tag`；online-safe 的 v2 DDL 在 barrier reason 中标注可跟随。
+- **事务级 schema planner** ✅ `engine/src/schema_transition.rs` 对 memory/spool change source 统一流式扫描，保留 transaction ordinal，只以每 relation terminal captured state 对齐一次提交后 source catalog；v1/TRUNCATE/unknown scope 和 rapid-advance/catalog drift 均 fail closed，不推进 checkpoint。
+- **fenced schema-event 持久化** ✅ 一个 source transaction 对应一个确定性 UUIDv8/JSON payload；写入、exact replay、unfinished adoption 和状态推进均锁 active target pipeline fence。真实 PG18 -> Cloudberry 2.1 E2E 覆盖 catalog exact match、后续 DDL mismatch、重复 WAL 和新 lease 接管。
 
 **未完成（下一位优先处理，按顺序）：**
-1. **事务级 catalog planner + schema event 持久化。** 按 transaction change ordinal 处理 v2 消息；只把每个 relation 的 terminal after-schema 与提交后 catalog 对齐，中间快照保留用于解释同事务 schema/DML；再用 bound before-schema 分类并写入 `schema_events`。
+1. **runtime schema coordinator + capability plan。** 在 `SchemaBarrier` 返回整 pipeline rebuild 之前接管含 DDL 的 committed transaction；以 bound before-schema 分类 terminal diff、计算 dependency closure，先持久化 pending event，再选择 online apply、table/closure reload、quarantine 或 bounded retry。未完成事件不得越过 checkpoint/ACK。
 2. **table barrier + shadow reload / catch-up / cutover。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 barrier 后 spool 回放该表 CDC → reconciliation → 原子 quarantine/activation + `registry.swap`。`schema_events` 状态随 target 变更同事务推进。
 3. **在线白名单 handler 接入。** 逐项验证 ADD/DROP/RENAME/default/nullability/widening 的 Cloudberry 2.1 capability；任一前置条件失败自动转受影响 table/dependency closure reload，不升级整 pipeline。
-4. **DROP quarantine + 新表自动准入。**
+4. **rapid DDL、DROP quarantine + 新表自动准入。** catalog 比 event 超前时合并连续 committed schema transactions 后重算 terminal plan；无法证明完整范围则局部 quarantine/reload 并阻断 checkpoint。
 
 **Phase 2 退出条件：** 并发 DML+DDL、同事务多次 DDL、rapid DDL、rename/drop/recreate、目标 commit ambiguity、进程重启和重复 WAL 矩阵通过；普通 DDL 不调用 `request_pipeline_rebuild`。
 

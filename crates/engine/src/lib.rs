@@ -5,5 +5,6 @@ pub mod normalize;
 pub mod pipeline;
 pub mod reconcile;
 pub mod runtime;
+pub mod schema_transition;
 pub mod supervisor;
 pub mod telemetry;

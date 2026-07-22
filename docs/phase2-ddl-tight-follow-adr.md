@@ -77,11 +77,12 @@ PK/distribution/collation 改变、不兼容类型、generated/partition/table k
 - [x] spool v2 完整 round-trip、格式升级恢复证明、typed DDL memory spill
 - [x] 同事务多 DDL、CREATE/DROP 的真实 PG18 测试
 
-### M2：事务 planner 和 ledger 接入（下一步）
+### M2：事务 planner 和 ledger 接入（进行中）
 
-- [ ] terminal-state catalog validation 和 rapid-DDL 合并规则
-- [ ] before/after diff、依赖 closure、事务级 `schema_events` record/replay
-- [ ] table completion barrier，替换普通 DDL 的 pipeline rebuild 分支
+- [x] memory/spool 统一流式 planner、terminal-state catalog validation、确定性事务 payload/event identity
+- [x] 事务级 `schema_events` exact replay、active fence 校验、未完成事件新 lease 接管
+- [ ] rapid-DDL coalesce/replan、bound before/after diff 和依赖 closure
+- [ ] runtime schema coordinator 与 table completion barrier，替换普通 DDL 的 pipeline rebuild 分支
 
 ### M3：shadow reload 和 cutover
 

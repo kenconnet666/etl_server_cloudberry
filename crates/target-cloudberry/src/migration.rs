@@ -270,8 +270,8 @@ CREATE INDEX IF NOT EXISTS snapshot_table_progress_pipeline_generation_idx
 
 /// Durable schema-transition ledger for Phase 2 tight DDL follow.
 ///
-/// Each row records one source DDL event that touches a managed relation, keyed
-/// by the source LSN and transaction id so replayed WAL is idempotent. The
+/// Each row records one committed source transaction containing managed DDL, keyed by the source
+/// LSN and transaction id so replayed WAL is idempotent. Ordered messages share one payload. The
 /// engine persists an event as `pending` before starting a table transition and
 /// advances it through `in_transition` to `completed`/`failed`; a restart scans
 /// unfinished source-transaction rows and resumes them in source-LSN order. `transitions` holds the

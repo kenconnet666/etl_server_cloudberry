@@ -4,14 +4,14 @@
 //! command-end trigger covers ordinary DDL, while the sql-drop trigger covers objects that no
 //! longer exist by the time the command completes.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use cloudberry_etl_core::{
     change::{DdlMessage, RelationSchemaSnapshot, TableTransition, TransitionKind},
     schema::validate_identifier,
 };
 use serde::{Deserialize, Serialize};
-use tokio_postgres::Client;
+use tokio_postgres::{Client, GenericClient};
 
 use crate::{
     SourceError, SourceResult,
@@ -26,6 +26,12 @@ const LEGACY_DDL_MESSAGE_VERSION: u16 = 1;
 /// trigger began emitting typed per-relation after-schema snapshots in the v2 envelope.
 pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v6";
 pub const CANONICAL_DDL_TRIGGER_NAME: &str = "pg2cb_ddl_command_end";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentRelationSchema {
+    pub fingerprint: String,
+    pub schema: RelationSchemaSnapshot,
+}
 
 #[derive(Debug, Clone)]
 pub struct DdlInstallSpec {
@@ -709,6 +715,86 @@ pub async fn ensure_ddl_capture(client: &Client, spec: &DdlInstallSpec) -> Sourc
     Ok(installed)
 }
 
+/// Read terminal catalog shapes through the same installed helper used by the event trigger.
+///
+/// Every requested relation is present in the returned map. A `None` value proves the OID no
+/// longer names a persistent table-like relation; a present value carries PostgreSQL's canonical
+/// jsonb fingerprint alongside the typed snapshot. The schema coordinator calls this once after
+/// a committed DDL transaction, never from the row hot path.
+pub async fn load_current_relation_schemas<C>(
+    client: &C,
+    metadata_schema: &str,
+    relation_ids: &[u32],
+) -> SourceResult<BTreeMap<u32, Option<CurrentRelationSchema>>>
+where
+    C: GenericClient + Sync,
+{
+    validate_schema(metadata_schema)?;
+    let mut relation_ids = relation_ids.to_vec();
+    relation_ids.sort_unstable();
+    relation_ids.dedup();
+    if relation_ids.contains(&0) {
+        return Err(SourceError::Ddl(
+            "relation OID zero is not valid for a catalog snapshot".to_owned(),
+        ));
+    }
+    if relation_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let database_ids = relation_ids
+        .iter()
+        .copied()
+        .map(i64::from)
+        .collect::<Vec<_>>();
+    let schema = quote_identifier(metadata_schema)?;
+    let sql = format!(
+        "WITH requested(relation_id) AS (
+             SELECT value FROM unnest($1::bigint[]) AS value
+         ), snapshots AS MATERIALIZED (
+             SELECT relation_id,
+                    {schema}.schema_snapshot(relation_id::oid) AS after_schema
+               FROM requested
+         )
+         SELECT relation_id,
+                after_schema,
+                CASE WHEN after_schema IS NULL THEN NULL ELSE md5(after_schema::text) END
+           FROM snapshots
+          ORDER BY relation_id"
+    );
+    let rows = client.query(&sql, &[&database_ids]).await?;
+    let mut current = BTreeMap::new();
+    for row in rows {
+        let relation_id = u32::try_from(row.try_get::<_, i64>(0)?).map_err(|_| {
+            SourceError::Ddl("catalog snapshot returned an invalid relation OID".to_owned())
+        })?;
+        let snapshot = row.try_get::<_, Option<serde_json::Value>>(1)?;
+        let fingerprint = row.try_get::<_, Option<String>>(2)?;
+        let value = match (snapshot, fingerprint) {
+            (None, None) => None,
+            (Some(snapshot), Some(fingerprint)) if !fingerprint.is_empty() => {
+                let snapshot = serde_json::from_value(snapshot)?;
+                validate_relation_snapshot(&snapshot, relation_id)?;
+                Some(CurrentRelationSchema {
+                    fingerprint,
+                    schema: snapshot,
+                })
+            }
+            _ => {
+                return Err(SourceError::Ddl(format!(
+                    "catalog snapshot/fingerprint mismatch for relation {relation_id}"
+                )));
+            }
+        };
+        current.insert(relation_id, value);
+    }
+    if current.len() != relation_ids.len() {
+        return Err(SourceError::Ddl(
+            "catalog snapshot query did not return every requested relation".to_owned(),
+        ));
+    }
+    Ok(current)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DdlEnvelope {
     version: u16,
@@ -855,7 +941,9 @@ fn parse_relation_id(value: serde_json::Value, context: &str) -> SourceResult<u3
         }
     };
     text.parse::<u32>()
-        .map_err(|_| SourceError::Ddl(format!("invalid relation OID `{text}` in {context}")))
+        .ok()
+        .filter(|relation_id| *relation_id != 0)
+        .ok_or_else(|| SourceError::Ddl(format!("invalid relation OID `{text}` in {context}")))
 }
 
 fn decode_table_transition(wire: TableTransitionEnvelope) -> SourceResult<TableTransition> {
@@ -998,6 +1086,8 @@ mod tests {
         assert!(decode_ddl_message(DDL_MESSAGE_PREFIX, payload).is_err());
         let payload = br#"{"version":2,"command_tag":"ALTER TABLE","schema_fingerprint":"x"}"#;
         assert!(decode_ddl_message(LEGACY_DDL_MESSAGE_PREFIX, payload).is_err());
+        let payload = br#"{"version":2,"command_tag":"ALTER TABLE","relation_ids":["0"],"schema_fingerprint":"x"}"#;
+        assert!(decode_ddl_message(DDL_MESSAGE_PREFIX, payload).is_err());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use cloudberry_etl_core::{
 use cloudberry_etl_source_postgres::{
     SourceResult,
     catalog::{CatalogOptions, PreflightOptions, load_tables, preflight},
-    ddl::{DDL_CAPTURE_MARKER, DdlInstallSpec, ensure_ddl_capture},
+    ddl::{DDL_CAPTURE_MARKER, DdlInstallSpec, ensure_ddl_capture, load_current_relation_schemas},
     publication::{
         PublicationSpec, create_logical_slot, drop_logical_slot, ensure_publication,
         inspect_publication,
@@ -415,6 +415,13 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
              COMMIT;"
         ))
         .await?;
+    let terminal_catalog = load_current_relation_schemas(
+        client,
+        &objects.metadata_schema,
+        &[table_relation_id, u32::MAX],
+    )
+    .await?;
+    assert_eq!(terminal_catalog.get(&u32::MAX), Some(&None));
 
     // DROP events are emitted by sql_drop because the dropped catalog rows are no longer
     // available to ddl_command_end. The schema is outside the selected publication but is kept
@@ -596,6 +603,15 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
             .iter()
             .all(|column| column.attnum != note_attnum),
         "DROP COLUMN post-state must omit the dropped attnum"
+    );
+    let terminal = terminal_catalog
+        .get(&table_relation_id)
+        .and_then(Option::as_ref)
+        .expect("managed table terminal catalog state");
+    assert_eq!(&terminal.schema, dropped);
+    assert_eq!(
+        Some(terminal.fingerprint.as_str()),
+        transitions[3].after_fingerprint.as_deref()
     );
 
     let publication_ddl = ddl_messages

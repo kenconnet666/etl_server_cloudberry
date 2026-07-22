@@ -165,6 +165,7 @@ jobs:
           cargo test -p cloudberry-etl-engine \
             --test snapshot_e2e \
             --test phase1_recovery_e2e \
+            --test schema_transition_e2e \
             -- --ignored --nocapture
         env:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source

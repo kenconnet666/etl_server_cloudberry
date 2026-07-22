@@ -70,6 +70,12 @@ async fn run_ledger_test(
         record_schema_event(client, &record).await?,
         RecordOutcome::AlreadyRecorded
     );
+    let mut conflicting = record.clone();
+    conflicting.transitions = serde_json::json!([{"relation_id": 100, "type": "drop_column"}]);
+    assert!(
+        record_schema_event(client, &conflicting).await.is_err(),
+        "same source identity with different payload must fail closed"
+    );
 
     // Loadable with the persisted payload intact.
     let loaded = load_schema_event(client, pipeline_id, PgLsn::new(0x1000), 4242)
@@ -86,10 +92,38 @@ async fn run_ledger_test(
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event_id, event_id);
 
+    // A newer lease first activates the target pipeline fence, then adopts unfinished rows.
+    let newer_fence = PipelineFence {
+        fencing_token: 6,
+        ..fence
+    };
+    activate_pipeline_fence(client, newer_fence).await?;
+    assert!(
+        list_unfinished_schema_events(client, fence).await.is_err(),
+        "the stale owner must not read/adopt transition work"
+    );
+    let adopted = list_unfinished_schema_events(client, newer_fence).await?;
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].fencing_token, newer_fence.fencing_token);
+
     // Drive the state machine: pending -> in_transition -> completed.
+    assert!(
+        advance_schema_event_state(
+            client,
+            fence,
+            PgLsn::new(0x1000),
+            4242,
+            SchemaEventState::Pending,
+            SchemaEventState::InTransition,
+            None,
+        )
+        .await
+        .is_err(),
+        "the stale owner must not advance an adopted event"
+    );
     advance_schema_event_state(
         client,
-        pipeline_id,
+        newer_fence,
         PgLsn::new(0x1000),
         4242,
         SchemaEventState::Pending,
@@ -101,7 +135,7 @@ async fn run_ledger_test(
     // A stale expected-from no longer matches, so the guarded update fails.
     let stale = advance_schema_event_state(
         client,
-        pipeline_id,
+        newer_fence,
         PgLsn::new(0x1000),
         4242,
         SchemaEventState::Pending,
@@ -113,7 +147,7 @@ async fn run_ledger_test(
 
     advance_schema_event_state(
         client,
-        pipeline_id,
+        newer_fence,
         PgLsn::new(0x1000),
         4242,
         SchemaEventState::InTransition,
@@ -123,7 +157,7 @@ async fn run_ledger_test(
     .await?;
 
     // Completed events drop out of the unfinished list.
-    let after = list_unfinished_schema_events(client, fence).await?;
+    let after = list_unfinished_schema_events(client, newer_fence).await?;
     assert!(
         after.is_empty(),
         "completed event must not remain unfinished"
@@ -138,7 +172,7 @@ async fn run_ledger_test(
     let failed_id = Uuid::now_v7();
     let failed = SchemaEventRecord {
         event_id: failed_id,
-        fence,
+        fence: newer_fence,
         source_lsn: PgLsn::new(0x2000),
         source_xid: 4243,
         command_tag: "ALTER TABLE".to_owned(),
@@ -151,7 +185,7 @@ async fn run_ledger_test(
     );
     advance_schema_event_state(
         client,
-        pipeline_id,
+        newer_fence,
         PgLsn::new(0x2000),
         4243,
         SchemaEventState::Pending,

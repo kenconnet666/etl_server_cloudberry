@@ -13,10 +13,10 @@ use cloudberry_etl_core::{id::PipelineId, lsn::PgLsn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, Row, Transaction};
 use uuid::Uuid;
 
-use crate::checkpoint::PipelineFence;
+use crate::checkpoint::{CheckpointError, PipelineFence, lock_pipeline_fence};
 
 const INSERT_SCHEMA_EVENT_SQL: &str = r#"
 INSERT INTO pg2cb_meta.schema_events (
@@ -24,7 +24,6 @@ INSERT INTO pg2cb_meta.schema_events (
     command_tag, schema_fingerprint, transitions, state, fencing_token
 )
 VALUES ($1, $2, $3, $4::text::pg_lsn, $5, $6, $7, $8, 'pending', $9)
-ON CONFLICT (pipeline_id, source_lsn, source_xid) DO NOTHING
 "#;
 
 const LOAD_SCHEMA_EVENT_SQL: &str = r#"
@@ -35,6 +34,15 @@ SELECT event_id, pipeline_id, topology_generation, source_lsn::text AS source_ls
  WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn AND source_xid = $3
 "#;
 
+const LOCK_SCHEMA_EVENT_SQL: &str = r#"
+SELECT event_id, pipeline_id, topology_generation, source_lsn::text AS source_lsn,
+       source_xid, command_tag, schema_fingerprint, transitions, state,
+       failure_reason, fencing_token
+  FROM pg2cb_meta.schema_events
+ WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn AND source_xid = $3
+ FOR UPDATE
+"#;
+
 const LIST_UNFINISHED_SCHEMA_EVENTS_SQL: &str = r#"
 SELECT event_id, pipeline_id, topology_generation, source_lsn::text AS source_lsn,
        source_xid, command_tag, schema_fingerprint, transitions, state,
@@ -43,15 +51,25 @@ SELECT event_id, pipeline_id, topology_generation, source_lsn::text AS source_ls
  WHERE pipeline_id = $1 AND topology_generation = $2
    AND state IN ('pending', 'in_transition')
  ORDER BY source_lsn, source_xid
+ FOR UPDATE
+"#;
+
+const ADOPT_UNFINISHED_SCHEMA_EVENTS_SQL: &str = r#"
+UPDATE pg2cb_meta.schema_events
+   SET fencing_token = $3
+ WHERE pipeline_id = $1 AND topology_generation = $2
+   AND state IN ('pending', 'in_transition')
+   AND fencing_token < $3
 "#;
 
 const ADVANCE_STATE_SQL: &str = r#"
 UPDATE pg2cb_meta.schema_events
-SET state = $4,
-    failure_reason = $5,
-    processed_at = CASE WHEN $4 IN ('completed', 'failed') THEN clock_timestamp() ELSE NULL END
-WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn AND source_xid = $3
-  AND state = $6
+SET state = $7,
+    failure_reason = $8,
+    processed_at = CASE WHEN $7 IN ('completed', 'failed') THEN clock_timestamp() ELSE NULL END
+WHERE pipeline_id = $1 AND topology_generation = $2
+  AND source_lsn = $3::text::pg_lsn AND source_xid = $4
+  AND fencing_token = $5 AND state = $6
 "#;
 
 /// Lifecycle state of a persisted schema event.
@@ -141,6 +159,8 @@ pub struct SchemaEventRecord {
 pub enum RecordOutcome {
     /// A new pending event row was written.
     Inserted,
+    /// An unfinished event was adopted by a newer active fencing token.
+    Adopted,
     /// An event with the same source identity already existed (idempotent WAL replay).
     AlreadyRecorded,
 }
@@ -149,6 +169,8 @@ pub enum RecordOutcome {
 pub enum SchemaEventError {
     #[error("schema event database operation failed: {0}")]
     Database(#[from] tokio_postgres::Error),
+    #[error(transparent)]
+    Fence(#[from] CheckpointError),
     #[error("topology generation {0} exceeds the target bigint range")]
     GenerationOutOfRange(u64),
     #[error("source xid {0} exceeds the target bigint range")]
@@ -157,6 +179,19 @@ pub enum SchemaEventError {
     InvalidFencingToken,
     #[error("command tag cannot be empty")]
     InvalidCommandTag,
+    #[error("schema fingerprint cannot be empty")]
+    InvalidSchemaFingerprint,
+    #[error("schema event id cannot be nil")]
+    InvalidEventId,
+    #[error("schema transition payload cannot be null")]
+    InvalidTransitions,
+    #[error("replayed schema event differs in immutable field `{field}`")]
+    ReplayMismatch { field: &'static str },
+    #[error("schema event fencing token {stored_token} is newer than active token {active_token}")]
+    NewerStoredFence {
+        stored_token: i64,
+        active_token: i64,
+    },
     #[error("persisted schema event contains invalid {field}: {value}")]
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("illegal schema event transition from {from} to {to}")]
@@ -168,24 +203,66 @@ pub enum SchemaEventError {
     UnexpectedWriteCount(u64),
 }
 
-/// Record a new pending schema event. Idempotent on `(pipeline_id, source_lsn,
-/// source_xid)`: a replayed WAL event returns [`RecordOutcome::AlreadyRecorded`]
-/// without overwriting the existing row.
+/// Record a new pending schema event in its own target transaction.
 pub async fn record_schema_event(
-    client: &Client,
+    client: &mut Client,
+    record: &SchemaEventRecord,
+) -> Result<RecordOutcome, SchemaEventError> {
+    let transaction = client.transaction().await?;
+    let outcome = record_schema_event_in_transaction(&transaction, record).await?;
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+/// Record or adopt a pending schema event inside the caller's target transaction.
+///
+/// A duplicate source identity is idempotent only when every immutable field is exact. An
+/// unfinished row from an older lease is adopted after the active pipeline fence is locked;
+/// terminal rows remain immutable historical evidence.
+pub async fn record_schema_event_in_transaction(
+    transaction: &Transaction<'_>,
     record: &SchemaEventRecord,
 ) -> Result<RecordOutcome, SchemaEventError> {
     let generation = database_generation(record.fence.topology_generation)?;
     let xid = database_xid(record.source_xid)?;
-    if record.fence.fencing_token <= 0 {
-        return Err(SchemaEventError::InvalidFencingToken);
-    }
-    if record.command_tag.is_empty() {
-        return Err(SchemaEventError::InvalidCommandTag);
-    }
+    validate_record(record)?;
+    lock_pipeline_fence(transaction, record.fence).await?;
     let pipeline_id = record.fence.pipeline_id.as_uuid();
     let lsn = record.source_lsn.to_string();
-    let written = client
+    let existing = transaction
+        .query_opt(LOCK_SCHEMA_EVENT_SQL, &[&pipeline_id, &lsn, &xid])
+        .await?
+        .map(|row| schema_event_from_row(&row))
+        .transpose()?;
+    if let Some(mut existing) = existing {
+        validate_replay(&existing, record)?;
+        if existing.fencing_token > record.fence.fencing_token {
+            return Err(SchemaEventError::NewerStoredFence {
+                stored_token: existing.fencing_token,
+                active_token: record.fence.fencing_token,
+            });
+        }
+        if matches!(
+            existing.state,
+            SchemaEventState::Pending | SchemaEventState::InTransition
+        ) && existing.fencing_token < record.fence.fencing_token
+        {
+            let updated = transaction
+                .execute(
+                    "UPDATE pg2cb_meta.schema_events SET fencing_token = $4
+                      WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn
+                        AND source_xid = $3 AND fencing_token < $4
+                        AND state IN ('pending', 'in_transition')",
+                    &[&pipeline_id, &lsn, &xid, &record.fence.fencing_token],
+                )
+                .await?;
+            ensure_one_row(updated)?;
+            existing.fencing_token = record.fence.fencing_token;
+            return Ok(RecordOutcome::Adopted);
+        }
+        return Ok(RecordOutcome::AlreadyRecorded);
+    }
+    let written = transaction
         .execute(
             INSERT_SCHEMA_EVENT_SQL,
             &[
@@ -201,11 +278,8 @@ pub async fn record_schema_event(
             ],
         )
         .await?;
-    if written == 1 {
-        Ok(RecordOutcome::Inserted)
-    } else {
-        Ok(RecordOutcome::AlreadyRecorded)
-    }
+    ensure_one_row(written)?;
+    Ok(RecordOutcome::Inserted)
 }
 
 /// Load a single event by its source identity, if present.
@@ -228,25 +302,79 @@ pub async fn load_schema_event(
 /// List unfinished (`pending`/`in_transition`) events for a generation in
 /// source-LSN order, so a restart can resume transitions deterministically.
 pub async fn list_unfinished_schema_events(
-    client: &Client,
+    client: &mut Client,
     fence: PipelineFence,
 ) -> Result<Vec<SchemaEvent>, SchemaEventError> {
+    if fence.fencing_token <= 0 {
+        return Err(SchemaEventError::InvalidFencingToken);
+    }
     let generation = database_generation(fence.topology_generation)?;
-    let rows = client
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    transaction
+        .execute(
+            ADOPT_UNFINISHED_SCHEMA_EVENTS_SQL,
+            &[
+                &fence.pipeline_id.as_uuid(),
+                &generation,
+                &fence.fencing_token,
+            ],
+        )
+        .await?;
+    let rows = transaction
         .query(
             LIST_UNFINISHED_SCHEMA_EVENTS_SQL,
             &[&fence.pipeline_id.as_uuid(), &generation],
         )
         .await?;
-    rows.iter().map(schema_event_from_row).collect()
+    let events = rows
+        .iter()
+        .map(schema_event_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(event) = events
+        .iter()
+        .find(|event| event.fencing_token > fence.fencing_token)
+    {
+        return Err(SchemaEventError::NewerStoredFence {
+            stored_token: event.fencing_token,
+            active_token: fence.fencing_token,
+        });
+    }
+    transaction.commit().await?;
+    Ok(events)
 }
 
 /// Advance an event's state, guarding the legal transition and requiring the row
 /// to still be in `expected_from` (optimistic concurrency). A `Failed` target
 /// must carry a reason; other targets must not.
 pub async fn advance_schema_event_state(
-    client: &Client,
-    pipeline_id: PipelineId,
+    client: &mut Client,
+    fence: PipelineFence,
+    source_lsn: PgLsn,
+    source_xid: u64,
+    expected_from: SchemaEventState,
+    next: SchemaEventState,
+    failure_reason: Option<&str>,
+) -> Result<(), SchemaEventError> {
+    let transaction = client.transaction().await?;
+    advance_schema_event_state_in_transaction(
+        &transaction,
+        fence,
+        source_lsn,
+        source_xid,
+        expected_from,
+        next,
+        failure_reason,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Advance an event in the same target transaction as the corresponding schema/metadata change.
+pub async fn advance_schema_event_state_in_transaction(
+    transaction: &Transaction<'_>,
+    fence: PipelineFence,
     source_lsn: PgLsn,
     source_xid: u64,
     expected_from: SchemaEventState,
@@ -264,24 +392,79 @@ pub async fn advance_schema_event_state(
     } else {
         None
     };
+    let generation = database_generation(fence.topology_generation)?;
+    if fence.fencing_token <= 0 {
+        return Err(SchemaEventError::InvalidFencingToken);
+    }
     let xid = database_xid(source_xid)?;
-    let updated = client
+    lock_pipeline_fence(transaction, fence).await?;
+    let updated = transaction
         .execute(
             ADVANCE_STATE_SQL,
             &[
-                &pipeline_id.as_uuid(),
+                &fence.pipeline_id.as_uuid(),
+                &generation,
                 &source_lsn.to_string(),
                 &xid,
+                &fence.fencing_token,
+                &expected_from.as_str(),
                 &next.as_str(),
                 &reason,
-                &expected_from.as_str(),
             ],
         )
         .await?;
-    if updated == 1 {
+    ensure_one_row(updated)
+}
+
+fn validate_record(record: &SchemaEventRecord) -> Result<(), SchemaEventError> {
+    if record.fence.fencing_token <= 0 {
+        return Err(SchemaEventError::InvalidFencingToken);
+    }
+    if record.event_id.is_nil() {
+        return Err(SchemaEventError::InvalidEventId);
+    }
+    if record.command_tag.is_empty() || record.command_tag.contains('\0') {
+        return Err(SchemaEventError::InvalidCommandTag);
+    }
+    if record.schema_fingerprint.is_empty() || record.schema_fingerprint.contains('\0') {
+        return Err(SchemaEventError::InvalidSchemaFingerprint);
+    }
+    if record.transitions.is_null() {
+        return Err(SchemaEventError::InvalidTransitions);
+    }
+    Ok(())
+}
+
+fn validate_replay(
+    stored: &SchemaEvent,
+    proposed: &SchemaEventRecord,
+) -> Result<(), SchemaEventError> {
+    let comparisons = [
+        (stored.event_id == proposed.event_id, "event_id"),
+        (
+            stored.topology_generation == proposed.fence.topology_generation,
+            "topology_generation",
+        ),
+        (stored.command_tag == proposed.command_tag, "command_tag"),
+        (
+            stored.schema_fingerprint == proposed.schema_fingerprint,
+            "schema_fingerprint",
+        ),
+        (stored.transitions == proposed.transitions, "transitions"),
+    ];
+    for (matches, field) in comparisons {
+        if !matches {
+            return Err(SchemaEventError::ReplayMismatch { field });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_one_row(written: u64) -> Result<(), SchemaEventError> {
+    if written == 1 {
         Ok(())
     } else {
-        Err(SchemaEventError::UnexpectedWriteCount(updated))
+        Err(SchemaEventError::UnexpectedWriteCount(written))
     }
 }
 
@@ -384,16 +567,13 @@ mod tests {
 
     #[test]
     fn insert_sql_is_idempotent_on_source_identity() {
-        assert!(
-            INSERT_SCHEMA_EVENT_SQL
-                .contains("ON CONFLICT (pipeline_id, source_lsn, source_xid) DO NOTHING")
-        );
+        assert!(LOCK_SCHEMA_EVENT_SQL.ends_with("FOR UPDATE\n"));
         // The list query must be ordered so restart replay is deterministic.
         assert!(LIST_UNFINISHED_SCHEMA_EVENTS_SQL.contains("ORDER BY source_lsn, source_xid"));
         assert!(
             LIST_UNFINISHED_SCHEMA_EVENTS_SQL.contains("state IN ('pending', 'in_transition')")
         );
         // The advance guard requires the expected prior state.
-        assert!(ADVANCE_STATE_SQL.contains("AND state = $6"));
+        assert!(ADVANCE_STATE_SQL.contains("AND fencing_token = $5 AND state = $6"));
     }
 }
