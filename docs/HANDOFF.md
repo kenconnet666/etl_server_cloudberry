@@ -32,7 +32,8 @@ cargo test --workspace --lib
 - **Citus:** 真实数据面推到 Phase 4（per-worker slot/checkpoint/topology generation），当前 fail-closed（`DataPlane::Gated`）。**`PhysicalHa` 已启用**，复用 Standalone 数据面（`data_plane_for_topology`）：failover 改 timeline 由 checkpoint identity 校验捕获并安全 rebuild。
 - **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 **target V8**（V8 = `schema_events` DDL transition ledger）。
 - **Web UI:** **已重建为 Vue 3 + Naive UI + Pinia + Vue Router**（`9e48e29`），5 视图 + API 层 + 认证 store，构建通过。JWT/CSRF 认证待后端对接。
-- **Cloudberry 镜像:** Apache Cloudberry 2.1 **无官方即用 server 镜像**（Docker Hub 只有 build/test 环境镜像）；target 集成测试需源码构建/sandbox/CI 提供。见 `tests/integration/README.md`。
+- **Cloudberry 镜像:** Apache Cloudberry 2.1 无官方即用 server 镜像（Docker Hub 只有 build/test 环境镜像）。**已解决**：`tests/integration/cloudberry/build-local-image.sh` 把官方 2.1.0 RPM 装进 rockylinux9 + `gpinitsystem` 起单节点 demo cluster（`init-singlenode.sh`），可复现地提供可运行 Cloudberry。CI 的 `integration-cloudberry` job 用它跑 target + E2E 测试。
+- **CI 验证矩阵:** 4 个 job——rust-checks（fmt/clippy/build/单测）、integration-pg18（真实 PG18 source + control-store）、integration-cloudberry（真实 Cloudberry target + 跨库 E2E）、web-checks（Vue 构建）。真实两端集成测试均已进 PR 门禁并本地验证通过。
 
 ## 进度
 
