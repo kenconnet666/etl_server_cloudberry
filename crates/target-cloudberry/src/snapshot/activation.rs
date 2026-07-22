@@ -447,9 +447,12 @@ pub async fn validate_active_snapshot_group(
         initial_checkpoints: stored.request.initial_checkpoints.clone(),
     })?;
     if expected.tables != stored.request.tables {
-        return Err(SnapshotTargetError::SnapshotGroupManifestMismatch(
-            snapshot_group_id,
-        ));
+        let difference = manifest::first_table_difference(&stored.request.tables, &expected.tables)
+            .unwrap_or_else(|| "active table manifests differ in an unrecognized field".to_owned());
+        return Err(SnapshotTargetError::SnapshotGroupManifestMismatch {
+            group: snapshot_group_id,
+            difference,
+        });
     }
 
     let mut states = Vec::with_capacity(expected.tables.len());

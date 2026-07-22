@@ -261,7 +261,7 @@ async fn run_snapshot_activation_test(
     changed_registration.initial_checkpoints[0].applied_lsn = PgLsn::new(51);
     assert!(matches!(
         begin_snapshot_group(client, &changed_registration).await,
-        Err(SnapshotTargetError::SnapshotGroupManifestMismatch(group))
+        Err(SnapshotTargetError::SnapshotGroupManifestMismatch { group, .. })
             if group == first_request.snapshot_group_id
     ));
     for (index, plan) in old_plans.iter().enumerate() {
@@ -471,7 +471,7 @@ async fn run_snapshot_activation_test(
         .push_str("-changed");
     assert!(matches!(
         validate_active_snapshot_group(client, adopted_fence, &incomplete_active_tables).await,
-        Err(SnapshotTargetError::SnapshotGroupManifestMismatch(group))
+        Err(SnapshotTargetError::SnapshotGroupManifestMismatch { group, .. })
             if group == second_request.snapshot_group_id
     ));
     for checkpoint in &second_request.initial_checkpoints {
@@ -517,7 +517,7 @@ async fn assert_manifest_mismatch_is_read_only(
     for variant in variants {
         assert!(matches!(
             activate_snapshot_group(client, &variant).await,
-            Err(SnapshotTargetError::SnapshotGroupManifestMismatch(group))
+            Err(SnapshotTargetError::SnapshotGroupManifestMismatch { group, .. })
                 if group == request.snapshot_group_id
         ));
     }

@@ -16,9 +16,11 @@ use cloudberry_etl_source_postgres::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyPlan, ApplyPlanError, ApplyRequest, DataChunkDisposition, LedgeredDataChunkOutcome,
-        LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome, TableApplyBatch,
-        execute_ledgered_data_chunk, execute_ledgered_empty_transaction, plan_apply,
+        ApplyPlan, ApplyPlanError, ApplyRequest, DataChunkDisposition, LedgeredCommitObserver,
+        LedgeredDataChunkOutcome, LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome,
+        TableApplyBatch, execute_ledgered_data_chunk, execute_ledgered_data_chunk_observed,
+        execute_ledgered_empty_transaction, execute_ledgered_empty_transaction_observed,
+        plan_apply,
     },
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
@@ -494,6 +496,7 @@ pub struct CloudberryTransactionSink {
     registry: TableBindingRegistry,
     ddl_scope: DdlScope,
     chunk_limits: ChunkLimits,
+    commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
 }
 
 impl CloudberryTransactionSink {
@@ -525,6 +528,46 @@ impl CloudberryTransactionSink {
         ddl_scope: DdlScope,
         chunk_limits: ChunkLimits,
     ) -> Result<Self, AdapterConfigError> {
+        Self::build(
+            client,
+            fence,
+            slot_name,
+            registry,
+            ddl_scope,
+            chunk_limits,
+            None,
+        )
+    }
+
+    pub fn new_with_chunk_limits_and_observer(
+        client: Client,
+        fence: PipelineFence,
+        slot_name: impl Into<String>,
+        registry: TableBindingRegistry,
+        ddl_scope: DdlScope,
+        chunk_limits: ChunkLimits,
+        commit_observer: Arc<dyn LedgeredCommitObserver>,
+    ) -> Result<Self, AdapterConfigError> {
+        Self::build(
+            client,
+            fence,
+            slot_name,
+            registry,
+            ddl_scope,
+            chunk_limits,
+            Some(commit_observer),
+        )
+    }
+
+    fn build(
+        client: Client,
+        fence: PipelineFence,
+        slot_name: impl Into<String>,
+        registry: TableBindingRegistry,
+        ddl_scope: DdlScope,
+        chunk_limits: ChunkLimits,
+        commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
+    ) -> Result<Self, AdapterConfigError> {
         let slot_name = slot_name.into();
         if slot_name.is_empty() || slot_name.contains('\0') {
             return Err(AdapterConfigError::InvalidSlotName);
@@ -539,6 +582,7 @@ impl CloudberryTransactionSink {
             registry,
             ddl_scope,
             chunk_limits,
+            commit_observer,
         })
     }
 
@@ -553,10 +597,20 @@ impl CloudberryTransactionSink {
             .map_err(|error| PipelineError::Source(error.to_string()))?;
         let manifest = transaction_manifest(self.fence, &self.slot_name, transaction, stats);
         if manifest.record_count == 0 {
-            return match execute_ledgered_empty_transaction(client, self.fence, &manifest)
-                .await
-                .map_err(|error| PipelineError::Target(error.to_string()))?
-            {
+            let outcome = match &self.commit_observer {
+                Some(observer) => {
+                    execute_ledgered_empty_transaction_observed(
+                        client,
+                        self.fence,
+                        &manifest,
+                        observer.as_ref(),
+                    )
+                    .await
+                }
+                None => execute_ledgered_empty_transaction(client, self.fence, &manifest).await,
+            }
+            .map_err(|error| PipelineError::Target(error.to_string()))?;
+            return match outcome {
                 LedgeredEmptyTransactionOutcome::Completed { .. }
                 | LedgeredEmptyTransactionOutcome::AlreadyCheckpointed { .. } => Ok(()),
             };
@@ -597,9 +651,13 @@ impl CloudberryTransactionSink {
                 chunk: chunk_identity,
                 tables,
             };
-            let outcome = execute_ledgered_data_chunk(client, &request)
-                .await
-                .map_err(|error| PipelineError::Target(error.to_string()))?;
+            let outcome = match &self.commit_observer {
+                Some(observer) => {
+                    execute_ledgered_data_chunk_observed(client, &request, observer.as_ref()).await
+                }
+                None => execute_ledgered_data_chunk(client, &request).await,
+            }
+            .map_err(|error| PipelineError::Target(error.to_string()))?;
             let (durable_next, disposition, completed) = match outcome {
                 LedgeredDataChunkOutcome::InProgress {
                     next_seq,

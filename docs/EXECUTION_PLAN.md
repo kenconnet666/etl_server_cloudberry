@@ -358,38 +358,33 @@ spool_retention_hours = 24           # checkpoint 后保留 24h 用于审计
 #### 1.5 E2E Kill-Point 测试（3 天）
 **目标:** 5 个关键 kill-point 半自动化测试脚本，验证崩溃后收敛。
 
-**文件变更:**
+**实际文件变更:**
 ```
-tests/integration/phase1_e2e.sh            [新增] 主测试脚本
-tests/integration/scenarios/              [新增] 5 个 kill-point 场景
-  01_source_read_kill.sh
-  02_spool_write_kill.sh
-  03_target_commit_kill.sh
-  04_checkpoint_ack_kill.sh
-  05_final_chunk_ambiguity.sh
+crates/engine/tests/phase1_recovery_e2e.rs [新增] typed-observer 恢复矩阵
+.github/workflows/ci.yml                   [更新] PG18 + Cloudberry CI gate
 ```
 
 **场景 1: source read 后 kill**
 ```bash
-# 启动 service，监控日志等待 "WAL decode batch X"
-# docker kill etl-service
-# 重启 service，验证从未 ACK 的 LSN 重新消费
-# 检查 target 数据最终一致（PK count 和 checksum）
+# observer 在 source read 后返回 fatal error
+# 销毁完整 job，释放并重获带新 fencing token 的 lease
+# 重建 factory/source/sink，验证从未 ACK 的 LSN 重新消费
+# 检查 target 与 source 有序 canonical rows 完全一致
 ```
 
 **交付标准:**
-- 每个场景脚本独立运行，输出 PASS/FAIL
-- `phase1_e2e.sh` 串行运行 5 个场景，全部通过输出 "All kill-point tests passed"
-- README 更新测试执行步骤
+- 单个 ignored E2E 串行执行五个确定性故障边界，不依赖日志或时间窗口触发
+- 每个边界后重建完整 job，并验证 ledger 清空、源目标最终一致
+- CI 在真实 PG18 与 Cloudberry 2.1 上运行该矩阵
 
 ---
 
 ### Phase 1 退出条件
-- [ ] Source snapshot 使用 keyset paging，单测覆盖 PG18 真实表
-- [ ] Target snapshot progress 持久化，commit ambiguity 可续传
+- [x] Source snapshot 使用 keyset paging，单测覆盖 PG18 真实表
+- [x] Target snapshot progress 持久化，commit ambiguity 可续传
 - [ ] Bounded snapshot runtime 崩溃后从新 S1 重拉，不复用旧 cursor
 - [ ] Spool journal 按时间窗口自动清理，ENOSPC 进入 RESOURCE_WAIT
-- [ ] 5 个 E2E kill-point 测试脚本通过，数据最终一致
+- [x] 5 个 E2E kill-point 场景通过，数据最终一致
 - [ ] `docs/delivery-plan.md` 更新 Phase 1 完成状态
 
 ---

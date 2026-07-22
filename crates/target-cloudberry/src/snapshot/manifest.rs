@@ -68,9 +68,7 @@ pub async fn begin_snapshot_group(
         load_snapshot_group_optional(&transaction, canonical.snapshot_group_id).await?
     {
         if stored.request != canonical {
-            return Err(SnapshotTargetError::SnapshotGroupManifestMismatch(
-                request.snapshot_group_id,
-            ));
+            return Err(manifest_mismatch(&stored.request, &canonical));
         }
         let disposition = match stored.state {
             SnapshotGroupState::Loading => SnapshotGroupRegistrationDisposition::AlreadyRegistered,
@@ -104,9 +102,7 @@ pub(super) fn validate_exact_request(
     if stored.request == canonical {
         Ok(canonical)
     } else {
-        Err(SnapshotTargetError::SnapshotGroupManifestMismatch(
-            request.snapshot_group_id,
-        ))
+        Err(manifest_mismatch(&stored.request, &canonical))
     }
 }
 
@@ -120,9 +116,31 @@ pub(super) fn validate_apply_membership(
         || stored.request.fence.topology_generation != ownership.fence.topology_generation
         || stored.request.fence.fencing_token != ownership.fence.fencing_token
     {
-        return Err(SnapshotTargetError::SnapshotGroupManifestMismatch(
-            ownership.snapshot_group_id,
-        ));
+        let difference = if stored.request.snapshot_group_id != ownership.snapshot_group_id {
+            format!(
+                "snapshot_group_id: stored={}, caller={}",
+                stored.request.snapshot_group_id, ownership.snapshot_group_id
+            )
+        } else if stored.request.fence.pipeline_id != ownership.fence.pipeline_id {
+            format!(
+                "fence.pipeline_id: stored={}, caller={}",
+                stored.request.fence.pipeline_id, ownership.fence.pipeline_id
+            )
+        } else if stored.request.fence.topology_generation != ownership.fence.topology_generation {
+            format!(
+                "fence.topology_generation: stored={}, caller={}",
+                stored.request.fence.topology_generation, ownership.fence.topology_generation
+            )
+        } else {
+            format!(
+                "fence.fencing_token: stored={}, caller={}",
+                stored.request.fence.fencing_token, ownership.fence.fencing_token
+            )
+        };
+        return Err(SnapshotTargetError::SnapshotGroupManifestMismatch {
+            group: ownership.snapshot_group_id,
+            difference,
+        });
     }
 
     let expected = plan.activation_table(ownership.schema_fingerprint.clone());
@@ -144,6 +162,143 @@ pub(super) fn validate_apply_membership(
         });
     }
     Ok(())
+}
+
+fn manifest_mismatch(
+    stored: &SnapshotActivationRequest,
+    caller: &SnapshotActivationRequest,
+) -> SnapshotTargetError {
+    let difference = first_request_difference(stored, caller)
+        .unwrap_or_else(|| "requests differ in an unrecognized field".to_owned());
+    SnapshotTargetError::SnapshotGroupManifestMismatch {
+        group: caller.snapshot_group_id,
+        difference,
+    }
+}
+
+fn first_request_difference(
+    stored: &SnapshotActivationRequest,
+    caller: &SnapshotActivationRequest,
+) -> Option<String> {
+    if stored.snapshot_group_id != caller.snapshot_group_id {
+        return Some(format!(
+            "snapshot_group_id: stored={}, caller={}",
+            stored.snapshot_group_id, caller.snapshot_group_id
+        ));
+    }
+    if stored.fence.pipeline_id != caller.fence.pipeline_id {
+        return Some(format!(
+            "fence.pipeline_id: stored={}, caller={}",
+            stored.fence.pipeline_id, caller.fence.pipeline_id
+        ));
+    }
+    if stored.fence.topology_generation != caller.fence.topology_generation {
+        return Some(format!(
+            "fence.topology_generation: stored={}, caller={}",
+            stored.fence.topology_generation, caller.fence.topology_generation
+        ));
+    }
+    if stored.fence.fencing_token != caller.fence.fencing_token {
+        return Some(format!(
+            "fence.fencing_token: stored={}, caller={}",
+            stored.fence.fencing_token, caller.fence.fencing_token
+        ));
+    }
+    first_table_difference(&stored.tables, &caller.tables).or_else(|| {
+        first_checkpoint_difference(&stored.initial_checkpoints, &caller.initial_checkpoints)
+    })
+}
+
+pub(super) fn first_table_difference(
+    stored: &[SnapshotActivationTable],
+    caller: &[SnapshotActivationTable],
+) -> Option<String> {
+    if stored.len() != caller.len() {
+        return Some(format!(
+            "tables.len: stored={}, caller={}",
+            stored.len(),
+            caller.len()
+        ));
+    }
+    for (index, (stored, caller)) in stored.iter().zip(caller).enumerate() {
+        if stored.target != caller.target {
+            return Some(format!(
+                "tables[{index}].target: stored={}, caller={}",
+                stored.target, caller.target
+            ));
+        }
+        if stored.shadow != caller.shadow {
+            return Some(format!(
+                "tables[{index}].shadow: stored={}, caller={}",
+                stored.shadow, caller.shadow
+            ));
+        }
+        if stored.source_relation_id != caller.source_relation_id {
+            return Some(format!(
+                "tables[{index}].source_relation_id: stored={}, caller={}",
+                stored.source_relation_id, caller.source_relation_id
+            ));
+        }
+        if stored.table_generation != caller.table_generation {
+            return Some(format!(
+                "tables[{index}].table_generation: stored={}, caller={}",
+                stored.table_generation, caller.table_generation
+            ));
+        }
+        if stored.schema_fingerprint != caller.schema_fingerprint {
+            return Some(format!(
+                "tables[{index}].schema_fingerprint: stored={}, caller={}",
+                stored.schema_fingerprint, caller.schema_fingerprint
+            ));
+        }
+    }
+    None
+}
+
+fn first_checkpoint_difference(
+    stored: &[NodeCheckpoint],
+    caller: &[NodeCheckpoint],
+) -> Option<String> {
+    if stored.len() != caller.len() {
+        return Some(format!(
+            "initial_checkpoints.len: stored={}, caller={}",
+            stored.len(),
+            caller.len()
+        ));
+    }
+    for (index, (stored, caller)) in stored.iter().zip(caller).enumerate() {
+        if stored.key != caller.key {
+            return Some(format!(
+                "initial_checkpoints[{index}].key: stored={:?}, caller={:?}",
+                stored.key, caller.key
+            ));
+        }
+        if stored.system_identifier != caller.system_identifier {
+            return Some(format!(
+                "initial_checkpoints[{index}].system_identifier: stored={}, caller={}",
+                stored.system_identifier, caller.system_identifier
+            ));
+        }
+        if stored.timeline != caller.timeline {
+            return Some(format!(
+                "initial_checkpoints[{index}].timeline: stored={}, caller={}",
+                stored.timeline, caller.timeline
+            ));
+        }
+        if stored.slot_name != caller.slot_name {
+            return Some(format!(
+                "initial_checkpoints[{index}].slot_name: stored={}, caller={}",
+                stored.slot_name, caller.slot_name
+            ));
+        }
+        if stored.applied_lsn != caller.applied_lsn {
+            return Some(format!(
+                "initial_checkpoints[{index}].applied_lsn: stored={}, caller={}",
+                stored.applied_lsn, caller.applied_lsn
+            ));
+        }
+    }
+    None
 }
 
 pub(super) async fn mark_snapshot_group_active(
@@ -648,6 +803,10 @@ mod tests {
         let mut changed = canonical.clone();
         changed.initial_checkpoints[0].slot_name.push_str("_other");
         assert_ne!(checksum, manifest_checksum(&changed));
+        assert_eq!(
+            first_request_difference(&canonical, &changed).unwrap(),
+            "initial_checkpoints[0].slot_name: stored=pg2cb_slot, caller=pg2cb_slot_other"
+        );
     }
 
     #[test]

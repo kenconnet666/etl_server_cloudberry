@@ -32,6 +32,7 @@ use cloudberry_etl_source_postgres::{
     wal::{ReplicationTransport, SourceNodeIdentity, TransactionAssembler, TransactionLimits},
 };
 use cloudberry_etl_target_cloudberry::{
+    apply::LedgeredCommitObserver,
     checkpoint::{
         CheckpointError, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
         load_node_checkpoint,
@@ -53,7 +54,7 @@ use uuid::Uuid;
 use crate::{
     adapters::{
         AdapterConfigError, CloudberryTransactionSink, DdlScope, PgOutputTransactionSource,
-        TableBinding, TableBindingRegistry,
+        SourceIngestObserver, TableBinding, TableBindingRegistry,
     },
     batch::{BatchError, BatchLimits, Batcher},
     pipeline::PipelineError,
@@ -90,8 +91,6 @@ enum RuntimeJobError {
     TargetDisabled,
     #[error("pipeline snapshot generation must be positive")]
     InvalidSnapshotGeneration,
-    #[error("pipeline fencing token must be positive")]
-    InvalidFencingToken,
     #[error("pipeline lease belongs to a different pipeline")]
     LeaseMismatch,
     #[error("source profile {0} does not exist")]
@@ -190,6 +189,8 @@ pub struct PostgresCloudberryJobFactory {
     control: Arc<dyn ControlStore>,
     master_key: Arc<MasterKey>,
     spool_root: PathBuf,
+    source_ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
+    target_commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
 }
 
 impl std::fmt::Debug for PostgresCloudberryJobFactory {
@@ -207,12 +208,29 @@ impl PostgresCloudberryJobFactory {
             control,
             master_key,
             spool_root: PathBuf::from("data/spool"),
+            source_ingest_observer: None,
+            target_commit_observer: None,
         }
     }
 
     #[must_use]
     pub fn with_spool_root(mut self, spool_root: impl AsRef<Path>) -> Self {
         self.spool_root = spool_root.as_ref().to_owned();
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_ingest_observer(mut self, observer: Arc<dyn SourceIngestObserver>) -> Self {
+        self.source_ingest_observer = Some(observer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_target_commit_observer(
+        mut self,
+        observer: Arc<dyn LedgeredCommitObserver>,
+    ) -> Self {
+        self.target_commit_observer = Some(observer);
         self
     }
 
@@ -279,6 +297,8 @@ impl PostgresCloudberryJobFactory {
             source_dsn,
             target_dsn,
             spool_root: self.spool_root.clone(),
+            source_ingest_observer: self.source_ingest_observer.as_ref().map(Arc::clone),
+            target_commit_observer: self.target_commit_observer.as_ref().map(Arc::clone),
             telemetry,
         })
     }
@@ -312,6 +332,8 @@ struct PostgresCloudberryJob {
     source_dsn: SecretString,
     target_dsn: SecretString,
     spool_root: PathBuf,
+    source_ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
+    target_commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
     telemetry: PipelineTelemetryHandle,
 }
 
@@ -552,12 +574,21 @@ impl PostgresCloudberryJob {
             },
             journal,
         )?;
-        let mut source = PgOutputTransactionSource::new_with_telemetry(
-            transport,
-            assembler,
-            prepared.checkpoint.applied_lsn,
-            self.telemetry.clone(),
-        );
+        let mut source = match &self.source_ingest_observer {
+            Some(observer) => PgOutputTransactionSource::new_with_telemetry_and_observer(
+                transport,
+                assembler,
+                prepared.checkpoint.applied_lsn,
+                self.telemetry.clone(),
+                Arc::clone(observer),
+            ),
+            None => PgOutputTransactionSource::new_with_telemetry(
+                transport,
+                assembler,
+                prepared.checkpoint.applied_lsn,
+                self.telemetry.clone(),
+            ),
+        };
         let registry = TableBindingRegistry::new(
             prepared
                 .tables
@@ -578,17 +609,29 @@ impl PostgresCloudberryJob {
             &self.source_settings.exclude_schemas,
         );
         ddl_scope.exclude(self.source_settings.metadata_schema.clone());
-        let sink = CloudberryTransactionSink::new_with_chunk_limits(
-            target,
-            self.fence,
-            &names.slot,
-            registry,
-            ddl_scope,
-            ChunkLimits {
-                max_records: self.pipeline_settings.batch.max_rows,
-                max_bytes: self.pipeline_settings.batch.max_bytes,
-            },
-        )?;
+        let chunk_limits = ChunkLimits {
+            max_records: self.pipeline_settings.batch.max_rows,
+            max_bytes: self.pipeline_settings.batch.max_bytes,
+        };
+        let sink = match &self.target_commit_observer {
+            Some(observer) => CloudberryTransactionSink::new_with_chunk_limits_and_observer(
+                target,
+                self.fence,
+                &names.slot,
+                registry,
+                ddl_scope,
+                chunk_limits,
+                Arc::clone(observer),
+            )?,
+            None => CloudberryTransactionSink::new_with_chunk_limits(
+                target,
+                self.fence,
+                &names.slot,
+                registry,
+                ddl_scope,
+                chunk_limits,
+            )?,
+        };
         let batcher = Batcher::new(BatchLimits {
             max_rows: self.pipeline_settings.batch.max_rows,
             max_bytes: self.pipeline_settings.batch.max_bytes,
@@ -811,11 +854,9 @@ impl PostgresCloudberryJob {
                 reason: rejected.reason.to_string(),
             });
         }
-        let snapshot_attempt = u64::try_from(self.fence.fencing_token)
-            .map_err(|_| RuntimeJobError::InvalidFencingToken)?;
         let planned = plan_tables(
             self.pipeline_id,
-            snapshot_attempt,
+            self.topology_generation,
             &self.source.prefix,
             &self.source.database_name,
             &self.target.database_name,

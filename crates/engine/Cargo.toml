@@ -31,4 +31,5 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+deadpool-postgres.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

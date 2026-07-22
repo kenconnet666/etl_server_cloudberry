@@ -127,8 +127,8 @@ pub enum SnapshotTargetError {
     SnapshotGroupNotRegistered(Uuid),
     #[error("snapshot group `{0}` has a corrupt or incomplete persisted manifest")]
     CorruptSnapshotGroupManifest(Uuid),
-    #[error("snapshot group `{0}` manifest does not exactly match the caller")]
-    SnapshotGroupManifestMismatch(Uuid),
+    #[error("snapshot group `{group}` manifest does not exactly match the caller: {difference}")]
+    SnapshotGroupManifestMismatch { group: Uuid, difference: String },
     #[error("snapshot group `{0}` is already active and cannot accept more shadows")]
     SnapshotGroupAlreadyActive(Uuid),
     #[error("snapshot group `{0}` is not in the loading state")]

@@ -480,6 +480,7 @@ dependencies = [
  "cloudberry-etl-metadata",
  "cloudberry-etl-source-postgres",
  "cloudberry-etl-target-cloudberry",
+ "deadpool-postgres",
  "futures",
  "native-tls",
  "postgres-native-tls 0.5.3",

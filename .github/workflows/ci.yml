@@ -161,7 +161,11 @@ jobs:
           RUST_LOG: info
 
       - name: Run cross-database snapshot E2E
-        run: cargo test -p cloudberry-etl-engine --test snapshot_e2e -- --ignored --nocapture
+        run: |
+          cargo test -p cloudberry-etl-engine \
+            --test snapshot_e2e \
+            --test phase1_recovery_e2e \
+            -- --ignored --nocapture
         env:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target

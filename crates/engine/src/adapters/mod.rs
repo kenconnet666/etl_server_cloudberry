@@ -7,4 +7,4 @@ pub use cloudberry::{
     AdapterConfigError, CloudberryTransactionSink, DdlScope, TableBinding, TableBindingRegistry,
     build_apply_request, build_apply_request_scoped,
 };
-pub use pgoutput::PgOutputTransactionSource;
+pub use pgoutput::{PgOutputTransactionSource, SourceIngestObserver, SourceIngestPoint};
