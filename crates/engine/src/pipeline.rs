@@ -50,6 +50,7 @@ struct StopBoundaryState {
 #[derive(Debug, Clone)]
 pub struct ReplicationStopBoundary {
     state: std::sync::Arc<std::sync::Mutex<StopBoundaryState>>,
+    reached: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Default for ReplicationStopBoundary {
@@ -68,6 +69,7 @@ impl ReplicationStopBoundary {
                 delivered_lsn: None,
                 durable_lsn: None,
             })),
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -110,6 +112,20 @@ impl ReplicationStopBoundary {
     #[must_use]
     pub fn status(&self) -> StopBoundaryStatus {
         self.lock().status
+    }
+
+    /// Wait until the source has flushed and acknowledged every transaction at or below the
+    /// boundary. Cancellation and timeout remain caller policy so this handle can be reused by
+    /// tests and runtime coordinators without embedding a particular lifecycle.
+    pub async fn wait_reached(&self) -> StopBoundaryStatus {
+        loop {
+            let notified = self.reached.notified();
+            let status = self.status();
+            if matches!(status, StopBoundaryStatus::Reached { .. }) {
+                return status;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn attach_source(
@@ -222,6 +238,8 @@ impl ReplicationStopBoundary {
             boundary,
             durable_lsn,
         };
+        drop(state);
+        self.reached.notify_waiters();
         Ok(())
     }
 
@@ -691,6 +709,30 @@ mod tests {
         assert!(stop_boundary.observe_transaction(PgLsn::new(2)).is_err());
         assert!(stop_boundary.observe_transaction(PgLsn::new(1)).is_err());
         assert!(!stop_boundary.observe_transaction(PgLsn::new(3)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stop_boundary_waiter_observes_the_durable_reached_state() {
+        let stop_boundary = ReplicationStopBoundary::new();
+        stop_boundary.attach_source(PgLsn::new(1)).unwrap();
+        stop_boundary.set(PgLsn::new(2)).unwrap();
+        let waiter = {
+            let stop_boundary = stop_boundary.clone();
+            tokio::spawn(async move { stop_boundary.wait_reached().await })
+        };
+
+        assert!(!stop_boundary.observe_transaction(PgLsn::new(2)).unwrap());
+        stop_boundary.record_durable(PgLsn::new(2)).unwrap();
+        assert!(stop_boundary.observe_transaction(PgLsn::new(3)).unwrap());
+        stop_boundary.mark_reached().unwrap();
+
+        assert_eq!(
+            waiter.await.unwrap(),
+            StopBoundaryStatus::Reached {
+                boundary: PgLsn::new(2),
+                durable_lsn: PgLsn::new(2),
+            }
+        );
     }
 
     #[tokio::test]

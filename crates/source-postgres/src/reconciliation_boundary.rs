@@ -56,6 +56,25 @@ pub struct EmittedReconciliationMarker {
     pub message_lsn: PgLsn,
 }
 
+/// Reads the writable source's current WAL head for the reconciliation lag gate.
+///
+/// This is intentionally separate from logical-slot retained bytes: retained bytes measure WAL
+/// pinning from `restart_lsn`, while scheduling needs the nonnegative distance from the target's
+/// durable apply checkpoint to the source head.
+pub async fn current_wal_lsn(client: &SqlClient) -> SourceResult<PgLsn> {
+    let text: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .try_get(0)?;
+    let lsn = PgLsn::from_str(&text).map_err(|_| SourceError::InvalidLsn(text))?;
+    if lsn == PgLsn::ZERO {
+        return Err(SourceError::contract(
+            "pg_current_wal_lsn returned the zero LSN",
+        ));
+    }
+    Ok(lsn)
+}
+
 /// Owns the replication session and its temporary reconciliation slot.
 pub struct ReconciliationBoundaryGuard {
     client: Option<replication_postgres::Client>,

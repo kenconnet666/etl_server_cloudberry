@@ -5,7 +5,10 @@
 //! ephemeral so a restart repeats a read-only scan instead of trying to resume an invalid source
 //! snapshot. Every mutation locks the pipeline fence before locking or writing this table.
 
-use std::{str::FromStr as _, time::SystemTime};
+use std::{
+    str::FromStr as _,
+    time::{Duration, SystemTime},
+};
 
 use cloudberry_etl_core::{
     id::PipelineId,
@@ -123,6 +126,37 @@ WHERE pipeline_id = $1 AND topology_generation = $2 AND source_relation_id = $3
   AND run_id = $4
 "#;
 
+const SELECT_NEXT_RECONCILIATION_SQL: &str = r#"
+SELECT managed.target_schema, managed.target_table, managed.relation_oid,
+       managed.source_relation_id, managed.table_generation,
+       managed.schema_fingerprint, managed.fencing_token,
+       latest.state AS previous_state,
+       CASE
+           WHEN latest.source_relation_id IS NULL
+               THEN snapshot_group.activated_at + ($3::bigint * INTERVAL '1 second')
+           WHEN latest.state = 'superseded' THEN clock_timestamp()
+           ELSE latest.next_due_at
+       END AS due_at
+FROM pg2cb_meta.managed_tables AS managed
+LEFT JOIN pg2cb_meta.snapshot_groups AS snapshot_group
+  ON snapshot_group.snapshot_group_id = managed.snapshot_group_id
+ AND snapshot_group.pipeline_id = managed.pipeline_id
+ AND snapshot_group.topology_generation = $2
+ AND snapshot_group.state = 'active'
+LEFT JOIN pg2cb_meta.table_reconciliation_state AS latest
+  ON latest.pipeline_id = managed.pipeline_id
+ AND latest.topology_generation = $2
+ AND latest.source_relation_id = managed.source_relation_id
+WHERE managed.pipeline_id = $1
+  AND managed.state = 'active'
+  AND (
+      latest.source_relation_id IS NULL
+      OR latest.state IN ('matched', 'reloaded', 'failed', 'superseded')
+  )
+ORDER BY due_at NULLS FIRST, managed.source_relation_id
+LIMIT 1
+"#;
+
 /// Durable lifecycle of the latest reconciliation run for a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconciliationState {
@@ -221,6 +255,22 @@ pub struct StoredReconciliationState {
     pub next_due_at: Option<SystemTime>,
     pub failure_reason: Option<String>,
     pub consecutive_failures: u64,
+}
+
+/// The single active table that should be considered next by the runtime scheduler.
+///
+/// `due_at` is derived from the table's active snapshot group until the first run exists. Later
+/// runs use their durable `next_due_at`; a superseded run is due immediately so a fresh identity
+/// can replace it. Returning only one table bounds the duration for which streaming is paused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationCandidate {
+    pub source_relation_id: u32,
+    pub target: QualifiedName,
+    pub target_relation_oid: u32,
+    pub table_generation: u64,
+    pub schema_fingerprint: String,
+    pub due_at: SystemTime,
+    pub previous_state: Option<ReconciliationState>,
 }
 
 impl StoredReconciliationState {
@@ -358,6 +408,42 @@ pub enum ReconciliationStateError {
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("reconciliation state write affected {0} rows instead of one")]
     UnexpectedWriteCount(u64),
+    #[error("initial reconciliation interval must be between 1 second and bigint::MAX seconds")]
+    InvalidScheduleInterval,
+    #[error("active managed-table fence {stored} is invalid for current fence {active}")]
+    InvalidManagedTableFence { stored: i64, active: i64 },
+}
+
+/// Returns the earliest schedulable active table under the current pipeline fence.
+///
+/// This function deliberately returns a future candidate as well as an overdue one. The runtime
+/// can sleep until `due_at` without polling target metadata. Nonterminal rows are omitted because
+/// startup recovery must explicitly supersede them before normal scheduling resumes.
+pub async fn next_reconciliation_candidate(
+    client: &mut Client,
+    fence: PipelineFence,
+    initial_interval: Duration,
+) -> Result<Option<ReconciliationCandidate>, ReconciliationStateError> {
+    validate_key(fence, 1)?;
+    let interval_seconds = i64::try_from(initial_interval.as_secs())
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or(ReconciliationStateError::InvalidScheduleInterval)?;
+    let generation = database_generation(fence.topology_generation)?;
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let row = transaction
+        .query_opt(
+            SELECT_NEXT_RECONCILIATION_SQL,
+            &[&fence.pipeline_id.as_uuid(), &generation, &interval_seconds],
+        )
+        .await?;
+    let candidate = row
+        .as_ref()
+        .map(|row| reconciliation_candidate_from_row(row, fence))
+        .transpose()?;
+    transaction.commit().await?;
+    Ok(candidate)
 }
 
 /// Starts or idempotently observes a reconciliation run in its own transaction.
@@ -1403,6 +1489,51 @@ fn validate_replayed_stats(
     }
 }
 
+fn reconciliation_candidate_from_row(
+    row: &Row,
+    fence: PipelineFence,
+) -> Result<ReconciliationCandidate, ReconciliationStateError> {
+    let source_relation_id = persisted_u32(row, "source_relation_id", false)?;
+    let target_relation_oid = persisted_u32(row, "relation_oid", false)?;
+    let table_generation = persisted_u64(row, "table_generation")?;
+    if table_generation == 0 {
+        return Err(invalid_persisted("table_generation", table_generation));
+    }
+    let target = QualifiedName::new(
+        row.try_get::<_, String>("target_schema")?,
+        row.try_get::<_, String>("target_table")?,
+    )
+    .map_err(|error| invalid_persisted("target", error))?;
+    let schema_fingerprint: String = row.try_get("schema_fingerprint")?;
+    if schema_fingerprint.is_empty() || schema_fingerprint.contains('\0') {
+        return Err(invalid_persisted("schema_fingerprint", schema_fingerprint));
+    }
+    let stored_fence: i64 = row.try_get("fencing_token")?;
+    if stored_fence <= 0 || stored_fence > fence.fencing_token {
+        return Err(ReconciliationStateError::InvalidManagedTableFence {
+            stored: stored_fence,
+            active: fence.fencing_token,
+        });
+    }
+    let previous_state = row
+        .try_get::<_, Option<&str>>("previous_state")?
+        .map(ReconciliationState::from_str)
+        .transpose()?;
+    let due_at = row
+        .try_get::<_, Option<SystemTime>>("due_at")?
+        .ok_or_else(|| invalid_persisted("due_at", "NULL"))?;
+
+    Ok(ReconciliationCandidate {
+        source_relation_id,
+        target,
+        target_relation_oid,
+        table_generation,
+        schema_fingerprint,
+        due_at,
+        previous_state,
+    })
+}
+
 fn reconciliation_from_row(
     row: &Row,
 ) -> Result<StoredReconciliationState, ReconciliationStateError> {
@@ -1969,5 +2100,17 @@ mod tests {
         assert!(SUPERSEDE_RECONCILIATION_SQL.contains("run_id = $4"));
         assert!(!INSERT_RECONCILIATION_SQL.contains("source_rows"));
         assert!(!MARK_SCANNING_SQL.contains("source_rows"));
+    }
+
+    #[test]
+    fn due_scheduler_uses_activation_then_terminal_deadlines_and_one_table() {
+        assert!(SELECT_NEXT_RECONCILIATION_SQL.contains("snapshot_group.activated_at"));
+        assert!(SELECT_NEXT_RECONCILIATION_SQL.contains("latest.next_due_at"));
+        assert!(SELECT_NEXT_RECONCILIATION_SQL.contains("latest.state = 'superseded'"));
+        assert!(SELECT_NEXT_RECONCILIATION_SQL.contains("ORDER BY due_at NULLS FIRST"));
+        assert!(SELECT_NEXT_RECONCILIATION_SQL.contains("LIMIT 1"));
+        assert!(!SELECT_NEXT_RECONCILIATION_SQL.contains("aligning"));
+        assert!(!SELECT_NEXT_RECONCILIATION_SQL.contains("scanning"));
+        assert!(!SELECT_NEXT_RECONCILIATION_SQL.contains("reload_pending"));
     }
 }

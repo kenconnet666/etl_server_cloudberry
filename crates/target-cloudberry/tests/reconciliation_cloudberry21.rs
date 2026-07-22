@@ -23,7 +23,7 @@ use cloudberry_etl_target_cloudberry::{
         ReconciliationStats, ReconciliationTransitionOutcome, activate_reconciliation_reload,
         begin_reconciliation, complete_reconciliation_scan, fail_reconciliation,
         load_reconciliation_startup_recovery, load_reconciliation_state,
-        mark_reconciliation_scanning, supersede_reconciliation,
+        mark_reconciliation_scanning, next_reconciliation_candidate, supersede_reconciliation,
     },
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyOutcome,
@@ -245,6 +245,21 @@ async fn cloudberry21_reconciliation_reload_activation_is_atomic_and_idempotent(
         SnapshotActivationDisposition::Activated
     );
 
+    let initial_candidate =
+        next_reconciliation_candidate(&mut client, fence, Duration::from_secs(1))
+            .await?
+            .expect("newly activated table must receive its first deadline");
+    assert_eq!(
+        initial_candidate.source_relation_id,
+        initial_schema.relation_id
+    );
+    assert_eq!(initial_candidate.target, target);
+    assert_eq!(
+        initial_candidate.table_generation,
+        initial_schema.generation
+    );
+    assert_eq!(initial_candidate.previous_state, None);
+
     let target_oid_raw: i64 = client
         .query_one(
             "SELECT c.oid::bigint FROM pg_catalog.pg_class AS c \
@@ -344,6 +359,27 @@ async fn cloudberry21_reconciliation_reload_activation_is_atomic_and_idempotent(
     assert!(reloaded.completed_at.is_some());
     assert!(reloaded.last_consistent_at.is_some());
     assert_eq!(reloaded.consecutive_failures, 0);
+    let reloaded_candidate =
+        next_reconciliation_candidate(&mut client, fence, Duration::from_secs(1))
+            .await?
+            .expect("reloaded table must retain its durable next deadline");
+    assert_eq!(
+        reloaded_candidate.source_relation_id,
+        initial_schema.relation_id
+    );
+    assert_eq!(reloaded_candidate.target, target);
+    assert_eq!(
+        reloaded_candidate.table_generation,
+        reload_schema.generation
+    );
+    assert_eq!(
+        reloaded_candidate.previous_state,
+        Some(ReconciliationState::Reloaded)
+    );
+    let deadline_rounding = next_due_at
+        .duration_since(reloaded_candidate.due_at)
+        .unwrap_or_else(|error| error.duration());
+    assert!(deadline_rounding < Duration::from_millis(1));
     let ids = client
         .query(&format!("SELECT id FROM {target} ORDER BY id"), &[])
         .await?

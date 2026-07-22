@@ -310,6 +310,23 @@ async fn standalone_ddl_uses_table_local_aoco_reload() -> Result<(), Box<dyn Err
 
 #[tokio::test]
 #[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_reconciliation_reloads_corrupt_aoco_and_replays_after_boundary()
+-> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let mut context =
+        TestContext::setup(&source_dsn, &target_dsn, LARGE_TRANSACTION_PROFILE).await?;
+    let result = async {
+        context.enable_fast_reconciliation().await?;
+        run_reconciliation_reload(&mut context).await
+    }
+    .await;
+    context.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
 async fn standalone_schema_scoped_enum_ddl_reloads_managed_closure() -> Result<(), Box<dyn Error>> {
     let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
     let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
@@ -811,6 +828,101 @@ async fn run_schema_reload_case(source_dsn: &str, target_dsn: &str) -> Result<()
     let result = run_schema_reload(&mut context).await;
     context.cleanup().await;
     result
+}
+
+async fn run_reconciliation_reload(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    const BULK_ROWS: i64 = 100_000;
+    insert_bulk_source_transaction(&context.source, &context.source_schema, 2, BULK_ROWS, 64)
+        .await?;
+    let mut active = context.start_job().await?;
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        BULK_ROWS + 1,
+        &active,
+    )
+    .await?;
+    let initial_identity = active_table_identity(&context.target, context.pipeline.id).await?;
+
+    let target = format!("{}.items", quote_identifier(&context.target_schema));
+    context
+        .target
+        .batch_execute(&format!(
+            "BEGIN;
+             UPDATE {target} SET payload='target-corrupt-update' WHERE id=1;
+             DELETE FROM {target} WHERE id=2;
+             INSERT INTO {target} (id, payload) VALUES (900000000, 'target-only-row');
+             COMMIT;"
+        ))
+        .await?;
+
+    wait_for_reconciliation_state(
+        &context.target,
+        context.pipeline.id,
+        "reload_pending",
+        &active,
+    )
+    .await?;
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload) VALUES (900000001, 'after-boundary')",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+    let after_boundary_lsn_text: String = context
+        .source
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .get(0);
+    let after_boundary_lsn: PgLsn = after_boundary_lsn_text.parse()?;
+
+    wait_for_reconciliation_state(&context.target, context.pipeline.id, "reloaded", &active)
+        .await?;
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        BULK_ROWS + 2,
+        &active,
+    )
+    .await?;
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    let reloaded_identity = active_table_identity(&context.target, context.pipeline.id).await?;
+    assert_eq!(reloaded_identity.1, initial_identity.1 + 1);
+    assert_ne!(reloaded_identity.0, initial_identity.0);
+    assert!(
+        load_checkpoint_lsn(&context.target, context.pipeline.id).await? >= after_boundary_lsn,
+        "the transaction after B must become durable after the main slot reconnects"
+    );
+    let temporary_slots: i64 = context
+        .source
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots
+             WHERE temporary AND slot_name LIKE 'pg2cb_r_%'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(temporary_slots, 0);
+
+    wait_for_reconciliation_state(&context.target, context.pipeline.id, "matched", &active).await?;
+    assert_eq!(
+        active_table_identity(&context.target, context.pipeline.id).await?,
+        reloaded_identity,
+        "a clean follow-up cycle must not replace the AOCO relation again"
+    );
+
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
 }
 
 async fn run_recovery_matrix(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
@@ -1860,6 +1972,30 @@ impl TestContext {
         })
     }
 
+    async fn enable_fast_reconciliation(&mut self) -> Result<(), Box<dyn Error>> {
+        self.pipeline.config_revision += 1;
+        self.pipeline.snapshot_generation += 1;
+        self.pipeline.updated_at = Utc::now();
+        self.pipeline
+            .settings
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("pipeline settings are not an object"))?
+            .insert(
+                "reconciliation".to_owned(),
+                json!({
+                    "enabled": true,
+                    "interval_seconds": 5,
+                    "retry_seconds": 1,
+                    "boundary_timeout_seconds": 30,
+                    "scan_timeout_seconds": 60,
+                    "max_lag_bytes": 64 * 1024 * 1024,
+                    "max_row_bytes": 1024 * 1024
+                }),
+            );
+        self.store.put_pipeline(&self.pipeline).await?;
+        Ok(())
+    }
+
     async fn start_job(&self) -> Result<ActiveJob, Box<dyn Error>> {
         let lease = self
             .store
@@ -2190,6 +2326,58 @@ async fn wait_for_running(active: &ActiveJob) -> Result<(), Box<dyn Error>> {
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn wait_for_reconciliation_state(
+    target: &Client,
+    pipeline_id: PipelineId,
+    expected: &str,
+    active: &ActiveJob,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before reconciliation reached {expected}: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        let state = target
+            .query_opt(
+                "SELECT state FROM pg2cb_meta.table_reconciliation_state
+                 WHERE pipeline_id=$1 ORDER BY source_relation_id LIMIT 1",
+                &[&pipeline_id.as_uuid()],
+            )
+            .await?
+            .map(|row| row.get::<_, String>(0));
+        if state.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("reconciliation did not reach {expected}; last state was {state:?}"),
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn active_table_identity(
+    target: &Client,
+    pipeline_id: PipelineId,
+) -> Result<(i64, i64), tokio_postgres::Error> {
+    target
+        .query_one(
+            "SELECT relation_oid, table_generation
+             FROM pg2cb_meta.managed_tables
+             WHERE pipeline_id=$1 AND state='active'",
+            &[&pipeline_id.as_uuid()],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))
 }
 
 async fn wait_for_target_condition(
@@ -2600,6 +2788,7 @@ async fn cleanup_target_metadata(target: &Client, pipeline_id: PipelineId) {
         "transaction_committed_chunks",
         "transaction_chunk_progress",
         "snapshot_table_progress",
+        "table_reconciliation_state",
         "managed_tables",
         "managed_types",
         "snapshot_reconciliation_log",
