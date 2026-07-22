@@ -11,7 +11,8 @@ use cloudberry_etl_target_cloudberry::{
     migration::migrate_target_database,
     schema_event::{
         RecordOutcome, SchemaEventRecord, SchemaEventState, advance_schema_event_state,
-        list_unfinished_schema_events, load_schema_event, record_schema_event,
+        fail_schema_event_and_block_transitions, list_unfinished_schema_events, load_schema_event,
+        record_schema_event,
     },
     table_transition::{
         TableTransitionAction, TableTransitionKey, TableTransitionRecord,
@@ -266,14 +267,35 @@ async fn run_ledger_test(
         record_schema_event(client, &failed).await?,
         RecordOutcome::Inserted
     );
-    advance_schema_event_state(
+    let failed_table_key = TableTransitionKey {
+        pipeline_id,
+        source_lsn: failed.source_lsn,
+        source_xid: failed.source_xid,
+        source_relation_id: 101,
+    };
+    record_table_transition(
+        client,
+        &TableTransitionRecord {
+            event_id: failed_id,
+            fence: newer_fence,
+            source_lsn: failed.source_lsn,
+            source_xid: failed.source_xid,
+            source_relation_id: failed_table_key.source_relation_id,
+            action: TableTransitionAction::Reload,
+            plan: serde_json::json!({"action": "reload"}),
+            barrier_lsn: failed.source_lsn,
+            active_table_generation: Some(1),
+            pending_table_generation: None,
+            snapshot_group_id: None,
+        },
+    )
+    .await?;
+    fail_schema_event_and_block_transitions(
         client,
         newer_fence,
-        PgLsn::new(0x2000),
-        4243,
-        SchemaEventState::Pending,
-        SchemaEventState::Failed,
-        Some("narrowing type change is not online-safe"),
+        failed.source_lsn,
+        failed.source_xid,
+        "narrowing type change is not online-safe",
     )
     .await?;
     let failed_row = load_schema_event(client, pipeline_id, PgLsn::new(0x2000), 4243)
@@ -283,6 +305,14 @@ async fn run_ledger_test(
     assert_eq!(
         failed_row.failure_reason.as_deref(),
         Some("narrowing type change is not online-safe")
+    );
+    let failed_table = load_table_transition(client, failed_table_key)
+        .await?
+        .expect("failed table transition exists");
+    assert_eq!(failed_table.state, TableTransitionState::Blocked);
+    assert_eq!(
+        failed_table.failure_reason.as_deref(),
+        failed_row.failure_reason.as_deref()
     );
 
     Ok(())

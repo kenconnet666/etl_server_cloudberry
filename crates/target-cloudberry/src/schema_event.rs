@@ -72,6 +72,23 @@ WHERE pipeline_id = $1 AND topology_generation = $2
   AND fencing_token = $5 AND state = $6
 "#;
 
+const LOCK_UNFINISHED_TABLE_TRANSITIONS_SQL: &str = r#"
+SELECT topology_generation, fencing_token
+  FROM pg2cb_meta.table_schema_transitions
+ WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn AND source_xid = $3
+   AND state <> 'completed'
+ FOR UPDATE
+"#;
+
+const BLOCK_UNFINISHED_TABLE_TRANSITIONS_SQL: &str = r#"
+UPDATE pg2cb_meta.table_schema_transitions
+   SET state = 'blocked', failure_reason = $6, updated_at = clock_timestamp(),
+       completed_at = NULL
+ WHERE pipeline_id = $1 AND topology_generation = $2
+   AND source_lsn = $3::text::pg_lsn AND source_xid = $4
+   AND fencing_token = $5 AND state <> 'completed'
+"#;
+
 /// Lifecycle state of a persisted schema event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +218,23 @@ pub enum SchemaEventError {
     },
     #[error("schema event state update affected {0} rows instead of one")]
     UnexpectedWriteCount(u64),
+    #[error("schema event was not found")]
+    NotFound,
+    #[error("schema event topology generation {stored} does not match active generation {active}")]
+    TopologyMismatch { stored: u64, active: u64 },
+    #[error("schema event fencing token {stored} does not match active token {active}")]
+    FenceMismatch { stored: i64, active: i64 },
+    #[error("schema-event fallback requires a non-empty failure reason")]
+    InvalidFailureReason,
+    #[error(
+        "unfinished table transition uses topology generation {stored} and fence {stored_fence}, expected generation {active} and fence {active_fence}"
+    )]
+    TableTransitionFenceMismatch {
+        stored: u64,
+        stored_fence: i64,
+        active: u64,
+        active_fence: i64,
+    },
 }
 
 /// Record a new pending schema event in its own target transaction.
@@ -416,6 +450,112 @@ pub async fn advance_schema_event_state_in_transaction(
     ensure_one_row(updated)
 }
 
+/// Atomically closes a schema event that is falling back to a pipeline rebuild.
+///
+/// Every unfinished child transition is blocked with the event failure reason before the parent
+/// becomes failed. Calling this for an already-failed event repairs ledgers written before table
+/// transitions were closed atomically.
+pub async fn fail_schema_event_and_block_transitions(
+    client: &mut Client,
+    fence: PipelineFence,
+    source_lsn: PgLsn,
+    source_xid: u64,
+    failure_reason: &str,
+) -> Result<(), SchemaEventError> {
+    if failure_reason.is_empty() || failure_reason.contains('\0') {
+        return Err(SchemaEventError::InvalidFailureReason);
+    }
+    if fence.fencing_token <= 0 {
+        return Err(SchemaEventError::InvalidFencingToken);
+    }
+    let generation = database_generation(fence.topology_generation)?;
+    let xid = database_xid(source_xid)?;
+    let pipeline_id = fence.pipeline_id.as_uuid();
+    let lsn = source_lsn.to_string();
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let event = transaction
+        .query_opt(LOCK_SCHEMA_EVENT_SQL, &[&pipeline_id, &lsn, &xid])
+        .await?
+        .map(|row| schema_event_from_row(&row))
+        .transpose()?
+        .ok_or(SchemaEventError::NotFound)?;
+    if event.topology_generation != fence.topology_generation {
+        return Err(SchemaEventError::TopologyMismatch {
+            stored: event.topology_generation,
+            active: fence.topology_generation,
+        });
+    }
+    if event.fencing_token != fence.fencing_token {
+        return Err(SchemaEventError::FenceMismatch {
+            stored: event.fencing_token,
+            active: fence.fencing_token,
+        });
+    }
+    if event.state == SchemaEventState::Completed {
+        return Err(SchemaEventError::IllegalTransition {
+            from: event.state.as_str(),
+            to: SchemaEventState::Failed.as_str(),
+        });
+    }
+    let effective_reason = event
+        .failure_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(failure_reason);
+    let transition_rows = transaction
+        .query(
+            LOCK_UNFINISHED_TABLE_TRANSITIONS_SQL,
+            &[&pipeline_id, &lsn, &xid],
+        )
+        .await?;
+    for row in transition_rows {
+        let stored_generation: i64 = row.try_get("topology_generation")?;
+        let stored_generation = u64::try_from(stored_generation).map_err(|_| {
+            SchemaEventError::InvalidPersistedValue {
+                field: "table_transition.topology_generation",
+                value: stored_generation.to_string(),
+            }
+        })?;
+        let stored_fence: i64 = row.try_get("fencing_token")?;
+        if stored_generation != fence.topology_generation || stored_fence != fence.fencing_token {
+            return Err(SchemaEventError::TableTransitionFenceMismatch {
+                stored: stored_generation,
+                stored_fence,
+                active: fence.topology_generation,
+                active_fence: fence.fencing_token,
+            });
+        }
+    }
+    transaction
+        .execute(
+            BLOCK_UNFINISHED_TABLE_TRANSITIONS_SQL,
+            &[
+                &pipeline_id,
+                &generation,
+                &lsn,
+                &xid,
+                &fence.fencing_token,
+                &effective_reason,
+            ],
+        )
+        .await?;
+    if event.state != SchemaEventState::Failed {
+        advance_schema_event_state_in_transaction(
+            &transaction,
+            fence,
+            source_lsn,
+            source_xid,
+            event.state,
+            SchemaEventState::Failed,
+            Some(effective_reason),
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 fn validate_record(record: &SchemaEventRecord) -> Result<(), SchemaEventError> {
     if record.fence.fencing_token <= 0 {
         return Err(SchemaEventError::InvalidFencingToken);
@@ -575,5 +715,13 @@ mod tests {
         );
         // The advance guard requires the expected prior state.
         assert!(ADVANCE_STATE_SQL.contains("AND fencing_token = $5 AND state = $6"));
+    }
+
+    #[test]
+    fn fallback_blocks_only_the_current_events_unfinished_tables() {
+        assert!(LOCK_UNFINISHED_TABLE_TRANSITIONS_SQL.ends_with("FOR UPDATE\n"));
+        assert!(BLOCK_UNFINISHED_TABLE_TRANSITIONS_SQL.contains("state = 'blocked'"));
+        assert!(BLOCK_UNFINISHED_TABLE_TRANSITIONS_SQL.contains("state <> 'completed'"));
+        assert!(BLOCK_UNFINISHED_TABLE_TRANSITIONS_SQL.contains("fencing_token = $5"));
     }
 }

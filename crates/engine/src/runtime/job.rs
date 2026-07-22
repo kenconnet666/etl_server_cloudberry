@@ -40,7 +40,8 @@ use cloudberry_etl_target_cloudberry::{
     },
     migration::{MigrationError, migrate_target_database},
     schema_event::{
-        SchemaEventError, SchemaEventState, advance_schema_event_state, load_schema_event,
+        SchemaEventError, SchemaEventState, fail_schema_event_and_block_transitions,
+        load_schema_event,
     },
     snapshot::{
         QuarantineGcPolicy, SnapshotActivationRequest, SnapshotPageCommitObserver,
@@ -743,24 +744,23 @@ impl PostgresCloudberryJob {
                 source_xid: key.source_xid,
             })?;
         match event.state {
-            SchemaEventState::Pending | SchemaEventState::InTransition => {
-                advance_schema_event_state(
-                    &mut target,
-                    self.fence,
-                    key.source_lsn,
-                    key.source_xid,
-                    event.state,
-                    SchemaEventState::Failed,
-                    Some(reason),
-                )
-                .await?;
-            }
-            SchemaEventState::Failed => {}
             SchemaEventState::Completed => {
                 return Err(RuntimeJobError::CompletedSchemaEventBarrier {
                     source_lsn: key.source_lsn,
                     source_xid: key.source_xid,
                 });
+            }
+            SchemaEventState::Pending
+            | SchemaEventState::InTransition
+            | SchemaEventState::Failed => {
+                fail_schema_event_and_block_transitions(
+                    &mut target,
+                    self.fence,
+                    key.source_lsn,
+                    key.source_xid,
+                    reason,
+                )
+                .await?;
             }
         }
         Ok(())
