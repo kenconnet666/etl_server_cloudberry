@@ -14,7 +14,9 @@ services:
       -c max_wal_senders=16
       -c shared_preload_libraries=''
     volumes:
-      - pg18-data:/var/lib/postgresql/data
+      # postgres:18 stores data in a major-version subdirectory, so the mount
+      # point must be /var/lib/postgresql (not .../data) or the entrypoint aborts.
+      - pg18-data:/var/lib/postgresql
       - ./pg18/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d source"]
