@@ -60,7 +60,7 @@ ConsistencyRunner
 退出条件：默认分支 CI 全绿；容器可启动并通过 health smoke；所有 checked-in 配置能被严格验证；
 测试环境不依赖开发者机器路径。
 
-## Phase 1：Standalone 连续数据面（已完成，2026-07-22）
+## Phase 1：Standalone 连续数据面（功能基线完成，生产验证未关闭）
 
 目标：在单节点上完成最终数据路径，而不是继续扩展旧 `Vec` assembler。
 
@@ -69,14 +69,18 @@ ConsistencyRunner
 - committed transaction 从 spool 按 rows/bytes chunk apply。
 - target 以稳定 manifest、record range/digest 和 durable `next_seq` 记录 chunk；receipt 与 DML
   同事务提交，不能只依赖 deferred checkpoint。
-- node completion tracker 在完整事务完成后推进连续 checkpoint。
-- snapshot 改为 PK chunk、并行 reader、持久进度和 bounded shadow load；同一 live S0 内可恢复 target commit ambiguity，进程崩溃后从新 slot 边界完整重拉。
+- 当前单节点串行 dispatcher 在完整事务完成后推进 checkpoint；per-node completion tracker
+  已有纯状态机和单测，但尚未接入并行 runtime。
+- snapshot 改为 PK chunk、串行 bounded reader、持久进度和 bounded shadow load；同一 live S0
+  内可恢复 target commit ambiguity，进程崩溃后从新 slot 边界完整重拉。并行 reader 尚未接入。
 - target 每个 apply 验证 table relation oid、generation、schema fingerprint 和 fence。
-- 实现 Standalone read-only reconciliation runner；差异先触发 table shadow rebuild，原地 repair 保持 capability-gated。
+- reconciliation 已有 bounded page/digest/diff primitives 与 canonical read 接口；周期 runtime
+  runner、持久健康状态和差异触发表级 shadow reload 尚未接入，原地 repair 保持 capability-gated。
 
-退出条件：最大测试事务显著大于进程内存预算；内存保持水位内；在 source read、spool write、
-target chunk commit、checkpoint commit、ACK 前后 kill 均可收敛；磁盘 high-water 进入
-`RESOURCE_WAIT`，扩容后继续且不触发 rebuild。
+当前功能证据：最大测试事务显著大于进程内存预算；内存保持水位内；in-process observer 覆盖
+source read、spool write、target chunk commit、checkpoint commit、ACK 边界；磁盘 high-water
+进入 `RESOURCE_WAIT` 后可继续且不触发 rebuild。生产退出仍要求独立进程 SIGKILL、网络/数据库
+重启、周期 reconciliation 和 24/72 小时 soak。
 
 ## Phase 2：DDL 紧密跟随
 
@@ -97,8 +101,34 @@ target chunk commit、checkpoint commit、ACK 前后 kill 均可收敛；磁盘 
 目标：在正确性模型不变的前提下释放并行能力。
 
 - pgoutput protocol v2 streaming 直接写入 Phase 1 的 spool journal。
-- table/node applier 并行，completion tracker 管理连续前缀。
+- node 级并行由 completion tracker 管理连续前缀；table 级连接池只在真实多 segment Cloudberry
+  基准证明有收益后启用。当前单 segment AOCO 的 4 表/400k 行 target-only COPY 中，1/2/4 连接分别
+  为 452,602/306,164/302,840 rows/s，并发反而下降 32%-33%，Standalone 默认保持单连接。
 - session-persistent staging 与 batch-local staging 用 Cloudberry benchmark 决定。
+- Standalone AOCO 已建立 10k/100k/1M release 基线；当前数据与 DuckLake 口径对比见
+  [standalone-benchmark.md](standalone-benchmark.md)。
+- PAX 的 1M/1000×1k INSERT-only 实验两轮达到 backlog 49.45k-49.64k、streaming
+  46.71k-50.01k rows/s，最多只比 AOCO 已观测上限高 2.8%/6.2%，但关系大小约小 41%。完整
+  current-state batch UPDATE 被 Cloudberry 2.1 以 `IndexDeleteTuples` 不支持拒绝，因此不进入生产
+  apply、重复 UPDATE 合并或恢复矩阵，AOCO 默认不变。
+- 无 schema barrier 且不超过 row/byte 水位的完整源事务由现有 `Batcher` 有界积压，跨事务按
+  table/key 折叠后一次 COPY/DML、一次 target commit、一次 checkpoint；超大事务继续使用 chunk
+  ledger。100k 行拆为 100 个 1k 源事务时，backlog/streaming 从 6,739/7,041 提升到
+  三次复跑中位数 35,288/45,212 rows/s（backlog 32,835-41,262，streaming 43,327-45,739）；
+  1M 小事务最终复跑为 46,753/46,753 rows/s，前一轮观测上限为
+  48,270/47,077 rows/s。
+- 同一 25k key 连续 4 轮、100k UPDATE 的真实 A/B：按轮提交为 4 次 target commit、100k 行应用、
+  21,545 input ops/s；跨轮折叠为 1 次 commit、25k 行应用、35,654 input ops/s。默认 row limit
+  从 10k 提升到 100k，16 MiB byte limit 与 250 ms delay limit 不变；满批到达水位立即 flush。
+- 不要求 `REPLICA IDENTITY FULL`。PG18 实测 FULL 对 64-byte/约 6 KiB UPDATE 分别增加 19.3%/
+  45.3% WAL，旧非键列不参与主键 lineage 或最终状态正确性，只会压缩可合并批次容量。
+- 外部 MQ 只按独立保留、重放、扇出需求选择，不作为单 Cloudberry sink 的吞吐补丁。下一项并发
+  实验是完整事务的有界进程内 channel，让 decode/spool 与 ordered apply 重叠；先补当前 Rust
+  decode-only 分层基准。Cloudberry COPY 是行流，客户端列式转置不进入主线，列组/压缩交给 AOCO。
+- 现有全局 `Batcher` 就是按 row/byte/delay 限界的堆积池，normalizer 已在批内按表/主键归并。
+  不创建随表数量增长的无界队列。未来若多 segment 基准支持 table worker，必须增加分表 durable
+  applied LSN、表内有序执行、DDL/TRUNCATE 全量 drain，并且只在全部受影响表持久后推进全局
+  checkpoint/ACK；不能把当前 atomic request 直接拆到多个连接。
 - source snapshot、WAL ingest、spool、COPY/apply、reconciliation 使用独立有界资源池。
 - 建立 24/72 小时 soak、故障注入、磁盘/WAL/内存容量告警。
 

@@ -11,8 +11,10 @@
 
 ## V3 当前执行边界
 
-- 只有 `Standalone` topology 已接入 pipeline runtime。
-- `PhysicalHa` 和 `Citus` 当前会被 runtime 明确拒绝。相应章节定义准入目标，不表示已经具备端到端 snapshot/WAL/apply 能力。
+- 只有 `Standalone` topology 已完成真实 pipeline runtime 与恢复矩阵验证。
+- `PhysicalHa` 当前复用单 active primary 的 Standalone 路径，但 failover logical slot 连续性尚未实现或验证；source identity/timeline 变化会安全停止并要求新 generation，不能宣称无缝 HA。
+- `Citus` 当前会被 runtime 明确拒绝。相应章节定义准入目标，不表示已经具备端到端 snapshot/WAL/apply 能力。
+- reconciliation 目前只有有界算法与读接口，尚未接入周期性 runtime runner；生产部署不能依赖后台对账自动发现静默漂移。
 - 对配置范围内的表采用严格 fail-closed：发现任意不合格表即拒绝整条 pipeline 启动，且不会静默排除该表。
 - 逐表持久化 `BLOCKED` 并继续复制其他合格表是后续能力；在 metadata 和恢复语义完成前不得按目标契约宣称已实现。
 
@@ -45,11 +47,11 @@ V3 当前运行时支持单 primary。初始快照和 logical replication 都从
 
 ### Primary + physical standby
 
-目标契约支持一个 primary 和多个物理从库，但它们共同构成一个 source node identity。V3 runtime 尚未启用该 topology：
+目标契约支持一个 primary 和多个物理从库，但它们共同构成一个 source node identity。V3 runtime 仅复用 Standalone 的单 active primary 处理，尚未具备故障切换连续性：
 
 - 只消费当前 primary，禁止同时消费 standby。
 - 使用稳定 primary endpoint。
-- PostgreSQL 18 failover logical slot 必须启用并由部署方监控同步状态。
+- PostgreSQL 18 failover logical slot 是交付目标；当前 runtime 会拒绝 `failover`/`synced` slot，不能把该模式用于生产连续切换。
 - failover 后必须验证 system identifier、timeline、slot 和 checkpoint 连续性。
 - 不满足连续性证明时进入 `REBUILD_REQUIRED`。
 
@@ -80,7 +82,7 @@ DDL 只能从 coordinator 执行。source event trigger 必须带 coordinator gu
 - stored generated column，作为目标普通列物化；publication 必须实际输出其值。
 - 列 default、NOT NULL 和可精确翻译的 CHECK 只作为 schema mirror；源仍是写入权威。
 
-Cloudberry 目标表首批固定为 heap，`DISTRIBUTED BY` 使用源 primary key 的全部 key column。主键变化、partition 变化或 distribution 变化不会在线修改现有 generation。
+Cloudberry 目标业务表默认使用 AOCO，`DISTRIBUTED BY` 使用源 primary key 的全部 key column。主键变化、partition 变化或 distribution 变化不会在线修改现有 generation。
 
 ### Validation-gated
 
@@ -115,7 +117,10 @@ primary key 是行身份和幂等性的唯一依据：
 - primary key update 显式转换成 `DELETE old_key` 和 `UPSERT new_row`。
 - Citus distribution key update 同样是 delete + insert，不使用 `ON CONFLICT DO UPDATE` 修改分布列。
 
-`REPLICA IDENTITY DEFAULT` 是正常配置。若某 DDL 或插件行为导致 update/delete 不再携带所需 key，服务暂停该表，而不是依赖全行模糊匹配。
+`REPLICA IDENTITY DEFAULT` 是正常且推荐的配置。跨事务合并只依赖 primary key 和按列 presence；
+不要求 `REPLICA IDENTITY FULL`。FULL 的旧非键列不能改善行身份或最终状态正确性，却会放大源
+WAL、网络、spool 和批次字节，降低一个有界批次可折叠的操作数。若某 DDL 或插件行为导致
+update/delete 不再携带所需 key，服务暂停该表，而不是依赖全行模糊匹配。
 
 TOAST 行值必须区分：
 

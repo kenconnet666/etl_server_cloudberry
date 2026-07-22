@@ -155,7 +155,9 @@ jobs:
             --test cloudberry21 \
             --test schema_event_cloudberry21 \
             --test chunk_ledger_cloudberry21 \
-            -- --ignored --nocapture
+            -- --ignored --nocapture \
+            --skip cloudberry21_parallel_aoco_copy_benchmark \
+            --skip cloudberry21_pax_experimental_smoke
         env:
           PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target
           RUST_LOG: info
@@ -166,7 +168,10 @@ jobs:
             --test snapshot_e2e \
             --test phase1_recovery_e2e \
             --test schema_transition_e2e \
-            -- --ignored --nocapture
+            -- --ignored --nocapture \
+            --skip standalone_aoco_throughput_benchmark \
+            --skip standalone_pax_experimental_throughput_benchmark \
+            --skip standalone_aoco_operation_coalescing_benchmark
         env:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target

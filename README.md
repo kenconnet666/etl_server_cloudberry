@@ -1,10 +1,12 @@
 # ETL Server Cloudberry
 
 `etl-server-cloudberry` mirrors the current row state of supported PostgreSQL
-18 tables into Apache Cloudberry. The V3 runtime currently executes standalone
-PostgreSQL pipelines only. Physical-HA and Citus topology values fail explicitly
-at startup; Citus catalog discovery and its opt-in integration environment are
-present as validation work, not as an end-to-end replication capability.
+18 tables into Apache Cloudberry. The V3 runtime has an exercised Standalone
+data plane. `PhysicalHa` currently reuses that single-active-primary path, but
+logical-slot continuity across failover is neither implemented nor validated;
+an identity or timeline change stops safely and requires a new generation.
+`Citus` remains gated. Its catalog discovery and opt-in integration environment
+are validation work, not an end-to-end replication capability.
 
 The delivery contract is at-least-once with idempotent primary-key application
 and eventual convergence. A selected table that violates the source contract
@@ -71,3 +73,5 @@ Functional tests may cross the Windows/WSL virtual network using the reachable
 `10.144.144.4` and `10.144.144.5` addresses. Peak throughput and latency tests
 run PostgreSQL, the service, and Cloudberry in one Linux/WSL instance to remove
 virtual-network noise; cross-boundary benchmarks are reported separately.
+The current Standalone AOCO 10k/100k/1M results and DuckLake comparison are in
+[`docs/standalone-benchmark.md`](docs/standalone-benchmark.md).

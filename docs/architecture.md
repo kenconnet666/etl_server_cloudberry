@@ -11,11 +11,11 @@
 
 ## V3 当前实现边界
 
-- 数据面运行时只执行 `Standalone` topology。`PhysicalHa` 和 `Citus` 会返回明确的 unsupported-topology 错误，不会退化为单机模式继续运行。
+- 数据面运行时只有 `Standalone` 完成真实恢复矩阵。`PhysicalHa` 暂时复用相同的单 active primary 路径，但 failover logical slot 连续性未实现或验证；identity/timeline 漂移会安全停止并要求新 generation。`Citus` 返回明确的 unsupported-topology 错误。
 - Citus 已有 topology/catalog discovery、表元数据分类和 opt-in 真实集群测试环境；尚未接通逐 worker snapshot、WAL、checkpoint 和 Cloudberry apply，因此不能声明端到端支持。
 - 源 catalog 能同时返回合格表与拒绝表；当前 pipeline planner 对配置范围采用严格 fail-closed：任意一张表不合格都会拒绝整条 pipeline 启动，绝不静默跳过。
 - “持久化逐表 `BLOCKED` 状态并让其他合格表继续”是目标能力，需在 control metadata 与运行时恢复语义接通后才能启用。
-- 后续章节中的 Citus、物理 HA、分块 reconciliation、表级隔离和完整 DDL 分类均是必须通过生产验证矩阵的目标设计。
+- 后续章节中的 Citus、物理 HA 连续切换和完整 catalog dependency graph 均是必须通过生产验证矩阵的目标设计。表级 DDL 重拉已在 Standalone 接入；reconciliation 仍只有有界算法与读接口，尚未接入周期性 runtime runner。
 
 ## 目标与非目标
 
@@ -166,7 +166,9 @@ decoder 输出按 source node 有序。调度器可以把已提交事务拆成 t
 
 ### 5. Cloudberry 应用
 
-首批目标表使用 heap，并以源主键全部列作为 `DISTRIBUTED BY`。目标表保留可表达的主键约束；目标 namespace 不允许外部 DML/DDL。
+目标业务表默认使用 AOCO（`ao_column`，zstd level 1），并以源主键全部列作为
+`DISTRIBUTED BY`。metadata 与 batch-local staging 保持 heap；PAX 仅为显式 INSERT-only
+实验，不属于生产支持。目标 namespace 不允许外部 DML/DDL。
 
 每个 table batch 先写 typed staging table，再在一个 Cloudberry 事务内：
 
