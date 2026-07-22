@@ -273,16 +273,35 @@ where
     let Some(plan) = plan_schema_transaction(transaction)? else {
         return Ok(None);
     };
+    prepare_schema_plan(source, target, metadata_schema, fence, plan)
+        .await
+        .map(Some)
+}
+
+/// Validate and persist an already planned schema transaction.
+///
+/// Callers use this split form to discard schema events outside their managed scope before the
+/// source catalog is queried or the target ledger is mutated.
+pub async fn prepare_schema_plan<C>(
+    source: &C,
+    target: &mut Client,
+    metadata_schema: &str,
+    fence: PipelineFence,
+    plan: SchemaTransactionPlan,
+) -> Result<PreparedSchemaEvent, SchemaCoordinatorError>
+where
+    C: GenericClient + Sync,
+{
     let current =
         load_current_relation_schemas(source, metadata_schema, &plan.relation_ids()).await?;
     let catalog_validation = plan.validate_catalog(&current)?;
     let record = plan.schema_event_record(fence)?;
     let record_outcome = record_schema_event(target, &record).await?;
-    Ok(Some(PreparedSchemaEvent {
+    Ok(PreparedSchemaEvent {
         plan,
         catalog_validation,
         record_outcome,
-    }))
+    })
 }
 
 /// Scan one committed transaction without materializing row changes. Returns `None` when it has

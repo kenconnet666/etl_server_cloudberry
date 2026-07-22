@@ -38,6 +38,9 @@ use cloudberry_etl_target_cloudberry::{
         load_node_checkpoint,
     },
     migration::{MigrationError, migrate_target_database},
+    schema_event::{
+        SchemaEventError, SchemaEventState, advance_schema_event_state, load_schema_event,
+    },
     snapshot::{
         QuarantineGcPolicy, SnapshotActivationRequest, SnapshotPageCommitObserver,
         SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group, begin_snapshot_apply,
@@ -57,7 +60,7 @@ use crate::{
         SourceIngestObserver, TableBinding, TableBindingRegistry,
     },
     batch::{BatchError, BatchLimits, Batcher},
-    pipeline::PipelineError,
+    pipeline::{PipelineError, SchemaEventKey},
     runtime::reconciler::{JobFactoryError, PipelineJobFactory},
     supervisor::{PipelineJob, SupervisorError},
     telemetry::PipelineTelemetryHandle,
@@ -99,6 +102,10 @@ enum RuntimeJobError {
     MissingTarget(String),
     #[error("pipeline disappeared while requesting a schema rebuild")]
     MissingPipelineForRebuild,
+    #[error("persisted schema event {source_lsn}/{source_xid} disappeared before fallback")]
+    MissingSchemaEvent { source_lsn: PgLsn, source_xid: u64 },
+    #[error("completed schema event {source_lsn}/{source_xid} unexpectedly raised a barrier")]
+    CompletedSchemaEventBarrier { source_lsn: PgLsn, source_xid: u64 },
     #[error("{0} topology is validation-gated and cannot run yet")]
     UnsupportedTopology(&'static str),
     #[error("source endpoint is a standby; a writable primary endpoint is required")]
@@ -171,6 +178,8 @@ enum RuntimeJobError {
     TargetMigration(#[from] MigrationError),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
+    #[error(transparent)]
+    SchemaEvent(#[from] SchemaEventError),
     #[error(transparent)]
     Snapshot(#[from] SnapshotTargetError),
     #[error(transparent)]
@@ -647,7 +656,8 @@ impl PostgresCloudberryJob {
                 ddl_scope,
                 chunk_limits,
             )?,
-        };
+        }
+        .with_schema_source(source_setup, self.source_settings.metadata_schema.clone())?;
         let batcher = Batcher::new(BatchLimits {
             max_rows: self.pipeline_settings.batch.max_rows,
             max_bytes: self.pipeline_settings.batch.max_bytes,
@@ -677,6 +687,7 @@ impl PostgresCloudberryJob {
             Ok(Err(PipelineError::SchemaBarrier {
                 reason,
                 command_tag,
+                schema_event,
             })) => {
                 if let Some(tag) = &command_tag {
                     tracing::info!(
@@ -686,6 +697,10 @@ impl PostgresCloudberryJob {
                     );
                 }
                 self.telemetry.mark_degraded(reason.clone());
+                if let Some(schema_event) = schema_event {
+                    self.fail_schema_event_for_rebuild(schema_event, &reason)
+                        .await?;
+                }
                 self.request_rebuild(&reason).await?;
                 Ok(())
             }
@@ -698,6 +713,42 @@ impl PostgresCloudberryJob {
             }
             Err(Err(error)) => Err(error),
         }
+    }
+
+    async fn fail_schema_event_for_rebuild(
+        &self,
+        key: SchemaEventKey,
+        reason: &str,
+    ) -> Result<(), RuntimeJobError> {
+        let mut target = connect_sql(&self.target_dsn, EndpointRole::Target).await?;
+        let event = load_schema_event(&target, self.pipeline_id, key.source_lsn, key.source_xid)
+            .await?
+            .ok_or(RuntimeJobError::MissingSchemaEvent {
+                source_lsn: key.source_lsn,
+                source_xid: key.source_xid,
+            })?;
+        match event.state {
+            SchemaEventState::Pending | SchemaEventState::InTransition => {
+                advance_schema_event_state(
+                    &mut target,
+                    self.fence,
+                    key.source_lsn,
+                    key.source_xid,
+                    event.state,
+                    SchemaEventState::Failed,
+                    Some(reason),
+                )
+                .await?;
+            }
+            SchemaEventState::Failed => {}
+            SchemaEventState::Completed => {
+                return Err(RuntimeJobError::CompletedSchemaEventBarrier {
+                    source_lsn: key.source_lsn,
+                    source_xid: key.source_xid,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn request_rebuild(&self, reason: &str) -> Result<(), RuntimeJobError> {

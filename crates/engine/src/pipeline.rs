@@ -15,6 +15,12 @@ use crate::{
     telemetry::PipelineTelemetryHandle,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaEventKey {
+    pub source_lsn: cloudberry_etl_core::lsn::PgLsn,
+    pub source_xid: u64,
+}
+
 const SOURCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
@@ -30,6 +36,9 @@ pub enum PipelineError {
         /// from a DDL event (as opposed to TRUNCATE). Lets the runtime record a
         /// structured schema event before requesting a rebuild.
         command_tag: Option<String>,
+        /// Durable target event written before this barrier was returned. The runtime uses this
+        /// identity to close the current fallback as failed before requesting a rebuild.
+        schema_event: Option<SchemaEventKey>,
     },
     #[error(transparent)]
     Normalize(#[from] crate::normalize::NormalizeError),

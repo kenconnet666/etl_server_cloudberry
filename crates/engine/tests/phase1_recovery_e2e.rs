@@ -210,6 +210,24 @@ impl ActiveJob {
         }
         Ok(())
     }
+
+    async fn expect_successful_exit(
+        &mut self,
+        store: &PostgresControlStore,
+    ) -> Result<(), Box<dyn Error>> {
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(|| io::Error::other("pipeline job handle is missing"))?;
+        let result = tokio::time::timeout(WAIT_TIMEOUT, handle)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pipeline job did not stop"))??;
+        result?;
+        if let Some(lease) = self.lease.take() {
+            store.release_lease(&lease).await?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ActiveJob {
@@ -245,7 +263,8 @@ async fn full_runtime_proves_phase1_recovery_and_capacity_boundaries() -> Result
     run_snapshot_restart_case(&source_dsn, &target_dsn).await?;
     run_recovery_case(&source_dsn, &target_dsn).await?;
     run_large_transaction_case(&source_dsn, &target_dsn).await?;
-    run_capacity_wait_case(&source_dsn, &target_dsn).await
+    run_capacity_wait_case(&source_dsn, &target_dsn).await?;
+    run_schema_fallback_case(&source_dsn, &target_dsn).await
 }
 
 async fn run_snapshot_restart_case(
@@ -279,6 +298,16 @@ async fn run_large_transaction_case(
 async fn run_capacity_wait_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
     let mut context = TestContext::setup(source_dsn, target_dsn, CAPACITY_PROFILE).await?;
     let result = run_capacity_wait(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
+async fn run_schema_fallback_case(
+    source_dsn: &str,
+    target_dsn: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, RECOVERY_PROFILE).await?;
+    let result = run_schema_fallback(&mut context).await;
     context.cleanup().await;
     result
 }
@@ -614,6 +643,65 @@ async fn run_capacity_wait(context: &mut TestContext) -> Result<(), Box<dyn Erro
     )
     .await?;
     active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+    let checkpoint_before = load_checkpoint_lsn(&context.target, context.pipeline.id).await?;
+
+    context
+        .source
+        .batch_execute(&format!(
+            "ALTER TABLE {}.items ADD COLUMN note text",
+            quote_identifier(&context.source_schema)
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+
+    assert_eq!(rebuild_operation_count(context).await?, 1);
+    assert_eq!(
+        load_checkpoint_lsn(&context.target, context.pipeline.id).await?,
+        checkpoint_before,
+        "schema fallback must not advance the target checkpoint across the DDL"
+    );
+    let event = context
+        .target
+        .query_one(
+            "SELECT state, failure_reason, transitions FROM pg2cb_meta.schema_events WHERE pipeline_id=$1",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(event.get::<_, String>("state"), "failed");
+    assert!(
+        event
+            .get::<_, Option<String>>("failure_reason")
+            .is_some_and(|reason| reason.contains("requires table transition"))
+    );
+    let transitions: serde_json::Value = event.try_get("transitions")?;
+    assert!(transitions["source_xid"].as_u64().is_some());
+    let target_has_note: bool = context
+        .target
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM pg_catalog.pg_attribute AS a
+                   JOIN pg_catalog.pg_class AS c ON c.oid=a.attrelid
+                   JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+                  WHERE n.nspname=$1 AND c.relname='items'
+                    AND a.attname='note' AND a.attnum>0 AND NOT a.attisdropped
+             )",
+            &[&context.target_schema],
+        )
+        .await?
+        .get(0);
+    assert!(
+        !target_has_note,
+        "the fallback must not leave a partially applied target DDL"
+    );
     Ok(())
 }
 
@@ -1161,6 +1249,20 @@ async fn rebuild_operation_count(context: &TestContext) -> Result<i64, tokio_pos
         )
         .await
         .map(|row| row.get(0))
+}
+
+async fn load_checkpoint_lsn(
+    target: &Client,
+    pipeline_id: PipelineId,
+) -> Result<PgLsn, Box<dyn Error>> {
+    let value: String = target
+        .query_one(
+            "SELECT applied_lsn::text FROM pg2cb_meta.node_checkpoints WHERE pipeline_id=$1",
+            &[&pipeline_id.as_uuid()],
+        )
+        .await?
+        .get(0);
+    Ok(value.parse()?)
 }
 
 async fn assert_source_target_equal(

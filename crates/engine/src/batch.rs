@@ -92,6 +92,7 @@ pub struct Batcher {
     pending: Vec<CommittedTransaction>,
     pending_rows: usize,
     pending_bytes: usize,
+    pending_has_generation_barrier: bool,
     pending_node_id: Option<i32>,
     node_watermarks: HashMap<i32, NodeWatermark>,
 }
@@ -113,6 +114,7 @@ impl Batcher {
             pending: Vec::new(),
             pending_rows: 0,
             pending_bytes: 0,
+            pending_has_generation_barrier: false,
             pending_node_id: None,
             node_watermarks: HashMap::new(),
         })
@@ -132,7 +134,8 @@ impl Batcher {
         let bytes = usize::try_from(stats.encoded_bytes).unwrap_or(usize::MAX);
         let barrier = stats.has_generation_barrier;
         let must_flush = !self.pending.is_empty()
-            && (barrier
+            && (self.pending_has_generation_barrier
+                || barrier
                 || self.pending_rows.saturating_add(rows) > self.limits.max_rows
                 || self.pending_bytes.saturating_add(bytes) > self.limits.max_bytes
                 // Empty transactions still carry a commit position; cap their count so they
@@ -152,6 +155,7 @@ impl Batcher {
         );
         self.pending_rows = self.pending_rows.saturating_add(rows);
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        self.pending_has_generation_barrier = barrier;
         self.pending.push(transaction);
         Ok(full)
     }
@@ -210,12 +214,7 @@ impl Batcher {
         let transactions = std::mem::take(&mut self.pending);
         let row_count = std::mem::take(&mut self.pending_rows);
         let estimated_bytes = std::mem::take(&mut self.pending_bytes);
-        let has_generation_barrier = transactions.iter().any(|transaction| {
-            transaction
-                .change_source
-                .stats()
-                .is_ok_and(|stats| stats.has_generation_barrier)
-        });
+        let has_generation_barrier = std::mem::take(&mut self.pending_has_generation_barrier);
         self.pending_node_id = None;
         TransactionBatch {
             transactions,
@@ -277,6 +276,33 @@ mod tests {
 
         let barrier = batcher.flush().unwrap();
         assert!(barrier.has_generation_barrier());
+    }
+
+    #[test]
+    fn generation_barrier_is_isolated_from_following_transactions() {
+        let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
+        let ddl = TransactionChange::Ddl(DdlMessage {
+            version: 1,
+            command_tag: "ALTER TABLE".into(),
+            relation_ids: vec![7],
+            affected_schemas: vec!["public".into()],
+            schema_fingerprint: "abc".into(),
+            transitions: Vec::new(),
+        });
+
+        assert!(batcher.push(transaction(1, vec![ddl])).unwrap().is_none());
+        let barrier = batcher
+            .push(transaction(2, vec![]))
+            .unwrap()
+            .expect("following transaction flushes the pending barrier");
+        assert_eq!(barrier.transactions().len(), 1);
+        assert_eq!(barrier.final_transaction().xid, 1);
+        assert!(barrier.has_generation_barrier());
+
+        let following = batcher.flush().unwrap();
+        assert_eq!(following.transactions().len(), 1);
+        assert_eq!(following.final_transaction().xid, 2);
+        assert!(!following.has_generation_barrier());
     }
 
     #[test]

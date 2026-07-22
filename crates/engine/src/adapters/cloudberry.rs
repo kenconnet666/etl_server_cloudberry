@@ -33,7 +33,8 @@ use tokio_postgres::Client;
 use crate::{
     batch::TransactionBatch,
     normalize::normalize_table_changes,
-    pipeline::{PipelineError, TransactionSink},
+    pipeline::{PipelineError, SchemaEventKey, TransactionSink},
+    schema_transition::{plan_schema_transaction, prepare_schema_plan},
 };
 
 // This versions the logical record digest consumed by the target ledger, not its memory or spool
@@ -61,6 +62,8 @@ pub enum AdapterConfigError {
     InvalidTableGeneration(u64),
     #[error("table schema fingerprint cannot be empty or contain NUL")]
     InvalidSchemaFingerprint,
+    #[error("source metadata schema cannot be empty or contain NUL")]
+    InvalidMetadataSchema,
 }
 
 /// Source schema selection used to decide whether a transactional DDL event requires a rebuild.
@@ -92,7 +95,10 @@ impl DdlScope {
         self.exclude_schemas.insert(schema.into());
     }
 
-    fn requires_barrier(&self, message: &cloudberry_etl_core::change::DdlMessage) -> bool {
+    pub(crate) fn requires_barrier(
+        &self,
+        message: &cloudberry_etl_core::change::DdlMessage,
+    ) -> bool {
         use cloudberry_etl_core::change::DdlReplicationImpact;
 
         // Commands proven harmless to the mirrored row stream (index maintenance,
@@ -267,6 +273,13 @@ impl TableBindingRegistry {
     #[must_use]
     pub fn get(&self, relation_id: u32, generation: u64) -> Option<&TableBinding> {
         self.bindings.get(&(relation_id, generation))
+    }
+
+    #[must_use]
+    pub fn contains_relation(&self, relation_id: u32) -> bool {
+        self.bindings
+            .keys()
+            .any(|(bound_relation, _)| *bound_relation == relation_id)
     }
 
     /// Classify a DDL against the currently bound schema for `(relation_id,
@@ -469,6 +482,7 @@ fn reject_schema_barriers(
                                 follow_note
                             ),
                             command_tag: Some(message.command_tag.clone()),
+                            schema_event: None,
                         });
                     }
                 }
@@ -479,6 +493,7 @@ fn reject_schema_barriers(
                             transaction.xid
                         ),
                         command_tag: None,
+                        schema_event: None,
                     });
                 }
                 TransactionChange::Row(_) => {}
@@ -491,12 +506,18 @@ fn reject_schema_barriers(
 /// Applies normalized rows and the target-authoritative checkpoint atomically.
 pub struct CloudberryTransactionSink {
     client: Mutex<Client>,
+    schema_source: Option<SchemaSource>,
     fence: PipelineFence,
     slot_name: String,
     registry: TableBindingRegistry,
     ddl_scope: DdlScope,
     chunk_limits: ChunkLimits,
     commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
+}
+
+struct SchemaSource {
+    client: Client,
+    metadata_schema: String,
 }
 
 impl CloudberryTransactionSink {
@@ -577,6 +598,7 @@ impl CloudberryTransactionSink {
             .map_err(|error| AdapterConfigError::InvalidChunkLimits(error.to_string()))?;
         Ok(Self {
             client: Mutex::new(client),
+            schema_source: None,
             fence,
             slot_name,
             registry,
@@ -584,6 +606,102 @@ impl CloudberryTransactionSink {
             chunk_limits,
             commit_observer,
         })
+    }
+
+    /// Enable transaction-level schema planning with a dedicated source SQL connection.
+    /// The connection is queried only for an isolated schema barrier, never from row apply.
+    pub fn with_schema_source(
+        mut self,
+        client: Client,
+        metadata_schema: impl Into<String>,
+    ) -> Result<Self, AdapterConfigError> {
+        let metadata_schema = metadata_schema.into();
+        if metadata_schema.is_empty() || metadata_schema.contains('\0') {
+            return Err(AdapterConfigError::InvalidMetadataSchema);
+        }
+        self.schema_source = Some(SchemaSource {
+            client,
+            metadata_schema,
+        });
+        Ok(self)
+    }
+
+    fn plan_requires_barrier(
+        &self,
+        plan: &crate::schema_transition::SchemaTransactionPlan,
+    ) -> bool {
+        plan.changes.iter().any(|change| match change {
+            crate::schema_transition::OrderedSchemaChange::Ddl { message, .. } => {
+                self.ddl_scope.requires_barrier(message)
+            }
+            crate::schema_transition::OrderedSchemaChange::Truncate { relation_ids, .. } => {
+                relation_ids
+                    .iter()
+                    .any(|relation_id| self.registry.contains_relation(*relation_id))
+            }
+        })
+    }
+
+    async fn prepare_schema_barrier(
+        &self,
+        client: &mut Client,
+        batch: &TransactionBatch,
+    ) -> Result<Option<PipelineError>, PipelineError> {
+        if !batch.has_generation_barrier() {
+            return Ok(None);
+        }
+        if batch.transactions().len() != 1 {
+            return Err(PipelineError::Target(
+                "schema barrier transaction was not isolated by the batcher".to_owned(),
+            ));
+        }
+        let transaction = batch.final_transaction();
+        let Some(plan) = plan_schema_transaction(transaction)
+            .map_err(|error| PipelineError::Source(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if !self.plan_requires_barrier(&plan) {
+            return Ok(None);
+        }
+        let command_tag = plan.changes.iter().find_map(|change| match change {
+            crate::schema_transition::OrderedSchemaChange::Ddl { message, .. } => {
+                Some(message.command_tag.clone())
+            }
+            crate::schema_transition::OrderedSchemaChange::Truncate { .. } => None,
+        });
+        let reason = format!(
+            "schema transaction {} at {} ({}) requires table transition for relations {:?} and schemas {:?}",
+            plan.source_xid,
+            plan.source_position.lsn,
+            plan.command_summary(),
+            plan.relation_ids(),
+            plan.affected_schemas
+        );
+        let Some(source) = &self.schema_source else {
+            return Ok(Some(PipelineError::SchemaBarrier {
+                reason,
+                command_tag,
+                schema_event: None,
+            }));
+        };
+        let prepared = prepare_schema_plan(
+            &source.client,
+            client,
+            &source.metadata_schema,
+            self.fence,
+            plan,
+        )
+        .await
+        .map_err(|error| PipelineError::Target(error.to_string()))?;
+        Ok(Some(PipelineError::SchemaBarrier {
+            reason,
+            command_tag,
+            schema_event: Some(SchemaEventKey {
+                source_lsn: prepared.plan.source_position.lsn,
+                source_xid: u64::from(prepared.plan.source_xid),
+            }),
+        }))
     }
 
     async fn apply_transaction(
@@ -735,10 +853,10 @@ fn validate_resume_sequence(
 #[async_trait]
 impl TransactionSink for CloudberryTransactionSink {
     async fn apply(&self, batch: &TransactionBatch) -> Result<(), PipelineError> {
-        // Scan the complete batch before the first target chunk commits. A barrier later in a
-        // batch must not be crossed by earlier data transactions.
-        reject_schema_barriers(batch, &self.ddl_scope)?;
         let mut client = self.client.lock().await;
+        if let Some(barrier) = self.prepare_schema_barrier(&mut client, batch).await? {
+            return Err(barrier);
+        }
         for transaction in batch.transactions() {
             self.apply_transaction(&mut client, transaction).await?;
         }
@@ -1099,16 +1217,19 @@ mod tests {
         let (root, committed) = spooled_transaction(&[insert(7, 3, "1", "a"), ddl]);
         let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
         batcher.push(committed.clone()).unwrap();
-        batcher
+        let batch = batcher
             .push(transaction(21, vec![insert(7, 3, "2", "later")]))
-            .unwrap();
-        let batch = batcher.flush().unwrap();
+            .unwrap()
+            .expect("the transaction after a barrier flushes the isolated DDL batch");
 
-        assert_eq!(batch.transactions().len(), 2);
+        assert_eq!(batch.transactions().len(), 1);
         assert!(matches!(
             reject_schema_barriers(&batch, &DdlScope::default()),
             Err(PipelineError::SchemaBarrier { reason, .. }) if reason.contains("ALTER TABLE")
         ));
+        let following = batcher.flush().unwrap();
+        assert_eq!(following.transactions().len(), 1);
+        assert!(!following.has_generation_barrier());
         assert_eq!(committed.change_source.stats().unwrap().change_count, 2);
 
         if let ChangeSource::Spool(handle) = &committed.change_source {

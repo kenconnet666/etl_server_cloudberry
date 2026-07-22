@@ -4,7 +4,7 @@
 //! stay inside this crate, so the rest of the pipeline does not depend on PostgreSQL client
 //! implementation details.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cloudberry_etl_core::schema::{
     ColumnSchema, GeneratedColumn, IdentityColumn, PgType, PgTypeKind, QualifiedName,
@@ -216,8 +216,58 @@ pub async fn inspect_tables<C>(client: &C, options: &CatalogOptions) -> SourceRe
 where
     C: GenericClient + Sync,
 {
-    let tables = load_table_candidates(client, options).await?;
+    let tables = load_table_candidates(client, options, None).await?;
     Ok(classify_tables(tables))
+}
+
+/// Load the complete, type-resolved schemas for an exact set of currently existing relations.
+///
+/// This is deliberately relation-ID based rather than name based: a schema coordinator must not
+/// confuse a dropped-and-recreated table with its previous incarnation. The query runs only at a
+/// DDL barrier, never on the row apply path. Every requested OID must resolve to one supported
+/// relation inside `options`; missing or unsupported entries fail closed.
+pub async fn load_tables_by_relation_ids<C>(
+    client: &C,
+    options: &CatalogOptions,
+    relation_ids: &[u32],
+) -> SourceResult<BTreeMap<u32, TableSchema>>
+where
+    C: GenericClient + Sync,
+{
+    let mut relation_ids = relation_ids.to_vec();
+    relation_ids.sort_unstable();
+    relation_ids.dedup();
+    if relation_ids.contains(&0) {
+        return Err(SourceError::contract(
+            "relation OID zero is not valid for a catalog table lookup",
+        ));
+    }
+    if relation_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let candidates = load_table_candidates(client, options, Some(&relation_ids)).await?;
+    let inventory = classify_tables(candidates);
+    if let Some(rejected) = inventory.rejected.first() {
+        return Err(SourceError::contract(format!(
+            "relation {} is not eligible for replication: {}",
+            rejected.name, rejected.reason
+        )));
+    }
+    let tables = inventory
+        .supported
+        .into_iter()
+        .map(|table| (table.relation_id, table))
+        .collect::<BTreeMap<_, _>>();
+    if tables.len() != relation_ids.len()
+        || relation_ids
+            .iter()
+            .any(|relation_id| !tables.contains_key(relation_id))
+    {
+        return Err(SourceError::contract(
+            "catalog table lookup did not return every requested relation",
+        ));
+    }
+    Ok(tables)
 }
 
 fn classify_tables(tables: Vec<TableSchema>) -> TableInventory {
@@ -241,6 +291,7 @@ fn classify_tables(tables: Vec<TableSchema>) -> TableInventory {
 async fn load_table_candidates<C>(
     client: &C,
     options: &CatalogOptions,
+    relation_ids: Option<&[u32]>,
 ) -> SourceResult<Vec<TableSchema>>
 where
     C: GenericClient + Sync,
@@ -274,10 +325,11 @@ where
                                       AND i.indisvalid AND i.indisready AND i.indimmediate
                LEFT JOIN pg_collation coll ON coll.oid = a.attcollation AND a.attcollation <> 0
                LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
-              WHERE c.relkind IN ('r', 'p')
-                AND c.relpersistence = 'p'
-              ORDER BY c.oid, a.attnum",
-            &[],
+               WHERE c.relkind IN ('r', 'p')
+                 AND c.relpersistence = 'p'
+                 AND ($1::bigint[] IS NULL OR c.oid = ANY($1::bigint[]))
+               ORDER BY c.oid, a.attnum",
+            &[&relation_ids.map(|ids| ids.iter().copied().map(i64::from).collect::<Vec<_>>())],
         )
         .await?;
 
