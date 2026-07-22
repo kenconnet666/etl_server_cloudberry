@@ -9,6 +9,7 @@ use cloudberry_etl_core::{
 use thiserror::Error;
 
 use crate::sql::{SqlRenderError, quote_identifier, quote_literal, quote_qualified_name};
+use crate::storage::TargetStorage;
 
 const MAX_NUMERIC_PRECISION: u16 = 1_000;
 const MAX_CHARACTER_LENGTH: u32 = 10_485_760;
@@ -69,11 +70,6 @@ pub struct ColumnPlan {
     pub primary_key_ordinal: Option<u16>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetStorage {
-    Heap,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTablePlan {
     pub target: QualifiedName,
@@ -95,10 +91,19 @@ pub fn plan_type(data_type: &PgType, target_type_schema: &str) -> Result<TypePla
     Ok(TypePlan { sql, prerequisites })
 }
 
-/// Builds a heap table whose distribution key is the complete source PK.
+/// Builds a business table whose distribution key is the complete source PK.
 pub fn plan_create_table(
     source: &TableSchema,
     target: QualifiedName,
+) -> Result<CreateTablePlan, SchemaError> {
+    plan_create_table_with_storage(source, target, TargetStorage::default())
+}
+
+/// Builds a business table with an explicit physical storage profile.
+pub fn plan_create_table_with_storage(
+    source: &TableSchema,
+    target: QualifiedName,
+    storage: TargetStorage,
 ) -> Result<CreateTablePlan, SchemaError> {
     source.validate_supported()?;
     match source.kind {
@@ -167,10 +172,10 @@ pub fn plan_create_table(
         .into_iter()
         .map(|column| column.name.clone())
         .collect();
-    let create_sql = render_create_table(&target, &columns, &primary_key)?;
+    let create_sql = render_create_table(&target, &columns, &primary_key, storage)?;
     Ok(CreateTablePlan {
         target,
-        storage: TargetStorage::Heap,
+        storage,
         columns,
         distribution_key: primary_key.clone(),
         primary_key,
@@ -183,6 +188,7 @@ fn render_create_table(
     target: &QualifiedName,
     columns: &[ColumnPlan],
     primary_key: &[String],
+    storage: TargetStorage,
 ) -> Result<String, SchemaError> {
     let mut definitions = Vec::with_capacity(columns.len() + 1);
     for column in columns {
@@ -198,9 +204,10 @@ fn render_create_table(
     definitions.push(format!("    PRIMARY KEY ({quoted_key})"));
 
     Ok(format!(
-        "CREATE TABLE {} (\n{}\n)\nUSING heap\nDISTRIBUTED BY ({})",
+        "CREATE TABLE {} (\n{}\n)\n{}\nDISTRIBUTED BY ({})",
         quote_qualified_name(target)?,
         definitions.join(",\n"),
+        storage.create_clause(),
         quoted_key
     ))
 }
@@ -535,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_explicit_heap_table_distributed_by_the_complete_pk() {
+    fn builds_aoco_table_distributed_by_the_complete_pk() {
         let source = table(vec![
             column(1, "tenant_id", PgTypeKind::Int4, Some(2)),
             column(2, "payload", PgTypeKind::VarChar { length: Some(64) }, None),
@@ -547,7 +554,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.storage, TargetStorage::Heap);
+        assert_eq!(plan.storage, TargetStorage::AoColumn);
         assert_eq!(plan.primary_key, ["id", "tenant_id"]);
         assert_eq!(plan.distribution_key, plan.primary_key);
         assert!(
@@ -558,11 +565,38 @@ mod tests {
             plan.create_sql
                 .contains("PRIMARY KEY (\"id\", \"tenant_id\")")
         );
-        assert!(plan.create_sql.contains("\nUSING heap\n"));
+        assert!(
+            plan.create_sql
+                .contains("\nUSING ao_column WITH (compresstype='zstd', compresslevel=1)\n")
+        );
         assert!(
             plan.create_sql
                 .ends_with("DISTRIBUTED BY (\"id\", \"tenant_id\")")
         );
+    }
+
+    #[test]
+    fn explicit_storage_profiles_render_only_the_supported_access_methods() {
+        let source = table(vec![column(1, "id", PgTypeKind::Int8, Some(1))]);
+        for (storage, clause) in [
+            (
+                TargetStorage::AoColumn,
+                "USING ao_column WITH (compresstype='zstd', compresslevel=1)",
+            ),
+            (
+                TargetStorage::PaxExperimental,
+                "USING pax WITH (storage_format='porc', compresstype='zstd', compresslevel=1)",
+            ),
+        ] {
+            let plan = plan_create_table_with_storage(
+                &source,
+                QualifiedName::new("target", format!("items_{storage:?}")).unwrap(),
+                storage,
+            )
+            .unwrap();
+            assert_eq!(plan.storage, storage);
+            assert!(plan.create_sql.contains(clause));
+        }
     }
 
     #[test]

@@ -8,4 +8,5 @@ pub mod schema;
 pub mod schema_event;
 pub mod snapshot;
 pub mod sql;
+pub mod storage;
 pub mod version;

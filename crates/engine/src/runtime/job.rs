@@ -1,6 +1,7 @@
 //! Concrete PostgreSQL 18 to Cloudberry pipeline job.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     str::FromStr as _,
     sync::Arc,
@@ -45,8 +46,10 @@ use cloudberry_etl_target_cloudberry::{
         QuarantineGcPolicy, SnapshotActivationRequest, SnapshotPageCommitObserver,
         SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group, begin_snapshot_apply,
         begin_snapshot_group, begin_snapshot_pages, cleanup_stale_snapshot_groups,
-        garbage_collect_quarantined_tables, plan_snapshot_target, validate_active_snapshot_group,
+        garbage_collect_quarantined_tables, plan_snapshot_target_with_storage,
+        validate_active_snapshot_group,
     },
+    storage::{StorageCapabilityError, load_relation_storage, verify_storage_available},
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -68,7 +71,8 @@ use crate::{
 
 use super::{
     EndpointRole, PipelineSettings, PlannedTable, SourceSettings, TablePlanningError,
-    TargetSettings, WalRetentionSettings, connect_sql, plan_tables, replication_names,
+    TargetPlanningContext, TargetSettings, WalRetentionSettings, connect_sql, plan_tables,
+    replication_names,
 };
 
 const STANDALONE_NODE_ID: i32 = 0;
@@ -118,6 +122,12 @@ enum RuntimeJobError {
     TargetDatabaseMismatch { expected: String, actual: String },
     #[error("target endpoint is not Apache Cloudberry 2.1")]
     UnsupportedTarget,
+    #[error("target table `{table}` uses `{actual}` access method, expected `{expected}`")]
+    TargetStorageDrift {
+        table: String,
+        expected: &'static str,
+        actual: String,
+    },
     #[error("no source table satisfies the complete source and target contract")]
     NoEligibleTables,
     #[error("source table `{table}` is inside the configured scope but unsupported: {reason}")]
@@ -176,6 +186,8 @@ enum RuntimeJobError {
     Spool(#[from] SpoolError),
     #[error(transparent)]
     TargetMigration(#[from] MigrationError),
+    #[error(transparent)]
+    StorageCapability(#[from] StorageCapabilityError),
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
@@ -465,6 +477,7 @@ impl PostgresCloudberryJob {
         .await?;
         self.validate_source(&report)?;
         self.validate_target(&target).await?;
+        self.validate_storage_capabilities(&target).await?;
         migrate_target_database(&mut target).await?;
         activate_pipeline_fence(&target, self.fence).await?;
         let stale_groups = cleanup_stale_snapshot_groups(&mut target, self.fence).await?;
@@ -531,6 +544,7 @@ impl PostgresCloudberryJob {
                         | RuntimeJobError::WalLost
                         | RuntimeJobError::WalRetentionExceeded { .. }
                         | RuntimeJobError::PublicationDrift(_)
+                        | RuntimeJobError::TargetStorageDrift { .. }
                 ) =>
             {
                 self.request_rebuild(&error.to_string()).await?;
@@ -623,6 +637,7 @@ impl PostgresCloudberryJob {
                         table.planned.source.clone(),
                         table.planned.target.clone(),
                         table.planned.staging_name.clone(),
+                        table.planned.storage,
                         self.topology_generation,
                         table.planned.schema_fingerprint.clone(),
                     )
@@ -872,6 +887,23 @@ impl PostgresCloudberryJob {
         Ok(())
     }
 
+    async fn validate_storage_capabilities(
+        &self,
+        target: &tokio_postgres::Client,
+    ) -> Result<(), RuntimeJobError> {
+        let mut required = HashSet::from([self.target_settings.default_table_storage]);
+        required.extend(
+            self.pipeline_settings
+                .table_mappings
+                .iter()
+                .filter_map(|mapping| mapping.storage),
+        );
+        for storage in required {
+            verify_storage_available(target, storage).await?;
+        }
+        Ok(())
+    }
+
     async fn install_ddl_capture(
         &self,
         source: &tokio_postgres::Client,
@@ -926,7 +958,10 @@ impl PostgresCloudberryJob {
             self.topology_generation,
             &self.source.prefix,
             &self.source.database_name,
-            &self.target.database_name,
+            TargetPlanningContext {
+                database: &self.target.database_name,
+                default_storage: self.target_settings.default_table_storage,
+            },
             &self.pipeline_settings,
             inventory.supported,
         )?;
@@ -934,10 +969,11 @@ impl PostgresCloudberryJob {
         for planned in planned {
             let mut snapshot_schema = planned.source.clone();
             snapshot_schema.generation = self.topology_generation;
-            let snapshot_plan = plan_snapshot_target(
+            let snapshot_plan = plan_snapshot_target_with_storage(
                 &snapshot_schema,
                 planned.target.clone(),
                 planned.shadow.clone(),
+                planned.storage,
             )?;
             accepted.push(RuntimeTable {
                 planned,
@@ -1361,6 +1397,17 @@ impl PostgresCloudberryJob {
         )
         .await?;
         let tables = self.plan_inventory(inventory)?;
+        for table in &tables {
+            if let Some(actual) = load_relation_storage(target, &table.planned.target).await?
+                && actual != table.planned.storage.access_method()
+            {
+                return Err(RuntimeJobError::TargetStorageDrift {
+                    table: table.planned.target.to_string(),
+                    expected: table.planned.storage.access_method(),
+                    actual,
+                });
+            }
+        }
         let publication = PublicationSpec::new(
             &names.publication,
             tables

@@ -16,7 +16,7 @@ use cloudberry_etl_target_cloudberry::{
     apply::{
         ApplyError, ApplyRequest, DataChunkDisposition, LedgeredDataChunkOutcome,
         LedgeredDataChunkRequest, StageOperation, StagingRow, TableApplyBatch, execute_apply,
-        execute_ledgered_data_chunk, plan_apply,
+        execute_ledgered_data_chunk, plan_apply_with_storage,
     },
     checkpoint::{
         AdvanceOutcome, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
@@ -25,6 +25,7 @@ use cloudberry_etl_target_cloudberry::{
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
     managed::{ManagedTableError, TableApplyIdentity},
     migration::migrate_target_database,
+    schema::plan_create_table_with_storage,
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyMode,
         SnapshotApplyOutcome, SnapshotGroupRegistrationDisposition, SnapshotOwnership,
@@ -32,6 +33,7 @@ use cloudberry_etl_target_cloudberry::{
         begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages, plan_snapshot_target,
         validate_active_snapshot_group,
     },
+    storage::{TargetStorage, load_relation_storage},
 };
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
@@ -54,6 +56,142 @@ async fn cloudberry21_typed_apply_move_and_checkpoint() -> Result<(), Box<dyn Er
     let pipeline_id = PipelineId::new();
     let result = run_test(&mut client, &target_schema, pipeline_id).await;
     cleanup(&client, &target_schema, pipeline_id).await;
+    connection_task.abort();
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_aoco_supports_current_state_dml_and_types() -> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (mut client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("integration test Cloudberry connection ended: {error}");
+        }
+    });
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_schema = format!("pg2cb_storage_{suffix}");
+    let result = async {
+        migrate_target_database(&mut client).await?;
+        client
+            .batch_execute(&format!("CREATE SCHEMA {}", quote_identifier(&target_schema)))
+            .await?;
+        let source = source_schema();
+        let target = QualifiedName::new(&target_schema, "items_aoco")?;
+        let plan = plan_create_table_with_storage(&source, target.clone(), TargetStorage::AoColumn)?;
+        client.batch_execute(&plan.create_sql).await?;
+        assert_eq!(
+            load_relation_storage(&client, &target).await?.as_deref(),
+            Some("ao_column")
+        );
+        let relation = format!("{}.items_aoco", quote_identifier(&target_schema));
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {relation} (id, payload, quantity) VALUES (1, 'initial', 1); \
+                 UPDATE {relation} SET payload = 'updated', quantity = 3 WHERE id = 1; \
+                 DELETE FROM {relation} WHERE id = 1;"
+            ))
+            .await?;
+        let count: i64 = client
+            .query_one(&format!("SELECT count(*) FROM {relation}"), &[])
+            .await?
+            .try_get(0)?;
+        assert_eq!(count, 0);
+        let type_contract = format!(
+            "{}.aoco_type_contract",
+            quote_identifier(&target_schema)
+        );
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {type_contract} (\
+                    id bigint PRIMARY KEY, flag boolean NOT NULL, amount numeric(12,2), \
+                    occurred_at timestamp(6) with time zone, payload jsonb, labels text[], \
+                    binary_value bytea, network inet, token uuid\
+                 ) USING ao_column WITH (compresstype='zstd', compresslevel=1) DISTRIBUTED BY (id); \
+                 INSERT INTO {type_contract} VALUES (\
+                    1, true, 123.45, '2026-07-22 12:34:56.123456+08', \
+                    '{{\"state\":\"new\"}}', ARRAY['a', 'b'], '\\x00ff', '10.0.0.1/24', \
+                    '550e8400-e29b-41d4-a716-446655440000'\
+                 ); \
+                 UPDATE {type_contract} SET payload = '{{\"state\":\"updated\"}}', amount = 234.56 WHERE id = 1;"
+            ))
+            .await?;
+        let typed_row = client
+            .query_one(
+                &format!(
+                    "SELECT flag, amount::text, payload->>'state', labels, encode(binary_value, 'hex'), network::text, token::text FROM {type_contract} WHERE id = 1"
+                ),
+                &[],
+            )
+            .await?;
+        assert!(typed_row.try_get::<_, bool>(0)?);
+        assert_eq!(typed_row.try_get::<_, String>(1)?, "234.56");
+        assert_eq!(typed_row.try_get::<_, String>(2)?, "updated");
+        assert_eq!(typed_row.try_get::<_, Vec<String>>(3)?, vec!["a", "b"]);
+        assert_eq!(typed_row.try_get::<_, String>(4)?, "00ff");
+        assert_eq!(typed_row.try_get::<_, String>(5)?, "10.0.0.1/24");
+        assert_eq!(
+            typed_row.try_get::<_, String>(6)?,
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        Ok::<_, Box<dyn Error>>(())
+    }
+    .await;
+    cleanup(&client, &target_schema, PipelineId::new()).await;
+    connection_task.abort();
+    result
+}
+
+#[tokio::test]
+#[ignore = "experimental: requires a PAX-enabled Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_pax_experimental_smoke() -> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("experimental PAX connection ended: {error}");
+        }
+    });
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_schema = format!("pg2cb_pax_{suffix}");
+    let result = async {
+        let pax_available: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_am WHERE amtype = 't' AND amname = 'pax')",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        if !pax_available {
+            return Ok::<_, Box<dyn Error>>(());
+        }
+        client
+            .batch_execute(&format!("CREATE SCHEMA {}", quote_identifier(&target_schema)))
+            .await?;
+        let target = QualifiedName::new(&target_schema, "items")?;
+        let plan = plan_create_table_with_storage(
+            &source_schema(),
+            target.clone(),
+            TargetStorage::PaxExperimental,
+        )?;
+        client.batch_execute(&plan.create_sql).await?;
+        assert_eq!(
+            load_relation_storage(&client, &target).await?.as_deref(),
+            Some("pax")
+        );
+        let relation = format!("{}.items", quote_identifier(&target_schema));
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {relation} VALUES (1, 'initial', 1); \
+                 UPDATE {relation} SET payload = 'updated', quantity = 2 WHERE id = 1; \
+                 DELETE FROM {relation} WHERE id = 1;"
+            ))
+            .await?;
+        Ok(())
+    }
+    .await;
+    cleanup(&client, &target_schema, PipelineId::new()).await;
     connection_task.abort();
     result
 }
@@ -682,11 +820,20 @@ async fn run_test(
 
     let source = source_schema();
     let target = QualifiedName::new(target_schema, "items")?;
-    let plan = plan_apply(&source, target, &format!("stage_{}", &target_schema[9..]))?;
+    let plan = plan_apply_with_storage(
+        &source,
+        target,
+        &format!("stage_{}", &target_schema[9..]),
+        TargetStorage::AoColumn,
+    )?;
     for prerequisite in &plan.table.prerequisites {
         client.batch_execute(&prerequisite.create_sql).await?;
     }
     client.batch_execute(&plan.table.create_sql).await?;
+    assert_eq!(
+        load_relation_storage(client, &plan.table.target).await?,
+        Some("ao_column".to_owned())
+    );
 
     let fence = PipelineFence {
         pipeline_id,

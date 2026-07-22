@@ -6,10 +6,12 @@ pub mod settings;
 
 pub use connection::{EndpointRole, SqlConnectError, connect_sql};
 pub use job::PostgresCloudberryJobFactory;
-pub use planning::{PlannedTable, TablePlanningError, plan_tables, schema_fingerprint};
+pub use planning::{
+    PlannedTable, TablePlanningError, TargetPlanningContext, plan_tables, schema_fingerprint,
+};
 
 pub use settings::{
     BatchSettings, ConnectionSettings, PipelineSettings, ReplicationNames, SettingsError,
-    SourceSettings, TableMapping, TargetSettings, TlsMode, TransactionSettings,
+    SourceSettings, TableMapping, TargetSettings, TargetStorage, TlsMode, TransactionSettings,
     WalRetentionSettings, replication_names, replication_names_for_uuid,
 };

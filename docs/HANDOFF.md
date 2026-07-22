@@ -4,7 +4,7 @@
 > （已删除）。每次换机或阶段推进后更新本文。
 
 **最后更新:** 2026-07-22
-**工作分支:** `codex/phase1-durable-cdc`（以 `git status --short --branch` 为准）
+**工作分支:** `codex/phase2-ddl`（以 `git status --short --branch` 为准）
 
 ## 换机快速开始
 
@@ -16,7 +16,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --lib
 ```
 
-预期：编译通过，clippy 零 warning，**275 项 library 单元测试全部通过**。真实数据库集成测试是 opt-in（见下"测试环境"），不在默认 `--lib` 范围内。source-postgres 的 PG18 集成测试已在真实 PostgreSQL 18.4 上全部通过（4/4，在 WSL 内运行）。
+预期：编译通过，clippy 零 warning，**293 项 library 单元测试全部通过**。真实数据库集成测试是 opt-in（见下"测试环境"），不在默认 `--lib` 范围内。source-postgres 的 PG18 集成测试已在真实 PostgreSQL 18.4 上全部通过（4/4，在 WSL 内运行）。
 
 ## 核心目标（不变）
 
@@ -79,6 +79,11 @@ cargo test --workspace --lib
 4. **rapid DDL、DROP quarantine + 新表自动准入。** catalog 比 event 超前时合并连续 committed schema transactions 后重算 terminal plan；无法证明完整范围则局部 quarantine/reload 并阻断 checkpoint。
 
 **Phase 2 退出条件：** 并发 DML+DDL、同事务多次 DDL、rapid DDL、rename/drop/recreate、目标 commit ambiguity、进程重启和重复 WAL 矩阵通过；普通 DDL 不调用 `request_pipeline_rebuild`。
+
+### Cloudberry 业务表存储 ✅ 进行中（AOCO 默认）
+- 业务表与 snapshot shadow 通过 `TargetStorage` 统一规划：默认 `ao_column`（zstd level 1）；`pax_experimental` 只允许显式按表评估；业务表禁止 heap，metadata/staging 保持 heap。完整约束见 [cloudberry-storage-profile.md](cloudberry-storage-profile.md)。
+- storage profile 进入 managed-table fingerprint；恢复时从 `pg_am` 校验 access method，已有 heap 或其他格式与期望 AOCO/PAX 不一致会在 CDC 写入前请求新的 snapshot generation，避免混用物理格式。
+- AOCO 承担完整 current-state/type 集成验证。PAX 只保留独立实验 smoke test，不声明完整 SQL、类型、并发和恢复支持；显式启用时启动探测 `pg_am`。
 
 ### Phase 3 / 4
 吞吐延迟与 soak / Citus 真实多节点数据面。详见 [delivery-plan.md](delivery-plan.md)。Citus 当前 `DataPlane::Gated`；PhysicalHa 已复用 Standalone。

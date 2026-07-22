@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::PipelineSettings;
+use super::{PipelineSettings, TargetStorage};
 
 #[derive(Debug, Error)]
 pub enum TablePlanningError {
@@ -35,7 +35,14 @@ pub struct PlannedTable {
     pub target: QualifiedName,
     pub shadow: QualifiedName,
     pub staging_name: String,
+    pub storage: TargetStorage,
     pub schema_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TargetPlanningContext<'a> {
+    pub database: &'a str,
+    pub default_storage: TargetStorage,
 }
 
 pub fn plan_tables(
@@ -43,12 +50,12 @@ pub fn plan_tables(
     topology_generation: u64,
     source_prefix: &SourcePrefix,
     source_database: &str,
-    target_database: &str,
+    target: TargetPlanningContext<'_>,
     settings: &PipelineSettings,
     tables: Vec<TableSchema>,
 ) -> Result<Vec<PlannedTable>, TablePlanningError> {
     let mapper = DefaultNameMapper {
-        target_database: target_database.to_owned(),
+        target_database: target.database.to_owned(),
         source_prefix: source_prefix.clone(),
         source_database: source_database.to_owned(),
     };
@@ -66,7 +73,7 @@ pub fn plan_tables(
     let explicit: HashMap<_, _> = settings
         .table_mappings
         .iter()
-        .map(|mapping| (mapping.source.clone(), mapping.target.clone()))
+        .map(|mapping| (mapping.source.clone(), mapping))
         .collect();
     let mut targets = HashSet::with_capacity(tables.len());
     let mut shadows = HashSet::with_capacity(tables.len());
@@ -74,9 +81,12 @@ pub fn plan_tables(
     let mut planned = Vec::with_capacity(tables.len());
 
     for source in tables {
-        let target = match explicit.get(&source.name) {
-            Some(target) => target.clone(),
-            None => mapper.map(&source.name)?.relation,
+        let (target, storage) = match explicit.get(&source.name) {
+            Some(mapping) => (
+                mapping.target.clone(),
+                mapping.storage.unwrap_or(target.default_storage),
+            ),
+            None => (mapper.map(&source.name)?.relation, target.default_storage),
         };
         if !targets.insert(target.clone()) {
             return Err(TablePlanningError::DuplicateTarget(target.to_string()));
@@ -99,27 +109,34 @@ pub fn plan_tables(
         if !staging_names.insert(staging_name.clone()) {
             return Err(TablePlanningError::DuplicateStaging(staging_name));
         }
-        let schema_fingerprint = schema_fingerprint(&source)?;
+        let schema_fingerprint = schema_fingerprint(&source, storage)?;
         planned.push(PlannedTable {
             source,
             target,
             shadow,
             staging_name,
+            storage,
             schema_fingerprint,
         });
     }
     Ok(planned)
 }
 
-/// Hash only portable schema identity. Relation/type OIDs and runtime generations are excluded.
-pub fn schema_fingerprint(table: &TableSchema) -> Result<String, TablePlanningError> {
+/// Hash portable schema identity and the selected physical storage profile.
+///
+/// Relation/type OIDs and runtime generations are excluded. Storage is included so changing a
+/// profile cannot silently reuse a physically incompatible managed table.
+pub fn schema_fingerprint(
+    table: &TableSchema,
+    storage: TargetStorage,
+) -> Result<String, TablePlanningError> {
     let mut value = serde_json::to_value(table)?;
     if let Value::Object(object) = &mut value {
         object.remove("relation_id");
         object.remove("generation");
     }
     remove_object_key(&mut value, "oid");
-    let digest = Sha256::digest(serde_json::to_vec(&value)?);
+    let digest = Sha256::digest(serde_json::to_vec(&(value, storage.fingerprint_tag()))?);
     let hexadecimal = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -180,6 +197,13 @@ mod tests {
         }
     }
 
+    fn target(default_storage: TargetStorage) -> TargetPlanningContext<'static> {
+        TargetPlanningContext {
+            database: "analytics",
+            default_storage,
+        }
+    }
+
     #[test]
     fn fingerprint_ignores_local_oids_and_runtime_generation() {
         let first = table(10, "public", "items");
@@ -188,13 +212,17 @@ mod tests {
         restored.generation = 8;
         restored.columns[0].data_type.oid = 9_999;
         assert_eq!(
-            schema_fingerprint(&first).unwrap(),
-            schema_fingerprint(&restored).unwrap()
+            schema_fingerprint(&first, TargetStorage::AoColumn).unwrap(),
+            schema_fingerprint(&restored, TargetStorage::AoColumn).unwrap()
         );
         restored.columns[0].data_type.kind = PgTypeKind::Int8;
         assert_ne!(
-            schema_fingerprint(&first).unwrap(),
-            schema_fingerprint(&restored).unwrap()
+            schema_fingerprint(&first, TargetStorage::AoColumn).unwrap(),
+            schema_fingerprint(&restored, TargetStorage::AoColumn).unwrap()
+        );
+        assert_ne!(
+            schema_fingerprint(&first, TargetStorage::AoColumn).unwrap(),
+            schema_fingerprint(&first, TargetStorage::PaxExperimental).unwrap()
         );
     }
 
@@ -212,7 +240,7 @@ mod tests {
             1,
             &SourcePrefix::new("erp").unwrap(),
             "source",
-            "analytics",
+            target(TargetStorage::AoColumn),
             &settings,
             vec![table(1, "public", "items"), table(2, "other", "items")],
         );
@@ -239,7 +267,7 @@ mod tests {
                 1,
                 &prefix,
                 "source",
-                "analytics",
+                target(TargetStorage::AoColumn),
                 &typo,
                 vec![table(1, "public", "items")]
             ),
@@ -252,7 +280,7 @@ mod tests {
             7,
             &prefix,
             "source",
-            "analytics",
+            target(TargetStorage::AoColumn),
             &settings,
             vec![table(1, "public", "items")],
         )
@@ -262,7 +290,7 @@ mod tests {
             7,
             &prefix,
             "source",
-            "analytics",
+            target(TargetStorage::AoColumn),
             &settings,
             vec![table(1, "public", "items")],
         )
@@ -271,6 +299,34 @@ mod tests {
         assert_eq!(first[0].target.to_string(), "erp__source__public.items");
         assert!(first[0].shadow.name.len() <= 63);
         assert!(first[0].staging_name.len() <= 63);
+        assert_eq!(first[0].storage, TargetStorage::AoColumn);
+    }
+
+    #[test]
+    fn explicit_mapping_can_override_the_target_storage_default() {
+        let settings = PipelineSettings::parse(&json!({
+            "table_mappings": [{
+                "source": {"schema": "public", "name": "items"},
+                "target": {"schema": "analytics", "name": "items"},
+                "storage": "pax_experimental"
+            }]
+        }))
+        .unwrap();
+        let planned = plan_tables(
+            PipelineId::new(),
+            1,
+            &SourcePrefix::new("erp").unwrap(),
+            "source",
+            target(TargetStorage::AoColumn),
+            &settings,
+            vec![table(1, "public", "items")],
+        )
+        .unwrap();
+        assert_eq!(planned[0].storage, TargetStorage::PaxExperimental);
+        assert_ne!(
+            planned[0].schema_fingerprint,
+            schema_fingerprint(&planned[0].source, TargetStorage::AoColumn).unwrap()
+        );
     }
 
     #[test]
@@ -297,7 +353,7 @@ mod tests {
             1,
             &prefix,
             &source_database,
-            "analytics",
+            target(TargetStorage::AoColumn),
             &PipelineSettings::default(),
             vec![source.clone()],
         )
@@ -307,7 +363,7 @@ mod tests {
             1,
             &prefix,
             &source_database,
-            "analytics",
+            target(TargetStorage::AoColumn),
             &PipelineSettings::default(),
             vec![source],
         )
@@ -322,7 +378,10 @@ mod tests {
             1,
             &prefix,
             &source_database,
-            &invalid_target_database,
+            TargetPlanningContext {
+                database: &invalid_target_database,
+                default_storage: TargetStorage::AoColumn,
+            },
             &PipelineSettings::default(),
             vec![table(1, "public", "items")],
         )

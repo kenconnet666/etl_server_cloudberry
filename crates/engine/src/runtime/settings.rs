@@ -12,6 +12,7 @@ use cloudberry_etl_core::{
     schema::{QualifiedName, validate_identifier},
 };
 pub use cloudberry_etl_target_cloudberry::migration::TARGET_METADATA_SCHEMA;
+pub use cloudberry_etl_target_cloudberry::storage::TargetStorage;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
@@ -182,6 +183,7 @@ impl SourceSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct TargetSettings {
     pub connection: Option<ConnectionSettings>,
+    pub default_table_storage: TargetStorage,
     pub quarantine_retention_days: u32,
     pub quarantine_gc_max_tables: u32,
 }
@@ -190,6 +192,7 @@ impl Default for TargetSettings {
     fn default() -> Self {
         Self {
             connection: None,
+            default_table_storage: TargetStorage::AoColumn,
             quarantine_retention_days: DEFAULT_QUARANTINE_RETENTION_DAYS,
             quarantine_gc_max_tables: DEFAULT_QUARANTINE_GC_MAX_TABLES,
         }
@@ -488,6 +491,9 @@ pub struct TableMapping {
     pub source: QualifiedName,
     #[serde(deserialize_with = "deserialize_qualified_name")]
     pub target: QualifiedName,
+    /// Overrides the target profile default for this business table.
+    #[serde(default)]
+    pub storage: Option<TargetStorage>,
 }
 
 /// Names owned by one replication reader.  Both names are valid PostgreSQL identifiers and remain
@@ -752,9 +758,18 @@ mod tests {
         assert!(!wal.check_interval().is_zero());
 
         let target = TargetSettings::parse(&json!({})).unwrap();
+        assert_eq!(target.default_table_storage, TargetStorage::AoColumn);
         assert_eq!(target.quarantine_retention_days, 30);
         assert!(!target.quarantine_retention().is_zero());
         assert!(TargetSettings::parse(&json!({"quarantine_retention_days": 0})).is_err());
+        assert_eq!(
+            TargetSettings::parse(&json!({"default_table_storage": "pax_experimental"}))
+                .unwrap()
+                .default_table_storage,
+            TargetStorage::PaxExperimental
+        );
+        assert!(TargetSettings::parse(&json!({"default_table_storage": "heap"})).is_err());
+        assert!(TargetSettings::parse(&json!({"default_table_storage": "pax"})).is_err());
     }
 
     #[test]

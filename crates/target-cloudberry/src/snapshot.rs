@@ -17,10 +17,11 @@ use crate::{
     checkpoint::{CheckpointError, NodeCheckpoint, PipelineFence, lock_pipeline_fence},
     migration::TARGET_METADATA_SCHEMA,
     schema::{
-        CreateTablePlan, SchemaError, UserTypeDefinition, UserTypePlan, plan_create_table,
-        quote_identifier_list,
+        CreateTablePlan, SchemaError, UserTypeDefinition, UserTypePlan,
+        plan_create_table_with_storage, quote_identifier_list,
     },
     sql::{SqlRenderError, quote_identifier, quote_literal, quote_qualified_name},
+    storage::TargetStorage,
 };
 
 const RELATION_EXISTS_SQL: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2)";
@@ -332,6 +333,16 @@ pub fn plan_snapshot_target(
     target: QualifiedName,
     shadow: QualifiedName,
 ) -> Result<SnapshotTargetPlan, SnapshotTargetError> {
+    plan_snapshot_target_with_storage(source, target, shadow, TargetStorage::default())
+}
+
+/// Plan a shadow using the same explicit storage profile as its eventual active table.
+pub fn plan_snapshot_target_with_storage(
+    source: &TableSchema,
+    target: QualifiedName,
+    shadow: QualifiedName,
+    storage: TargetStorage,
+) -> Result<SnapshotTargetPlan, SnapshotTargetError> {
     if target == shadow {
         return Err(SnapshotTargetError::TargetIsShadow);
     }
@@ -341,7 +352,7 @@ pub fn plan_snapshot_target(
             shadow: shadow.to_string(),
         });
     }
-    let shadow = plan_create_table(source, shadow)?;
+    let shadow = plan_create_table_with_storage(source, shadow, storage)?;
     let columns = shadow
         .columns
         .iter()
@@ -1432,6 +1443,20 @@ mod tests {
         assert!(!plan.copy_sql.contains('*'));
         assert_eq!(plan.source_relation_id, 42);
         assert_eq!(plan.source_generation, 7);
+        assert_eq!(plan.shadow.storage, TargetStorage::AoColumn);
+    }
+
+    #[test]
+    fn shadow_keeps_the_explicit_business_storage_profile() {
+        let plan = plan_snapshot_target_with_storage(
+            &table(),
+            QualifiedName::new("target", "items").unwrap(),
+            QualifiedName::new("target", "items_shadow").unwrap(),
+            TargetStorage::PaxExperimental,
+        )
+        .unwrap();
+        assert_eq!(plan.shadow.storage, TargetStorage::PaxExperimental);
+        assert!(plan.shadow.create_sql.contains("USING pax"));
     }
 
     #[test]

@@ -24,8 +24,9 @@ use crate::{
     },
     copy::{CopyEncodeError, encode_row},
     managed::{ManagedTableError, TableApplyIdentity, lock_active_apply_tables},
-    schema::{CreateTablePlan, SchemaError, plan_create_table, quote_identifier_list},
+    schema::{CreateTablePlan, SchemaError, plan_create_table_with_storage, quote_identifier_list},
     sql::{SqlRenderError, quote_identifier, quote_literal, quote_qualified_name},
+    storage::TargetStorage,
 };
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -663,7 +664,17 @@ pub fn plan_apply(
     target: QualifiedName,
     staging_name: &str,
 ) -> Result<ApplyPlan, ApplyPlanError> {
-    let table = plan_create_table(source, target)?;
+    plan_apply_with_storage(source, target, staging_name, TargetStorage::default())
+}
+
+/// Plans target apply with an explicit business-table storage profile.
+pub fn plan_apply_with_storage(
+    source: &TableSchema,
+    target: QualifiedName,
+    staging_name: &str,
+    storage: TargetStorage,
+) -> Result<ApplyPlan, ApplyPlanError> {
+    let table = plan_create_table_with_storage(source, target, storage)?;
     let quoted_target = quote_qualified_name(&table.target)?;
     let quoted_staging = quote_identifier(staging_name)?;
     let control_prefix = unused_control_prefix(&table);

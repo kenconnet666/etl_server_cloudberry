@@ -20,11 +20,12 @@ use cloudberry_etl_target_cloudberry::{
         LedgeredDataChunkOutcome, LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome,
         TableApplyBatch, execute_ledgered_data_chunk, execute_ledgered_data_chunk_observed,
         execute_ledgered_empty_transaction, execute_ledgered_empty_transaction_observed,
-        plan_apply,
+        plan_apply_with_storage,
     },
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
     managed::TableApplyIdentity,
+    storage::TargetStorage,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -136,6 +137,7 @@ impl TableBinding {
         schema: TableSchema,
         target: QualifiedName,
         staging_name: impl Into<String>,
+        storage: TargetStorage,
         table_generation: u64,
         schema_fingerprint: impl Into<String>,
     ) -> Result<Self, AdapterConfigError> {
@@ -153,7 +155,7 @@ impl TableBinding {
             table_generation,
             schema_fingerprint,
         });
-        let plan = plan_apply(&schema, target, &staging_name)?;
+        let plan = plan_apply_with_storage(&schema, target, &staging_name, storage)?;
         Ok(Self {
             schema,
             identity,
@@ -1034,6 +1036,7 @@ mod tests {
             schema(relation_id, generation, source_name),
             QualifiedName::new("target", target_name).unwrap(),
             staging_name,
+            TargetStorage::AoColumn,
             4,
             format!("sha256:test-{relation_id}"),
         )
@@ -1615,13 +1618,21 @@ mod tests {
                 schema(7, 3, "items"),
                 target(),
                 "stage_items",
+                TargetStorage::AoColumn,
                 u64::MAX,
                 "sha256:test"
             ),
             Err(AdapterConfigError::InvalidTableGeneration(u64::MAX))
         ));
         assert!(matches!(
-            TableBinding::new(schema(7, 3, "items"), target(), "stage_items", 4, ""),
+            TableBinding::new(
+                schema(7, 3, "items"),
+                target(),
+                "stage_items",
+                TargetStorage::AoColumn,
+                4,
+                "",
+            ),
             Err(AdapterConfigError::InvalidSchemaFingerprint)
         ));
         assert!(matches!(
@@ -1629,6 +1640,7 @@ mod tests {
                 schema(7, 3, "items"),
                 target(),
                 "stage_items",
+                TargetStorage::AoColumn,
                 4,
                 "sha256:test\0invalid"
             ),
