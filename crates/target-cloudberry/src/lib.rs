@@ -5,6 +5,7 @@ pub mod copy;
 pub mod managed;
 pub mod migration;
 pub mod schema;
+pub mod schema_event;
 pub mod snapshot;
 pub mod sql;
 pub mod version;
