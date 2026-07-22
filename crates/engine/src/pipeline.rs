@@ -1,16 +1,21 @@
 //! Replication loop and recoverable pipeline state machine.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use cloudberry_etl_core::{change::SourcePosition, pipeline::PipelinePhase};
 use cloudberry_etl_source_postgres::wal::CommittedTransaction;
 use thiserror::Error;
-use tokio::time::{Instant, sleep_until};
+
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     batch::{BatchError, Batcher, TransactionBatch},
     telemetry::PipelineTelemetryHandle,
 };
+
+const SOURCE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -45,6 +50,9 @@ pub enum PipelineError {
 pub trait TransactionSource: Send {
     async fn next_transaction(&mut self) -> Result<Option<CommittedTransaction>, PipelineError>;
     async fn acknowledge(&mut self, position: &SourcePosition) -> Result<(), PipelineError>;
+
+    /// Keep the source session alive without advancing its durable position.
+    async fn heartbeat(&mut self) -> Result<(), PipelineError>;
 }
 
 #[async_trait]
@@ -194,20 +202,40 @@ async fn apply_and_ack_or_cancel(
     telemetry: Option<&PipelineTelemetryHandle>,
     cancellation: &CancellationToken,
 ) -> Result<bool, PipelineError> {
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Ok(false),
-        result = apply_and_ack(source, sink, batch, telemetry) => result.map(|()| true),
-    }
+    apply_and_ack_or_cancel_with_heartbeat(
+        source,
+        sink,
+        batch,
+        telemetry,
+        cancellation,
+        SOURCE_HEARTBEAT_INTERVAL,
+    )
+    .await
 }
 
-async fn apply_and_ack(
+async fn apply_and_ack_or_cancel_with_heartbeat(
     source: &mut dyn TransactionSource,
     sink: &dyn TransactionSink,
     batch: &TransactionBatch,
     telemetry: Option<&PipelineTelemetryHandle>,
-) -> Result<(), PipelineError> {
-    sink.apply(batch).await?;
+    cancellation: &CancellationToken,
+    heartbeat_interval: Duration,
+) -> Result<bool, PipelineError> {
+    let apply = sink.apply(batch);
+    tokio::pin!(apply);
+    let mut heartbeat = interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(false),
+            result = &mut apply => {
+                result?;
+                break;
+            }
+            _ = heartbeat.tick() => source.heartbeat().await?,
+        }
+    }
     let final_position = &batch.final_transaction().final_position;
     if let Some(telemetry) = telemetry {
         telemetry.applied(final_position.lsn);
@@ -221,7 +249,7 @@ async fn apply_and_ack(
     if let Some(telemetry) = telemetry {
         telemetry.acknowledged(final_position.lsn);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -254,11 +282,28 @@ mod tests {
                 .push(format!("ack:{}", position.lsn));
             Ok(())
         }
+
+        async fn heartbeat(&mut self) -> Result<(), PipelineError> {
+            self.log.lock().unwrap().push("heartbeat".to_owned());
+            Ok(())
+        }
     }
 
     struct FakeSink {
         log: std::sync::Arc<Mutex<Vec<String>>>,
         fail: bool,
+    }
+
+    struct SlowSink {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl TransactionSink for SlowSink {
+        async fn apply(&self, _batch: &TransactionBatch) -> Result<(), PipelineError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -316,6 +361,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*log.lock().unwrap(), ["apply:0/00000002", "ack:0/00000002"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_target_apply_keeps_source_alive_without_advancing_ack() {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut source = FakeSource {
+            events: VecDeque::from([transaction(1)]),
+            log: std::sync::Arc::clone(&log),
+        };
+        let sink = SlowSink {
+            delay: Duration::from_secs(25),
+        };
+
+        replicate(&mut source, &sink, batcher(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter()
+                .filter(|entry| entry.as_str() == "heartbeat")
+                .count(),
+            2
+        );
+        assert_eq!(log.last().map(String::as_str), Some("ack:0/00000001"));
     }
 
     #[tokio::test]

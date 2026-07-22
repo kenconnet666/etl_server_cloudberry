@@ -1,4 +1,4 @@
-//! Full-runtime Phase 1 recovery matrix against PostgreSQL 18 and Cloudberry 2.1.
+//! Full-runtime Phase 1 recovery and capacity matrix against PostgreSQL 18 and Cloudberry 2.1.
 //!
 //! The test destroys and reconstructs the complete pipeline job at each fault boundary. Only the
 //! control records, source slot/WAL, local spool directory, and target metadata survive, matching
@@ -8,7 +8,10 @@ use std::{
     error::Error,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,7 +28,7 @@ use cloudberry_etl_engine::{
         PostgresCloudberryJobFactory, reconciler::PipelineJobFactory, settings::replication_names,
     },
     supervisor::SupervisorError,
-    telemetry::PipelineTelemetryHandle,
+    telemetry::{PipelineRuntimeState, PipelineTelemetryHandle},
 };
 use cloudberry_etl_metadata::{
     crypto::{MasterKey, source_credential_aad, target_credential_aad},
@@ -51,6 +54,56 @@ const TEST_MASTER_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(90);
 const LEASE_TTL: Duration = Duration::from_secs(180);
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeProfile {
+    memory_high_water_changes: usize,
+    memory_high_water_bytes: usize,
+    segment_target_bytes: usize,
+    disk_high_water_bytes: u64,
+    batch_max_rows: usize,
+    batch_max_bytes: usize,
+    batch_max_delay_ms: u64,
+}
+
+struct FixtureSpec<'a> {
+    source_dsn: &'a str,
+    target_dsn: &'a str,
+    source_schema: &'a str,
+    target_schema: &'a str,
+    suffix: &'a str,
+    profile: RuntimeProfile,
+}
+
+const RECOVERY_PROFILE: RuntimeProfile = RuntimeProfile {
+    memory_high_water_changes: 1,
+    memory_high_water_bytes: 1,
+    segment_target_bytes: 128,
+    disk_high_water_bytes: 16 * 1024 * 1024,
+    batch_max_rows: 2,
+    batch_max_bytes: 1024 * 1024,
+    batch_max_delay_ms: 10,
+};
+
+const LARGE_TRANSACTION_PROFILE: RuntimeProfile = RuntimeProfile {
+    memory_high_water_changes: 8,
+    memory_high_water_bytes: 64 * 1024,
+    segment_target_bytes: 256 * 1024,
+    disk_high_water_bytes: 128 * 1024 * 1024,
+    batch_max_rows: 4_096,
+    batch_max_bytes: 8 * 1024 * 1024,
+    batch_max_delay_ms: 10,
+};
+
+const CAPACITY_PROFILE: RuntimeProfile = RuntimeProfile {
+    memory_high_water_changes: 1,
+    memory_high_water_bytes: 1,
+    segment_target_bytes: 16 * 1024,
+    disk_high_water_bytes: 96 * 1024,
+    batch_max_rows: 10_000,
+    batch_max_bytes: 32 * 1024 * 1024,
+    batch_max_delay_ms: 2_000,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryFault {
     Source(SourceIngestPoint),
@@ -64,6 +117,7 @@ enum RecoveryFault {
 struct FaultController {
     armed: Mutex<Option<RecoveryFault>>,
     fired: tokio::sync::Notify,
+    spool_commits: AtomicUsize,
 }
 
 impl FaultController {
@@ -92,6 +146,9 @@ impl FaultController {
 
 impl SourceIngestObserver for FaultController {
     fn observe(&self, point: SourceIngestPoint) -> Result<(), String> {
+        if point == SourceIngestPoint::AfterSpoolCommit {
+            self.spool_commits.fetch_add(1, Ordering::Relaxed);
+        }
         self.trigger(RecoveryFault::Source(point))
     }
 }
@@ -171,12 +228,37 @@ struct TestContext {
 
 #[tokio::test]
 #[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
-async fn full_runtime_recovers_at_phase1_durable_boundaries() -> Result<(), Box<dyn Error>> {
+async fn full_runtime_proves_phase1_recovery_and_capacity_boundaries() -> Result<(), Box<dyn Error>>
+{
     let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
     let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
-    let mut context = TestContext::setup(&source_dsn, &target_dsn).await?;
+
+    run_recovery_case(&source_dsn, &target_dsn).await?;
+    run_large_transaction_case(&source_dsn, &target_dsn).await?;
+    run_capacity_wait_case(&source_dsn, &target_dsn).await
+}
+
+async fn run_recovery_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, RECOVERY_PROFILE).await?;
 
     let result = run_recovery_matrix(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
+async fn run_large_transaction_case(
+    source_dsn: &str,
+    target_dsn: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, LARGE_TRANSACTION_PROFILE).await?;
+    let result = run_large_transaction(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
+async fn run_capacity_wait_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, CAPACITY_PROFILE).await?;
+    let result = run_capacity_wait(&mut context).await;
     context.cleanup().await;
     result
 }
@@ -263,8 +345,125 @@ async fn run_recovery_matrix(context: &mut TestContext) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+async fn run_large_transaction(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    const ROWS: i64 = 32 * 1024;
+    const PAYLOAD_BYTES: i32 = 1024;
+    const MAX_RSS_GROWTH_BYTES: u64 = 24 * 1024 * 1024;
+
+    assert!(
+        u64::try_from(ROWS)? * u64::try_from(PAYLOAD_BYTES)?
+            > u64::try_from(LARGE_TRANSACTION_PROFILE.memory_high_water_bytes)? * 128
+    );
+
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+    let sampler = RssSampler::start()?;
+    let commits_before = context.controller.spool_commits.load(Ordering::Relaxed);
+
+    insert_bulk_source_transaction(
+        &context.source,
+        &context.source_schema,
+        10_000,
+        ROWS,
+        PAYLOAD_BYTES,
+    )
+    .await?;
+    wait_for_target_count(&context.target, &context.target_schema, ROWS + 1, &active).await?;
+    let rss_growth = sampler.stop().await?;
+
+    assert!(
+        context.controller.spool_commits.load(Ordering::Relaxed) > commits_before,
+        "the large transaction must use the durable spool path"
+    );
+    if let Some(rss_growth) = rss_growth {
+        eprintln!("large transaction process RSS growth: {rss_growth} bytes");
+        assert!(
+            rss_growth <= MAX_RSS_GROWTH_BYTES,
+            "large transaction grew process RSS by {rss_growth} bytes, limit is {MAX_RSS_GROWTH_BYTES}"
+        );
+    }
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+async fn run_capacity_wait(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    const ROWS_PER_TRANSACTION: i64 = 128;
+    const PAYLOAD_BYTES: i32 = 512;
+
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+    insert_bulk_source_transaction(
+        &context.source,
+        &context.source_schema,
+        20_000,
+        ROWS_PER_TRANSACTION,
+        PAYLOAD_BYTES,
+    )
+    .await?;
+    insert_bulk_source_transaction(
+        &context.source,
+        &context.source_schema,
+        30_000,
+        ROWS_PER_TRANSACTION,
+        PAYLOAD_BYTES,
+    )
+    .await?;
+
+    wait_for_resource_wait(&active).await?;
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        ROWS_PER_TRANSACTION * 2 + 1,
+        &active,
+    )
+    .await?;
+    assert_ne!(
+        active.telemetry.snapshot().state,
+        PipelineRuntimeState::ResourceWait,
+        "resource wait must clear after committed spool files are retired"
+    );
+    let generation: i64 = context
+        .source
+        .query_one(
+            "SELECT snapshot_generation FROM cloudberry_etl_control.pipelines WHERE id=$1",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(generation, context.pipeline.snapshot_generation);
+    let rebuilds: i64 = context
+        .source
+        .query_one(
+            "SELECT count(*) FROM cloudberry_etl_control.operations WHERE pipeline_id=$1 AND operation_type='rebuild'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(rebuilds, 0, "capacity recovery must not request a rebuild");
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
 impl TestContext {
-    async fn setup(source_dsn: &str, target_dsn: &str) -> Result<Self, Box<dyn Error>> {
+    async fn setup(
+        source_dsn: &str,
+        target_dsn: &str,
+        profile: RuntimeProfile,
+    ) -> Result<Self, Box<dyn Error>> {
         let (mut source, source_connection) = connect(source_dsn, "source").await?;
         let (target, target_connection) = connect(target_dsn, "target").await?;
         migrate_control_database(&mut source).await?;
@@ -306,11 +505,14 @@ impl TestContext {
         let pipeline = persist_pipeline(
             store.as_ref(),
             master_key.as_ref(),
-            source_dsn,
-            target_dsn,
-            &source_schema,
-            &target_schema,
-            &suffix,
+            FixtureSpec {
+                source_dsn,
+                target_dsn,
+                source_schema: &source_schema,
+                target_schema: &target_schema,
+                suffix: &suffix,
+                profile,
+            },
         )
         .await?;
 
@@ -389,12 +591,16 @@ impl TestContext {
 async fn persist_pipeline(
     store: &PostgresControlStore,
     master_key: &MasterKey,
-    source_dsn: &str,
-    target_dsn: &str,
-    source_schema: &str,
-    target_schema: &str,
-    suffix: &str,
+    spec: FixtureSpec<'_>,
 ) -> Result<PipelineDefinition, Box<dyn Error>> {
+    let FixtureSpec {
+        source_dsn,
+        target_dsn,
+        source_schema,
+        target_schema,
+        suffix,
+        profile,
+    } = spec;
     let source_id = SourceId::new();
     let target_id = TargetId::new();
     let pipeline_id = PipelineId::new();
@@ -414,10 +620,10 @@ async fn persist_pipeline(
             settings: json!({
                 "include_schemas": [source_schema],
                 "transaction": {
-                    "memory_high_water_changes": 1,
-                    "memory_high_water_bytes": 1,
-                    "segment_target_bytes": 128,
-                    "disk_high_water_bytes": 16 * 1024 * 1024,
+                    "memory_high_water_changes": profile.memory_high_water_changes,
+                    "memory_high_water_bytes": profile.memory_high_water_bytes,
+                    "segment_target_bytes": profile.segment_target_bytes,
+                    "disk_high_water_bytes": profile.disk_high_water_bytes,
                     "minimum_free_disk_bytes": 1
                 }
             }),
@@ -452,9 +658,9 @@ async fn persist_pipeline(
         snapshot_generation: 1,
         settings: json!({
             "batch": {
-                "max_rows": 2,
-                "max_bytes": 1024 * 1024,
-                "max_delay_ms": 10
+                "max_rows": profile.batch_max_rows,
+                "max_bytes": profile.batch_max_bytes,
+                "max_delay_ms": profile.batch_max_delay_ms
             },
             "table_mappings": [{
                 "source": QualifiedName::new(source_schema, "items")?,
@@ -501,6 +707,25 @@ async fn insert_source_transaction(
     Ok(())
 }
 
+async fn insert_bulk_source_transaction(
+    source: &Client,
+    source_schema: &str,
+    first_id: i64,
+    rows: i64,
+    payload_bytes: i32,
+) -> Result<(), tokio_postgres::Error> {
+    source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload) SELECT $1::bigint + value, repeat('x', $3::integer) || '-' || value::text FROM generate_series(0::bigint, $2::bigint - 1) AS value",
+                quote_identifier(source_schema)
+            ),
+            &[&first_id, &rows, &payload_bytes],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn wait_for_target_count(
     target: &Client,
     target_schema: &str,
@@ -538,6 +763,103 @@ async fn wait_for_target_count(
             .into());
         }
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_resource_wait(active: &ActiveJob) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before entering resource wait: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        let snapshot = active.telemetry.snapshot();
+        if snapshot.state == PipelineRuntimeState::ResourceWait {
+            assert!(
+                snapshot
+                    .resource_wait_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("spool capacity wait"))
+            );
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pipeline did not enter resource wait",
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+struct RssSampler {
+    baseline: Option<u64>,
+    peak: Arc<AtomicU64>,
+    cancellation: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RssSampler {
+    fn start() -> io::Result<Self> {
+        let baseline = resident_set_bytes()?;
+        let peak = Arc::new(AtomicU64::new(baseline.unwrap_or(0)));
+        let cancellation = CancellationToken::new();
+        let handle = baseline.map(|_| {
+            let task_peak = Arc::clone(&peak);
+            let task_cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = task_cancellation.cancelled() => break,
+                        () = sleep(Duration::from_millis(5)) => {
+                            if let Ok(Some(rss)) = resident_set_bytes() {
+                                task_peak.fetch_max(rss, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        Ok(Self {
+            baseline,
+            peak,
+            cancellation,
+            handle,
+        })
+    }
+
+    async fn stop(mut self) -> Result<Option<u64>, tokio::task::JoinError> {
+        self.cancellation.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.await?;
+        }
+        Ok(self
+            .baseline
+            .map(|baseline| self.peak.load(Ordering::Relaxed).saturating_sub(baseline)))
+    }
+}
+
+fn resident_set_bytes() -> io::Result<Option<u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let kibibytes = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other("/proc/self/status does not contain VmRSS"))?;
+        Ok(Some(kibibytes.saturating_mul(1024)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
     }
 }
 

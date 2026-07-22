@@ -388,6 +388,10 @@ impl TransactionSource for PgOutputTransactionSource {
         }
         self.send_durable_status().await
     }
+
+    async fn heartbeat(&mut self) -> Result<(), PipelineError> {
+        self.send_durable_status().await
+    }
 }
 
 #[cfg(test)]
