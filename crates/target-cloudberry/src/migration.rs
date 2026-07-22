@@ -268,6 +268,45 @@ CREATE INDEX IF NOT EXISTS snapshot_table_progress_pipeline_generation_idx
     );
 "#;
 
+/// Durable schema-transition ledger for Phase 2 tight DDL follow.
+///
+/// Each row records one source DDL event that touches a managed relation, keyed
+/// by the source LSN and transaction id so replayed WAL is idempotent. The
+/// engine persists an event as `pending` before starting a table transition and
+/// advances it through `in_transition` to `completed`/`failed`; a restart scans
+/// unfinished rows and resumes them in source-LSN order. `transitions` holds the
+/// serialized per-table before/after descriptors so recovery does not depend on
+/// re-reading the source catalog after the fact. Distribution by pipeline keeps
+/// a pipeline's ordered event history colocated.
+pub const TARGET_V8_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.schema_events (
+    event_id uuid NOT NULL,
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    source_lsn pg_lsn NOT NULL,
+    source_xid bigint NOT NULL CHECK (source_xid >= 0),
+    command_tag text NOT NULL CHECK (command_tag <> ''),
+    schema_fingerprint text NOT NULL,
+    transitions jsonb NOT NULL DEFAULT '[]'::jsonb,
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'in_transition', 'completed', 'failed')),
+    failure_reason text,
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    emitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    processed_at timestamptz,
+    PRIMARY KEY (pipeline_id, source_lsn, source_xid),
+    UNIQUE (event_id),
+    CHECK ((state IN ('completed', 'failed')) = (processed_at IS NOT NULL)),
+    CHECK ((state = 'failed') OR (failure_reason IS NULL))
+)
+USING heap
+DISTRIBUTED BY (pipeline_id);
+
+CREATE INDEX IF NOT EXISTS schema_events_pending_idx
+    ON pg2cb_meta.schema_events (pipeline_id, topology_generation, source_lsn)
+    WHERE state IN ('pending', 'in_transition');
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -309,6 +348,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "durable_snapshot_table_progress",
         sql: TARGET_V7_SQL,
+    },
+    Migration {
+        version: 8,
+        name: "schema_event_ledger",
+        sql: TARGET_V8_SQL,
     },
 ];
 
@@ -470,7 +514,7 @@ mod tests {
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 7);
+        assert_eq!(MIGRATIONS.len(), 8);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[1].version, 2);
         assert_eq!(MIGRATIONS[2].version, 3);
@@ -478,6 +522,7 @@ mod tests {
         assert_eq!(MIGRATIONS[4].version, 5);
         assert_eq!(MIGRATIONS[5].version, 6);
         assert_eq!(MIGRATIONS[6].version, 7);
+        assert_eq!(MIGRATIONS[7].version, 8);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
@@ -506,5 +551,25 @@ mod tests {
             Sha256::digest(MIGRATIONS[6].sql),
             Sha256::digest(TARGET_V7_SQL)
         );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[7].sql),
+            Sha256::digest(TARGET_V8_SQL)
+        );
+    }
+
+    #[test]
+    fn v8_defines_the_schema_event_ledger() {
+        assert!(TARGET_V8_SQL.contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.schema_events"));
+        assert!(TARGET_V8_SQL.contains("event_id uuid NOT NULL"));
+        assert!(TARGET_V8_SQL.contains("source_lsn pg_lsn NOT NULL"));
+        assert!(TARGET_V8_SQL.contains("source_xid bigint NOT NULL"));
+        assert!(TARGET_V8_SQL.contains("transitions jsonb NOT NULL"));
+        assert!(TARGET_V8_SQL.contains(
+            "state text NOT NULL DEFAULT 'pending'"
+        ));
+        assert!(TARGET_V8_SQL.contains("PRIMARY KEY (pipeline_id, source_lsn, source_xid)"));
+        assert!(TARGET_V8_SQL.contains("UNIQUE (event_id)"));
+        assert!(TARGET_V8_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
+        assert!(TARGET_V8_SQL.contains("schema_events_pending_idx"));
     }
 }
