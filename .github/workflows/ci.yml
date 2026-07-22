@@ -113,6 +113,60 @@ jobs:
           PG2CB_TEST_CONTROL_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           RUST_LOG: info
 
+  integration-cloudberry:
+    name: Cloudberry Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Start PostgreSQL 18 source
+        run: |
+          docker run -d --name pg18 \
+            -e POSTGRES_PASSWORD=pg2cb_test -e POSTGRES_DB=source -e POSTGRES_USER=postgres \
+            -p 5432:5432 postgres:18-alpine \
+            -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
+          for i in $(seq 1 30); do
+            if docker exec pg18 pg_isready -U postgres -d source; then break; fi
+            sleep 2
+          done
+
+      - name: Build and initialize single-node Cloudberry 2.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CBDB_PORT: "55433"
+        run: bash tests/integration/cloudberry/build-local-image.sh
+
+      - name: Run target-cloudberry integration tests
+        run: |
+          cargo test -p cloudberry-etl-target-cloudberry \
+            --test cloudberry21 \
+            --test schema_event_cloudberry21 \
+            --test chunk_ledger_cloudberry21 \
+            -- --ignored --nocapture
+        env:
+          PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target
+          RUST_LOG: info
+
+      - name: Run cross-database snapshot E2E
+        run: cargo test -p cloudberry-etl-engine --test snapshot_e2e -- --ignored --nocapture
+        env:
+          PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
+          PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target
+          RUST_LOG: info
+
   web-checks:
     name: Web Build
     runs-on: ubuntu-latest
