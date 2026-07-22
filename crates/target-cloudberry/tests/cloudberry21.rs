@@ -29,12 +29,13 @@ use cloudberry_etl_target_cloudberry::{
     snapshot::{
         ActiveTableRequirement, SnapshotActivationDisposition, SnapshotActivationRequest,
         SnapshotApplyMode, SnapshotApplyOutcome, SnapshotGroupCleanupRequest,
-        SnapshotGroupRegistrationDisposition, SnapshotOwnership, SnapshotPageApplyOutcome,
-        SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group,
-        activate_table_snapshot_group, begin_snapshot_apply, begin_snapshot_group,
-        begin_snapshot_pages, cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
-        plan_snapshot_target, reset_interrupted_table_snapshot_group,
-        validate_active_snapshot_group, validate_active_tables,
+        SnapshotGroupRegistrationDisposition, SnapshotGroupStatus, SnapshotOwnership,
+        SnapshotPageApplyOutcome, SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group,
+        activate_table_snapshot_group, adopt_table_snapshot_replay_group, begin_snapshot_apply,
+        begin_snapshot_group, begin_snapshot_pages, cleanup_loading_snapshot_group,
+        cleanup_stale_snapshot_groups, load_snapshot_group_manifest, plan_snapshot_target,
+        reset_interrupted_table_snapshot_group, validate_active_snapshot_group,
+        validate_active_tables,
     },
     storage::{TargetStorage, load_relation_storage},
 };
@@ -345,6 +346,18 @@ async fn run_interrupted_table_snapshot_reset_test(
             cloudberry_etl_target_cloudberry::checkpoint::CheckpointError::StaleFence { .. }
         ))
     ));
+    let recovered = load_snapshot_group_manifest(client, current_fence, snapshot_group_id).await?;
+    assert_eq!(recovered.status, SnapshotGroupStatus::Loading);
+    assert_eq!(recovered.request.fence, original_fence);
+    assert_eq!(
+        recovered.request.initial_checkpoints[0].applied_lsn,
+        PgLsn::new(0x2000)
+    );
+    assert!(matches!(
+        adopt_table_snapshot_replay_group(client, current_fence, snapshot_group_id).await,
+        Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(group))
+            if group == snapshot_group_id
+    ));
     assert!(
         cleanup_stale_snapshot_groups(client, current_fence)
             .await?
@@ -454,6 +467,79 @@ async fn run_interrupted_table_snapshot_reset_test(
         },
     )
     .await?;
+
+    let completed_group_id = Uuid::now_v7();
+    let mut completed_request = request.clone();
+    completed_request.fence = current_fence;
+    completed_request.snapshot_group_id = completed_group_id;
+    completed_request.initial_checkpoints[0].applied_lsn = PgLsn::new(0x3000);
+    begin_snapshot_group(client, &completed_request).await?;
+    let completed_ownership = SnapshotOwnership {
+        fence: current_fence,
+        snapshot_group_id: completed_group_id,
+        schema_fingerprint: "sha256:reload-generation-2".to_owned(),
+    };
+    let mut completed_loader =
+        begin_snapshot_pages(client, plan.clone(), &completed_ownership).await?;
+    let complete_page =
+        futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from("2\tcomplete\t2\n"))]);
+    completed_loader
+        .apply_page(client, vec!["2".to_owned()], true, complete_page)
+        .await?;
+    client
+        .execute(
+            "INSERT INTO pg2cb_meta.table_schema_transitions (
+                event_id, pipeline_id, topology_generation, source_lsn, source_xid,
+                source_relation_id, action, plan, barrier_lsn, active_table_generation,
+                pending_table_generation, snapshot_group_id, state, fencing_token
+             ) VALUES ($1, $2, 1, $3::text::pg_lsn, 8, $4, 'reload', $5,
+                       $3::text::pg_lsn, 1, 2, $6, 'catching_up', $7)",
+            &[
+                &Uuid::now_v7(),
+                &pipeline_id.as_uuid(),
+                &PgLsn::new(0x1900).to_string(),
+                &i64::from(reloaded_schema.relation_id),
+                &serde_json::json!({"action": "reload"}),
+                &completed_group_id,
+                &current_fence.fencing_token,
+            ],
+        )
+        .await?;
+    let replay_fence = PipelineFence {
+        fencing_token: 22,
+        ..current_fence
+    };
+    activate_pipeline_fence(client, replay_fence).await?;
+    let adopted =
+        adopt_table_snapshot_replay_group(client, replay_fence, completed_group_id).await?;
+    assert_eq!(adopted.manifest.status, SnapshotGroupStatus::Loading);
+    assert_eq!(adopted.manifest.request.fence, replay_fence);
+    assert_eq!(
+        adopted.transition_state,
+        cloudberry_etl_target_cloudberry::table_transition::TableTransitionState::CatchingUp
+    );
+    assert_eq!(
+        adopted.manifest.request.initial_checkpoints[0].applied_lsn,
+        PgLsn::new(0x3000)
+    );
+
+    client
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions SET state = 'cutover_pending'
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2",
+            &[&pipeline_id.as_uuid(), &completed_group_id],
+        )
+        .await?;
+    activate_table_snapshot_group(client, &adopted.manifest.request).await?;
+    let post_cutover_fence = PipelineFence {
+        fencing_token: 23,
+        ..replay_fence
+    };
+    activate_pipeline_fence(client, post_cutover_fence).await?;
+    let adopted_active =
+        adopt_table_snapshot_replay_group(client, post_cutover_fence, completed_group_id).await?;
+    assert_eq!(adopted_active.manifest.status, SnapshotGroupStatus::Active);
+    assert_eq!(adopted_active.manifest.request.fence, post_cutover_fence);
     Ok(())
 }
 

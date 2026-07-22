@@ -15,14 +15,16 @@ use crate::{
     checkpoint::{PipelineFence, lock_pipeline_fence},
     migration::TARGET_METADATA_SCHEMA,
     sql::{quote_identifier, quote_qualified_name},
+    table_transition::TableTransitionState,
 };
 
 use super::{
-    ManagedTableRecord, ManagedTableState, RelationState, SnapshotTargetError,
+    ManagedTableRecord, ManagedTableState, RelationState, SnapshotGroupManifest,
+    SnapshotTargetError,
     activation::quarantine_name,
     database_generation, ensure_one_metadata_row, load_relation_state,
-    manifest::{self, SnapshotGroupState},
-    progress, relation_oid,
+    manifest::{self, SnapshotGroupStatus},
+    matches_activation, progress, relation_oid, validate_managed_fence, validate_managed_identity,
 };
 
 const LIST_TRANSITION_SNAPSHOT_GROUPS_SQL: &str = r#"
@@ -55,6 +57,13 @@ pub struct SnapshotGroupCleanupRequest {
 pub struct SnapshotCleanupOutcome {
     pub snapshot_group_id: Uuid,
     pub dropped_shadows: Vec<QualifiedName>,
+}
+
+/// Completed table snapshot adopted by the current lease and ready for main-slot replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSnapshotReplayGroup {
+    pub manifest: SnapshotGroupManifest,
+    pub transition_state: TableTransitionState,
 }
 
 /// Retention and work-budget controls for quarantine garbage collection.
@@ -224,7 +233,7 @@ async fn cleanup_loading_snapshot_group_locked(
     }
 
     validate_group_fence(&stored.request.fence, request)?;
-    if stored.state != SnapshotGroupState::Loading {
+    if stored.state != SnapshotGroupStatus::Loading {
         return Err(SnapshotTargetError::SnapshotGroupNotLoading(
             request.snapshot_group_id,
         ));
@@ -528,6 +537,245 @@ pub async fn reset_interrupted_table_snapshot_group(
     .await?;
     transaction.commit().await?;
     Ok(cleanup)
+}
+
+/// Adopts a completed Reload/Add snapshot group after a lease change.
+///
+/// This path is intentionally unavailable to `snapshotting`: an interrupted COPY must be reset
+/// because its exported source snapshot is gone. Every manifest table, transition, progress row,
+/// managed relation and physical OID is locked and matched before ownership changes.
+pub async fn adopt_table_snapshot_replay_group(
+    client: &mut Client,
+    current_fence: PipelineFence,
+    snapshot_group_id: Uuid,
+) -> Result<TableSnapshotReplayGroup, SnapshotTargetError> {
+    if snapshot_group_id.is_nil() {
+        return Err(SnapshotTargetError::InvalidSnapshotGroupId);
+    }
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, current_fence).await?;
+    let stored = manifest::load_snapshot_group(&transaction, snapshot_group_id).await?;
+    let group_fence = stored.request.fence;
+    if group_fence.pipeline_id != current_fence.pipeline_id
+        || group_fence.topology_generation != current_fence.topology_generation
+        || group_fence.fencing_token > current_fence.fencing_token
+    {
+        return Err(SnapshotTargetError::SnapshotGroupFenceMismatch {
+            group: snapshot_group_id,
+            expected_generation: current_fence.topology_generation,
+            expected_token: current_fence.fencing_token,
+            actual_generation: group_fence.topology_generation,
+            actual_token: group_fence.fencing_token,
+        });
+    }
+    if stored.snapshot_progress_version != progress::SNAPSHOT_PROGRESS_VERSION {
+        return Err(SnapshotTargetError::UnsupportedSnapshotProgressVersion {
+            group: snapshot_group_id,
+            version: stored.snapshot_progress_version,
+        });
+    }
+
+    let transitions = transaction
+        .query(
+            "SELECT source_relation_id, pending_table_generation, action, state,
+                    topology_generation, fencing_token
+               FROM pg2cb_meta.table_schema_transitions
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2
+              ORDER BY source_lsn, source_xid, source_relation_id
+              FOR UPDATE",
+            &[&current_fence.pipeline_id.as_uuid(), &snapshot_group_id],
+        )
+        .await?;
+    if transitions.is_empty() {
+        return Err(SnapshotTargetError::SnapshotGroupNotOwnedByTableTransition(
+            snapshot_group_id,
+        ));
+    }
+    let expected_generation = database_generation(current_fence.topology_generation)?;
+    let mut transition_tables = HashSet::with_capacity(transitions.len());
+    let mut transition_state = None;
+    for row in &transitions {
+        let relation_id = u32::try_from(row.try_get::<_, i64>("source_relation_id")?)
+            .map_err(|_| SnapshotTargetError::SnapshotGroupTransitionMismatch(snapshot_group_id))?;
+        let table_generation = row
+            .try_get::<_, Option<i64>>("pending_table_generation")?
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                snapshot_group_id,
+            ))?;
+        let action: String = row.try_get("action")?;
+        let state: String = row.try_get("state")?;
+        let state = match state.as_str() {
+            "catching_up" => TableTransitionState::CatchingUp,
+            "cutover_pending" => TableTransitionState::CutoverPending,
+            _ => {
+                return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                    snapshot_group_id,
+                ));
+            }
+        };
+        let generation: i64 = row.try_get("topology_generation")?;
+        let token: i64 = row.try_get("fencing_token")?;
+        if !matches!(action.as_str(), "reload" | "add")
+            || generation != expected_generation
+            || token > current_fence.fencing_token
+            || transition_state.is_some_and(|expected| expected != state)
+            || !transition_tables.insert((relation_id, table_generation))
+        {
+            return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                snapshot_group_id,
+            ));
+        }
+        transition_state = Some(state);
+    }
+    let transition_state = transition_state.ok_or(
+        SnapshotTargetError::SnapshotGroupTransitionMismatch(snapshot_group_id),
+    )?;
+    if stored.state == SnapshotGroupStatus::Active
+        && transition_state != TableTransitionState::CutoverPending
+    {
+        return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+            snapshot_group_id,
+        ));
+    }
+    let manifest_tables = stored
+        .request
+        .tables
+        .iter()
+        .map(|table| (table.source_relation_id, table.table_generation))
+        .collect::<HashSet<_>>();
+    if manifest_tables.len() != stored.request.tables.len() || manifest_tables != transition_tables
+    {
+        return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+            snapshot_group_id,
+        ));
+    }
+
+    let mut progress_identities = Vec::with_capacity(stored.request.tables.len());
+    let mut managed_names = Vec::with_capacity(stored.request.tables.len());
+    for table in &stored.request.tables {
+        let name = match stored.state {
+            SnapshotGroupStatus::Loading => &table.shadow,
+            SnapshotGroupStatus::Active => &table.target,
+        };
+        let record = match load_relation_state(&transaction, name).await? {
+            RelationState::Managed(record) => record,
+            RelationState::ManagedObjectMissing(_) => {
+                return Err(SnapshotTargetError::ManagedRelationMissing(
+                    name.to_string(),
+                ));
+            }
+            RelationState::Vacant | RelationState::Unmanaged => {
+                return Err(SnapshotTargetError::SnapshotTableManifestMismatch {
+                    group: snapshot_group_id,
+                    table: name.to_string(),
+                });
+            }
+        };
+        match stored.state {
+            SnapshotGroupStatus::Loading => validate_shadow_ownership(
+                name,
+                &record,
+                snapshot_group_id,
+                &group_fence,
+                table.source_relation_id,
+                table.table_generation,
+                &table.schema_fingerprint,
+            )?,
+            SnapshotGroupStatus::Active => {
+                validate_managed_identity(
+                    name,
+                    &record,
+                    current_fence.pipeline_id,
+                    table.source_relation_id,
+                )?;
+                validate_managed_fence(name, &record, current_fence.fencing_token)?;
+                if record.state != ManagedTableState::Active
+                    || record.fencing_token != group_fence.fencing_token
+                    || !matches_activation(&record, table, snapshot_group_id)
+                {
+                    return Err(SnapshotTargetError::SnapshotTableManifestMismatch {
+                        group: snapshot_group_id,
+                        table: name.to_string(),
+                    });
+                }
+            }
+        }
+        validate_relation_identity(&transaction, name, &record).await?;
+        progress_identities.push(progress::CompletedSnapshotTableIdentity {
+            table: table.clone(),
+            shadow_relation_oid: record
+                .relation_oid
+                .ok_or_else(|| SnapshotTargetError::MissingRelationIdentity(name.to_string()))?,
+        });
+        managed_names.push(name.clone());
+    }
+    progress::lock_completed_snapshot_tables(&transaction, &stored.request, &progress_identities)
+        .await?;
+
+    let adopted_transitions = transaction
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions
+                SET fencing_token = $3, updated_at = clock_timestamp()
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2
+                AND state IN ('catching_up', 'cutover_pending') AND fencing_token <= $3",
+            &[
+                &current_fence.pipeline_id.as_uuid(),
+                &snapshot_group_id,
+                &current_fence.fencing_token,
+            ],
+        )
+        .await?;
+    if adopted_transitions != transitions.len() as u64 {
+        return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+            snapshot_group_id,
+        ));
+    }
+    for name in &managed_names {
+        let adopted = transaction
+            .execute(
+                "UPDATE pg2cb_meta.managed_tables
+                    SET fencing_token = $5, updated_at = clock_timestamp()
+                  WHERE target_schema = $1 AND target_table = $2 AND pipeline_id = $3
+                    AND snapshot_group_id = $4 AND fencing_token = $6",
+                &[
+                    &name.schema,
+                    &name.name,
+                    &current_fence.pipeline_id.as_uuid(),
+                    &snapshot_group_id,
+                    &current_fence.fencing_token,
+                    &group_fence.fencing_token,
+                ],
+            )
+            .await?;
+        ensure_one_metadata_row(adopted)?;
+    }
+    let adopted_progress = transaction
+        .execute(
+            "UPDATE pg2cb_meta.snapshot_table_progress
+                SET fencing_token = $3, updated_at = clock_timestamp()
+              WHERE snapshot_group_id = $1 AND fencing_token = $2 AND completed",
+            &[
+                &snapshot_group_id,
+                &group_fence.fencing_token,
+                &current_fence.fencing_token,
+            ],
+        )
+        .await?;
+    if adopted_progress != stored.request.tables.len() as u64 {
+        return Err(SnapshotTargetError::IncompleteSnapshotProgress(
+            snapshot_group_id,
+        ));
+    }
+    let stored = manifest::adopt_snapshot_group_fence(&transaction, stored, current_fence).await?;
+    transaction.commit().await?;
+    Ok(TableSnapshotReplayGroup {
+        manifest: SnapshotGroupManifest {
+            status: stored.state,
+            request: stored.request,
+        },
+        transition_state,
+    })
 }
 
 /// Garbage-collects eligible quarantines for one pipeline.

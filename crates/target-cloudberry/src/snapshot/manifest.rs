@@ -28,12 +28,12 @@ pub enum SnapshotGroupRegistrationDisposition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SnapshotGroupState {
+pub enum SnapshotGroupStatus {
     Loading,
     Active,
 }
 
-impl SnapshotGroupState {
+impl SnapshotGroupStatus {
     fn parse(snapshot_group_id: Uuid, value: &str) -> Result<Self, SnapshotTargetError> {
         match value {
             "loading" => Ok(Self::Loading),
@@ -47,9 +47,16 @@ impl SnapshotGroupState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StoredSnapshotGroup {
-    pub(super) state: SnapshotGroupState,
+    pub(super) state: SnapshotGroupStatus,
     pub(super) snapshot_progress_version: u16,
     pub(super) request: SnapshotActivationRequest,
+}
+
+/// Fenced, checksum-validated snapshot manifest used by table-reload recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotGroupManifest {
+    pub status: SnapshotGroupStatus,
+    pub request: SnapshotActivationRequest,
 }
 
 /// Registers the complete table and source-node boundary manifest before any shadow COPY starts.
@@ -81,14 +88,47 @@ pub async fn begin_snapshot_group_in_transaction(
             return Err(manifest_mismatch(&stored.request, &canonical));
         }
         let disposition = match stored.state {
-            SnapshotGroupState::Loading => SnapshotGroupRegistrationDisposition::AlreadyRegistered,
-            SnapshotGroupState::Active => SnapshotGroupRegistrationDisposition::AlreadyActive,
+            SnapshotGroupStatus::Loading => SnapshotGroupRegistrationDisposition::AlreadyRegistered,
+            SnapshotGroupStatus::Active => SnapshotGroupRegistrationDisposition::AlreadyActive,
         };
         return Ok(disposition);
     }
 
     insert_snapshot_group(transaction, &canonical).await?;
     Ok(SnapshotGroupRegistrationDisposition::Registered)
+}
+
+/// Loads a complete manifest under the current pipeline fence without changing its ownership.
+///
+/// A newer lease may inspect an older same-topology group in order to decide whether it must be
+/// reset or adopted. A stale lease and a different topology are rejected before any manifest is
+/// returned.
+pub async fn load_snapshot_group_manifest(
+    client: &mut Client,
+    current_fence: PipelineFence,
+    snapshot_group_id: Uuid,
+) -> Result<SnapshotGroupManifest, SnapshotTargetError> {
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, current_fence).await?;
+    let stored = load_snapshot_group(&transaction, snapshot_group_id).await?;
+    let group_fence = stored.request.fence;
+    if group_fence.pipeline_id != current_fence.pipeline_id
+        || group_fence.topology_generation != current_fence.topology_generation
+        || group_fence.fencing_token > current_fence.fencing_token
+    {
+        return Err(SnapshotTargetError::SnapshotGroupFenceMismatch {
+            group: snapshot_group_id,
+            expected_generation: current_fence.topology_generation,
+            expected_token: current_fence.fencing_token,
+            actual_generation: group_fence.topology_generation,
+            actual_token: group_fence.fencing_token,
+        });
+    }
+    transaction.commit().await?;
+    Ok(SnapshotGroupManifest {
+        status: stored.state,
+        request: stored.request,
+    })
 }
 
 pub(super) async fn load_snapshot_group(
@@ -100,6 +140,47 @@ pub(super) async fn load_snapshot_group(
         .ok_or(SnapshotTargetError::SnapshotGroupNotRegistered(
             snapshot_group_id,
         ))
+}
+
+pub(super) async fn adopt_snapshot_group_fence(
+    transaction: &Transaction<'_>,
+    mut stored: StoredSnapshotGroup,
+    current_fence: PipelineFence,
+) -> Result<StoredSnapshotGroup, SnapshotTargetError> {
+    let group_id = stored.request.snapshot_group_id;
+    let previous_fence = stored.request.fence;
+    if previous_fence == current_fence {
+        return Ok(stored);
+    }
+    if previous_fence.pipeline_id != current_fence.pipeline_id
+        || previous_fence.topology_generation != current_fence.topology_generation
+        || previous_fence.fencing_token > current_fence.fencing_token
+    {
+        return Err(SnapshotTargetError::SnapshotGroupFenceMismatch {
+            group: group_id,
+            expected_generation: current_fence.topology_generation,
+            expected_token: current_fence.fencing_token,
+            actual_generation: previous_fence.topology_generation,
+            actual_token: previous_fence.fencing_token,
+        });
+    }
+    stored.request.fence = current_fence;
+    let checksum = manifest_checksum(&stored.request);
+    let written = transaction
+        .execute(
+            "UPDATE pg2cb_meta.snapshot_groups
+                SET fencing_token = $3, manifest_checksum = $4, updated_at = clock_timestamp()
+              WHERE snapshot_group_id = $1 AND fencing_token = $2",
+            &[
+                &group_id,
+                &previous_fence.fencing_token,
+                &current_fence.fencing_token,
+                &checksum,
+            ],
+        )
+        .await?;
+    ensure_one_metadata_row(written)?;
+    Ok(stored)
 }
 
 pub(super) fn validate_exact_request(
@@ -578,7 +659,7 @@ async fn load_snapshot_group_optional(
     let pipeline_id = PipelineId::from_uuid(group.try_get("pipeline_id")?);
     let topology_generation = persisted_u64(&group, "topology_generation", snapshot_group_id)?;
     let fencing_token: i64 = group.try_get("fencing_token")?;
-    let state = SnapshotGroupState::parse(snapshot_group_id, group.try_get("state")?)?;
+    let state = SnapshotGroupStatus::parse(snapshot_group_id, group.try_get("state")?)?;
     let table_count = persisted_count(&group, "table_count", snapshot_group_id)?;
     let node_count = persisted_count(&group, "node_count", snapshot_group_id)?;
     let stored_checksum: Vec<u8> = group.try_get("manifest_checksum")?;
@@ -838,7 +919,7 @@ mod tests {
     fn apply_membership_requires_every_table_field() {
         let request = canonical_request(&request()).unwrap();
         let stored = StoredSnapshotGroup {
-            state: SnapshotGroupState::Loading,
+            state: SnapshotGroupStatus::Loading,
             snapshot_progress_version: 1,
             request: request.clone(),
         };

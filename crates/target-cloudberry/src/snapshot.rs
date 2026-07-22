@@ -39,11 +39,13 @@ pub use activation::{
 };
 pub use cleanup::{
     QuarantineGcOutcome, QuarantineGcPolicy, SnapshotCleanupOutcome, SnapshotGroupCleanupRequest,
-    cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
-    garbage_collect_quarantined_tables, reset_interrupted_table_snapshot_group,
+    TableSnapshotReplayGroup, adopt_table_snapshot_replay_group, cleanup_loading_snapshot_group,
+    cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables,
+    reset_interrupted_table_snapshot_group,
 };
 pub use manifest::{
-    SnapshotGroupRegistrationDisposition, begin_snapshot_group, begin_snapshot_group_in_transaction,
+    SnapshotGroupManifest, SnapshotGroupRegistrationDisposition, SnapshotGroupStatus,
+    begin_snapshot_group, begin_snapshot_group_in_transaction, load_snapshot_group_manifest,
 };
 pub use progress::{
     SNAPSHOT_CURSOR_FORMAT_VERSION, SnapshotPageApplyOutcome, SnapshotTableProgress,
@@ -439,7 +441,7 @@ async fn prepare_shadow_load(
 ) -> Result<SnapshotTableProgress, SnapshotTargetError> {
     let manifest = manifest::load_snapshot_group(transaction, ownership.snapshot_group_id).await?;
     manifest::validate_apply_membership(&manifest, plan, ownership)?;
-    if manifest.state == manifest::SnapshotGroupState::Active {
+    if manifest.state == manifest::SnapshotGroupStatus::Active {
         return Err(SnapshotTargetError::SnapshotGroupAlreadyActive(
             ownership.snapshot_group_id,
         ));

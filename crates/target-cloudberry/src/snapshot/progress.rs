@@ -422,7 +422,7 @@ async fn lock_progress_identity(
         });
     }
     manifest::validate_apply_membership(&stored, plan, ownership)?;
-    if stored.state != manifest::SnapshotGroupState::Loading {
+    if stored.state != manifest::SnapshotGroupStatus::Loading {
         return Err(SnapshotTargetError::SnapshotGroupAlreadyActive(
             ownership.snapshot_group_id,
         ));

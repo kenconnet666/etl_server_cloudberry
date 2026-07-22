@@ -119,7 +119,7 @@ pub async fn activate_snapshot_group(
     reserved_names.extend(stale.iter().map(|table| table.target.clone()));
 
     if group_is_active(&states)? {
-        if stored.state != manifest::SnapshotGroupState::Active {
+        if stored.state != manifest::SnapshotGroupStatus::Active {
             return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
                 request.snapshot_group_id,
             ));
@@ -139,7 +139,7 @@ pub async fn activate_snapshot_group(
             quarantined,
         });
     }
-    if stored.state != manifest::SnapshotGroupState::Loading {
+    if stored.state != manifest::SnapshotGroupStatus::Loading {
         return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
             request.snapshot_group_id,
         ));
@@ -297,7 +297,7 @@ pub async fn activate_table_snapshot_group_in_transaction(
             .await?;
     }
     if already_active {
-        if stored.state != manifest::SnapshotGroupState::Active {
+        if stored.state != manifest::SnapshotGroupStatus::Active {
             return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
                 request.snapshot_group_id,
             ));
@@ -307,7 +307,7 @@ pub async fn activate_table_snapshot_group_in_transaction(
             quarantined: Vec::new(),
         });
     }
-    if stored.state != manifest::SnapshotGroupState::Loading {
+    if stored.state != manifest::SnapshotGroupStatus::Loading {
         return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
             request.snapshot_group_id,
         ));
@@ -567,7 +567,7 @@ pub async fn validate_active_snapshot_group(
         }
     };
     let stored = manifest::load_snapshot_group(&transaction, snapshot_group_id).await?;
-    if stored.state != manifest::SnapshotGroupState::Active
+    if stored.state != manifest::SnapshotGroupStatus::Active
         || stored.request.fence.pipeline_id != fence.pipeline_id
         || stored.request.fence.topology_generation != fence.topology_generation
         || stored.request.fence.fencing_token > fence.fencing_token
