@@ -70,6 +70,11 @@ pub struct DdlMessage {
     #[serde(default)]
     pub affected_schemas: Vec<String>,
     pub schema_fingerprint: String,
+    /// Per-relation structural changes (v2 envelope). Absent or empty for a v1
+    /// message, in which case the engine has no structured transition to act on
+    /// and treats the DDL conservatively.
+    #[serde(default)]
+    pub transitions: Vec<TableTransition>,
 }
 
 /// How a source DDL command affects logical row replication.
@@ -101,6 +106,93 @@ impl DdlMessage {
             DdlReplicationImpact::Irrelevant
         } else {
             DdlReplicationImpact::SchemaSensitive
+        }
+    }
+
+    /// Whether this event carries a non-empty v2 transition set in which every
+    /// transition is online-safe. Only then can the engine follow the DDL with
+    /// table transitions instead of a full rebuild; a v1 message (no
+    /// transitions) or any unsafe/unknown transition returns false.
+    #[must_use]
+    pub fn all_transitions_online_safe(&self) -> bool {
+        !self.transitions.is_empty()
+            && self
+                .transitions
+                .iter()
+                .all(|transition| transition.kind.is_online_safe())
+    }
+}
+
+/// One managed relation's structural change described by a DDL event.
+///
+/// Emitted in the v2 DDL envelope so the engine can decide, per table, whether
+/// the change is an online-safe transition (whitelisted) or must fall back to a
+/// shadow rebuild. `before_*`/`after_*` fingerprints let a consumer detect an
+/// identity change without re-reading the source catalog; `kind` records the
+/// classified operation when the source could determine it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableTransition {
+    pub relation_id: u32,
+    /// Table generation before the DDL, if the relation already existed.
+    pub before_generation: Option<u64>,
+    /// Table generation after the DDL, if the relation still exists.
+    pub after_generation: Option<u64>,
+    /// Schema fingerprint before the DDL (None for a newly created table).
+    pub before_fingerprint: Option<String>,
+    /// Schema fingerprint after the DDL (None for a dropped table).
+    pub after_fingerprint: Option<String>,
+    pub kind: TransitionKind,
+}
+
+/// Classified DDL operation for one relation. `Unknown` is the conservative
+/// default when the source cannot prove which online-safe category applies, and
+/// it forces the fail-closed rebuild path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransitionKind {
+    /// A column was added. `nullable_or_defaulted` is true when the add cannot
+    /// rewrite existing rows unsafely (nullable, or NOT NULL with a constant
+    /// default), which is the online-safe case.
+    AddColumn {
+        name: String,
+        nullable_or_defaulted: bool,
+    },
+    /// A column was dropped.
+    DropColumn { name: String },
+    /// A column was renamed.
+    RenameColumn { from: String, to: String },
+    /// A column type changed. `widening` is true for a proven-compatible change
+    /// (e.g. int4 -> int8, varchar(n) -> varchar(m>n) or text).
+    AlterColumnType { name: String, widening: bool },
+    /// A new table entered the managed scope.
+    AddTable,
+    /// A managed table was dropped and should be quarantined.
+    DropTable,
+    /// The source could not classify the change; treat as unsafe (rebuild).
+    Unknown,
+}
+
+impl TransitionKind {
+    /// Whether this classified operation is on the online-safe whitelist and can
+    /// be applied as a table transition rather than a full rebuild.
+    ///
+    /// Deliberately conservative: only additive/rename/widening column changes,
+    /// new tables, and drops (via quarantine) are online-safe. A narrowing type
+    /// change, a NOT NULL add without a default, or an `Unknown` classification
+    /// is not.
+    #[must_use]
+    pub const fn is_online_safe(&self) -> bool {
+        match self {
+            Self::AddColumn {
+                nullable_or_defaulted,
+                ..
+            } => *nullable_or_defaulted,
+            Self::AlterColumnType { widening, .. } => *widening,
+            Self::DropColumn { .. }
+            | Self::RenameColumn { .. }
+            | Self::AddTable
+            | Self::DropTable => true,
+            Self::Unknown => false,
         }
     }
 }
@@ -154,6 +246,7 @@ mod ddl_impact_tests {
             relation_ids: Vec::new(),
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "fp".to_owned(),
+            transitions: Vec::new(),
         }
     }
 
@@ -207,6 +300,85 @@ mod ddl_impact_tests {
             ddl("  CREATE INDEX  ").replication_impact(),
             DdlReplicationImpact::Irrelevant
         );
+    }
+
+    #[test]
+    fn transition_kind_online_safety_is_conservative() {
+        use super::TransitionKind;
+        assert!(TransitionKind::AddColumn {
+            name: "c".to_owned(),
+            nullable_or_defaulted: true
+        }
+        .is_online_safe());
+        assert!(!TransitionKind::AddColumn {
+            name: "c".to_owned(),
+            nullable_or_defaulted: false
+        }
+        .is_online_safe());
+        assert!(TransitionKind::AlterColumnType {
+            name: "c".to_owned(),
+            widening: true
+        }
+        .is_online_safe());
+        assert!(!TransitionKind::AlterColumnType {
+            name: "c".to_owned(),
+            widening: false
+        }
+        .is_online_safe());
+        assert!(TransitionKind::DropColumn { name: "c".to_owned() }.is_online_safe());
+        assert!(TransitionKind::RenameColumn {
+            from: "a".to_owned(),
+            to: "b".to_owned()
+        }
+        .is_online_safe());
+        assert!(TransitionKind::AddTable.is_online_safe());
+        assert!(TransitionKind::DropTable.is_online_safe());
+        assert!(!TransitionKind::Unknown.is_online_safe());
+    }
+
+    #[test]
+    fn all_transitions_online_safe_requires_nonempty_and_all_safe() {
+        use super::{TableTransition, TransitionKind};
+        // v1 message: no transitions -> not online-followable.
+        assert!(!ddl("ALTER TABLE").all_transitions_online_safe());
+
+        let safe = TableTransition {
+            relation_id: 1,
+            before_generation: Some(1),
+            after_generation: Some(2),
+            before_fingerprint: Some("a".to_owned()),
+            after_fingerprint: Some("b".to_owned()),
+            kind: TransitionKind::AddColumn {
+                name: "note".to_owned(),
+                nullable_or_defaulted: true,
+            },
+        };
+        let unsafe_one = TableTransition {
+            kind: TransitionKind::Unknown,
+            ..safe.clone()
+        };
+
+        let mut message = ddl("ALTER TABLE");
+        message.transitions = vec![safe.clone()];
+        assert!(message.all_transitions_online_safe());
+
+        message.transitions = vec![safe, unsafe_one];
+        assert!(!message.all_transitions_online_safe());
+    }
+
+    #[test]
+    fn v1_ddl_json_without_transitions_deserializes() {
+        // A v1 payload has no `transitions` field; serde default must fill it.
+        let json = r#"{
+            "version": 1,
+            "command_tag": "ALTER TABLE",
+            "relation_ids": [42],
+            "affected_schemas": ["public"],
+            "schema_fingerprint": "fp"
+        }"#;
+        let message: DdlMessage = serde_json::from_str(json).unwrap();
+        assert!(message.transitions.is_empty());
+        assert_eq!(message.command_tag, "ALTER TABLE");
     }
 }
 

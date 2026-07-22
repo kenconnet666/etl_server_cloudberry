@@ -1274,6 +1274,7 @@ mod tests {
                     relation_ids: vec![42],
                     affected_schemas: vec!["public".to_owned()],
                     schema_fingerprint: "abc".to_owned(),
+                    transitions: Vec::new(),
                 }))
                 .unwrap()
                 .is_none()
@@ -1314,6 +1315,7 @@ mod tests {
             relation_ids: vec![42],
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "same".to_owned(),
+            transitions: Vec::new(),
         };
         let mut assembler = TransactionAssembler::new(identity);
         assembler.push(begin(1, 7)).unwrap();

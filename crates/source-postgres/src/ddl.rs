@@ -704,6 +704,9 @@ pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessa
         relation_ids,
         affected_schemas,
         schema_fingerprint: envelope.schema_fingerprint,
+        // v1 source envelope carries no structured transitions yet; the v2
+        // capture that populates these lands with the online-follow path.
+        transitions: Vec::new(),
     })
 }
 

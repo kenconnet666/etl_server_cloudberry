@@ -1318,6 +1318,9 @@ impl From<WireDdlMessage> for DdlMessage {
             relation_ids: message.relation_ids,
             affected_schemas: message.affected_schemas,
             schema_fingerprint: message.schema_fingerprint,
+            // The spool/barrier path does not carry structured transitions; they
+            // are derived at DDL parse time and acted on before spooling.
+            transitions: Vec::new(),
         }
     }
 }

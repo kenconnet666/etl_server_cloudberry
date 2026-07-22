@@ -270,6 +270,7 @@ mod tests {
             relation_ids: vec![7],
             affected_schemas: vec!["public".into()],
             schema_fingerprint: "abc".into(),
+            transitions: Vec::new(),
         });
         let full = batcher.push(transaction(2, vec![ddl])).unwrap().unwrap();
         assert_eq!(full.transactions().len(), 1);

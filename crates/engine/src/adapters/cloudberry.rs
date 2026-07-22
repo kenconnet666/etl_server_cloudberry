@@ -1005,6 +1005,7 @@ mod tests {
             relation_ids: vec![7],
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "changed".to_owned(),
+            transitions: Vec::new(),
         });
         let (root, committed) = spooled_transaction(&[insert(7, 3, "1", "a"), ddl]);
         let mut batcher = Batcher::new(BatchLimits::default()).unwrap();
@@ -1071,6 +1072,7 @@ mod tests {
             relation_ids: vec![7],
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         assert!(matches!(
             build_apply_request(fence(), "slot", &registry, &ddl),
@@ -1082,6 +1084,7 @@ mod tests {
             relation_ids: vec![],
             affected_schemas: vec![],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         assert!(matches!(
             build_apply_request(fence(), "slot", &registry, &external_publication_ddl),
@@ -1108,6 +1111,7 @@ mod tests {
             relation_ids: vec![],
             affected_schemas: vec!["other".to_owned()],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         let scope = DdlScope::new(Some(HashSet::from(["included".to_owned()])), HashSet::new());
         let request = build_apply_request_scoped(fence(), "slot", &registry, &scope, &ddl).unwrap();
@@ -1124,6 +1128,7 @@ mod tests {
             relation_ids: vec![],
             affected_schemas: vec![],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         assert!(matches!(
             build_apply_request_scoped(
@@ -1142,6 +1147,7 @@ mod tests {
             relation_ids: vec![],
             affected_schemas: vec!["excluded".to_owned()],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         let mut excluded = HashSet::new();
         excluded.insert("excluded".to_owned());
@@ -1167,6 +1173,7 @@ mod tests {
             relation_ids: vec![7],
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         let request =
             build_apply_request(fence(), "slot", &registry, &create_index).unwrap();
@@ -1180,6 +1187,7 @@ mod tests {
             relation_ids: vec![],
             affected_schemas: vec!["public".to_owned()],
             schema_fingerprint: "abc".to_owned(),
+            transitions: Vec::new(),
         })]);
         let scope = DdlScope::new(Some(HashSet::from(["public".to_owned()])), HashSet::new());
         let request =
