@@ -495,6 +495,26 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     assert!(saw_ddl, "DDL event trigger message was not decoded");
     assert!(ddl_tags.contains("ALTER PUBLICATION"));
     assert!(ddl_tags.contains("ALTER TABLE"));
+
+    // The v5 command-end trigger emits per-relation after-fingerprints; the
+    // ALTER TABLE ADD COLUMN on the mirrored table must carry a transition with
+    // a populated after-fingerprint and no before side (command-end can't see it).
+    let alter_ddl = ddl_messages
+        .iter()
+        .find(|message| message.command_tag == "ALTER TABLE")
+        .expect("ALTER TABLE DDL must be captured");
+    assert!(
+        !alter_ddl.transitions.is_empty(),
+        "ALTER TABLE must carry per-relation transitions (v5 capture)"
+    );
+    assert!(
+        alter_ddl
+            .transitions
+            .iter()
+            .all(|t| t.after_fingerprint.is_some() && t.before_fingerprint.is_none()),
+        "each transition must carry an after-fingerprint and no before side"
+    );
+
     let publication_ddl = ddl_messages
         .iter()
         .find(|message| message.command_tag == "ALTER PUBLICATION")
