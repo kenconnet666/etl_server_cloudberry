@@ -564,9 +564,7 @@ mod tests {
         assert!(TARGET_V8_SQL.contains("source_lsn pg_lsn NOT NULL"));
         assert!(TARGET_V8_SQL.contains("source_xid bigint NOT NULL"));
         assert!(TARGET_V8_SQL.contains("transitions jsonb NOT NULL"));
-        assert!(TARGET_V8_SQL.contains(
-            "state text NOT NULL DEFAULT 'pending'"
-        ));
+        assert!(TARGET_V8_SQL.contains("state text NOT NULL DEFAULT 'pending'"));
         assert!(TARGET_V8_SQL.contains("PRIMARY KEY (pipeline_id, source_lsn, source_xid)"));
         assert!(TARGET_V8_SQL.contains("UNIQUE (event_id)"));
         assert!(TARGET_V8_SQL.contains("DISTRIBUTED BY (pipeline_id)"));

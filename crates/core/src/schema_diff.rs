@@ -104,8 +104,8 @@ fn is_widening(before: &PgTypeKind, after: &PgTypeKind) -> bool {
         // varchar(n) -> varchar(m) with m >= n (or m unbounded) is a widening.
         (VarChar { length: before_len }, VarChar { length: after_len }) => {
             match (before_len, after_len) {
-                (_, None) => true,           // after is unbounded
-                (None, Some(_)) => false,    // before unbounded, after bounded = narrowing
+                (_, None) => true,        // after is unbounded
+                (None, Some(_)) => false, // before unbounded, after bounded = narrowing
                 (Some(b), Some(a)) => a >= b,
             }
         }
@@ -121,8 +121,13 @@ mod tests {
         TableKind,
     };
 
-    fn col(attnum: i16, name: &str, kind: PgTypeKind, pk: Option<u16>, nullable: bool)
-        -> ColumnSchema {
+    fn col(
+        attnum: i16,
+        name: &str,
+        kind: PgTypeKind,
+        pk: Option<u16>,
+        nullable: bool,
+    ) -> ColumnSchema {
         ColumnSchema {
             attnum,
             name: name.to_owned(),
@@ -167,7 +172,9 @@ mod tests {
     #[test]
     fn add_nullable_column_is_online_safe() {
         let mut after = base();
-        after.columns.push(col(3, "note", PgTypeKind::Text, None, true));
+        after
+            .columns
+            .push(col(3, "note", PgTypeKind::Text, None, true));
         let diff = classify_table_diff(&base(), &after);
         assert_eq!(diff.len(), 1);
         assert!(matches!(
@@ -180,11 +187,16 @@ mod tests {
     #[test]
     fn add_not_null_column_is_flagged_unsafe() {
         let mut after = base();
-        after.columns.push(col(3, "flag", PgTypeKind::Bool, None, false));
+        after
+            .columns
+            .push(col(3, "flag", PgTypeKind::Bool, None, false));
         let diff = classify_table_diff(&base(), &after);
         assert!(matches!(
             &diff[0],
-            TransitionKind::AddColumn { nullable_or_defaulted: false, .. }
+            TransitionKind::AddColumn {
+                nullable_or_defaulted: false,
+                ..
+            }
         ));
         assert!(!diff[0].is_online_safe());
     }
@@ -242,7 +254,10 @@ mod tests {
         let diff = classify_table_diff(&narrowed, &before); // int8 -> int4
         assert!(matches!(
             &diff[0],
-            TransitionKind::AlterColumnType { widening: false, .. }
+            TransitionKind::AlterColumnType {
+                widening: false,
+                ..
+            }
         ));
         assert!(!diff[0].is_online_safe());
     }

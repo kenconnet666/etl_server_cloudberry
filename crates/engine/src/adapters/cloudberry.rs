@@ -1206,8 +1206,7 @@ mod tests {
             schema_fingerprint: "abc".to_owned(),
             transitions: Vec::new(),
         })]);
-        let request =
-            build_apply_request(fence(), "slot", &registry, &create_index).unwrap();
+        let request = build_apply_request(fence(), "slot", &registry, &create_index).unwrap();
         assert!(request.tables.is_empty());
         assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
 
@@ -1402,7 +1401,11 @@ mod tests {
             TableBindingRegistry::new([binding(7, 3, "items", "items", "stage_items")]).unwrap();
 
         // Unmanaged key -> None.
-        assert!(registry.classify_relation_diff(99, 1, &schema(99, 1, "x")).is_none());
+        assert!(
+            registry
+                .classify_relation_diff(99, 1, &schema(99, 1, "x"))
+                .is_none()
+        );
 
         // Add a nullable column to the bound schema (id pk + payload) -> online-safe AddColumn.
         let mut after = schema(7, 3, "items");
@@ -1415,10 +1418,12 @@ mod tests {
         assert!(diff[0].is_online_safe());
 
         // Identical schema -> no transitions.
-        assert!(registry
-            .classify_relation_diff(7, 3, &schema(7, 3, "items"))
-            .expect("managed relation")
-            .is_empty());
+        assert!(
+            registry
+                .classify_relation_diff(7, 3, &schema(7, 3, "items"))
+                .expect("managed relation")
+                .is_empty()
+        );
     }
 
     #[test]

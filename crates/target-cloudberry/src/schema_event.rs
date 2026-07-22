@@ -159,7 +159,10 @@ pub enum SchemaEventError {
     #[error("persisted schema event contains invalid {field}: {value}")]
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("illegal schema event transition from {from} to {to}")]
-    IllegalTransition { from: &'static str, to: &'static str },
+    IllegalTransition {
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("schema event state update affected {0} rows instead of one")]
     UnexpectedWriteCount(u64),
 }
@@ -286,12 +289,13 @@ fn schema_event_from_row(row: &Row) -> Result<SchemaEvent, SchemaEventError> {
     let source_xid: i64 = row.try_get("source_xid")?;
     let lsn_text: String = row.try_get("source_lsn")?;
     let state_text: String = row.try_get("state")?;
-    let source_lsn = lsn_text.parse::<PgLsn>().map_err(|_| {
-        SchemaEventError::InvalidPersistedValue {
-            field: "source_lsn",
-            value: lsn_text.clone(),
-        }
-    })?;
+    let source_lsn =
+        lsn_text
+            .parse::<PgLsn>()
+            .map_err(|_| SchemaEventError::InvalidPersistedValue {
+                field: "source_lsn",
+                value: lsn_text.clone(),
+            })?;
     Ok(SchemaEvent {
         event_id: row.try_get("event_id")?,
         pipeline_id: PipelineId::from_uuid(row.try_get("pipeline_id")?),
@@ -379,11 +383,15 @@ mod tests {
 
     #[test]
     fn insert_sql_is_idempotent_on_source_identity() {
-        assert!(INSERT_SCHEMA_EVENT_SQL
-            .contains("ON CONFLICT (pipeline_id, source_lsn, source_xid) DO NOTHING"));
+        assert!(
+            INSERT_SCHEMA_EVENT_SQL
+                .contains("ON CONFLICT (pipeline_id, source_lsn, source_xid) DO NOTHING")
+        );
         // The list query must be ordered so restart replay is deterministic.
         assert!(LIST_UNFINISHED_SCHEMA_EVENTS_SQL.contains("ORDER BY source_lsn, source_xid"));
-        assert!(LIST_UNFINISHED_SCHEMA_EVENTS_SQL.contains("state IN ('pending', 'in_transition')"));
+        assert!(
+            LIST_UNFINISHED_SCHEMA_EVENTS_SQL.contains("state IN ('pending', 'in_transition')")
+        );
         // The advance guard requires the expected prior state.
         assert!(ADVANCE_STATE_SQL.contains("AND state = $6"));
     }

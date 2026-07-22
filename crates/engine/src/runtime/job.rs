@@ -39,7 +39,7 @@ use cloudberry_etl_target_cloudberry::{
     migration::{MigrationError, migrate_target_database},
     snapshot::{
         QuarantineGcPolicy, SnapshotActivationRequest, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_pages, begin_snapshot_group,
+        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages,
         cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables, plan_snapshot_target,
         validate_active_snapshot_group,
     },

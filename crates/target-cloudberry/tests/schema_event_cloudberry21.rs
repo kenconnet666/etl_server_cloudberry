@@ -124,7 +124,10 @@ async fn run_ledger_test(
 
     // Completed events drop out of the unfinished list.
     let after = list_unfinished_schema_events(client, fence).await?;
-    assert!(after.is_empty(), "completed event must not remain unfinished");
+    assert!(
+        after.is_empty(),
+        "completed event must not remain unfinished"
+    );
 
     let completed = load_schema_event(client, pipeline_id, PgLsn::new(0x1000), 4242)
         .await?

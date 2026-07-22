@@ -305,32 +305,47 @@ mod ddl_impact_tests {
     #[test]
     fn transition_kind_online_safety_is_conservative() {
         use super::TransitionKind;
-        assert!(TransitionKind::AddColumn {
-            name: "c".to_owned(),
-            nullable_or_defaulted: true
-        }
-        .is_online_safe());
-        assert!(!TransitionKind::AddColumn {
-            name: "c".to_owned(),
-            nullable_or_defaulted: false
-        }
-        .is_online_safe());
-        assert!(TransitionKind::AlterColumnType {
-            name: "c".to_owned(),
-            widening: true
-        }
-        .is_online_safe());
-        assert!(!TransitionKind::AlterColumnType {
-            name: "c".to_owned(),
-            widening: false
-        }
-        .is_online_safe());
-        assert!(TransitionKind::DropColumn { name: "c".to_owned() }.is_online_safe());
-        assert!(TransitionKind::RenameColumn {
-            from: "a".to_owned(),
-            to: "b".to_owned()
-        }
-        .is_online_safe());
+        assert!(
+            TransitionKind::AddColumn {
+                name: "c".to_owned(),
+                nullable_or_defaulted: true
+            }
+            .is_online_safe()
+        );
+        assert!(
+            !TransitionKind::AddColumn {
+                name: "c".to_owned(),
+                nullable_or_defaulted: false
+            }
+            .is_online_safe()
+        );
+        assert!(
+            TransitionKind::AlterColumnType {
+                name: "c".to_owned(),
+                widening: true
+            }
+            .is_online_safe()
+        );
+        assert!(
+            !TransitionKind::AlterColumnType {
+                name: "c".to_owned(),
+                widening: false
+            }
+            .is_online_safe()
+        );
+        assert!(
+            TransitionKind::DropColumn {
+                name: "c".to_owned()
+            }
+            .is_online_safe()
+        );
+        assert!(
+            TransitionKind::RenameColumn {
+                from: "a".to_owned(),
+                to: "b".to_owned()
+            }
+            .is_online_safe()
+        );
         assert!(TransitionKind::AddTable.is_online_safe());
         assert!(TransitionKind::DropTable.is_online_safe());
         assert!(!TransitionKind::Unknown.is_online_safe());
