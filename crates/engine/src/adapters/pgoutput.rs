@@ -1,12 +1,12 @@
 //! PostgreSQL pgoutput adapter for the engine transaction source.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use cloudberry_etl_core::{change::SourcePosition, lsn::PgLsn};
 use cloudberry_etl_source_postgres::{
     SourceResult,
-    spool::ResourceState,
+    spool::{ChangeSource, ResourceState},
     wal::{
         AssembledEvent, DecodedMessage, ReplicationTransport, StandbyStatus, TransactionAssembler,
     },
@@ -21,6 +21,21 @@ use crate::telemetry::PipelineTelemetryHandle;
 trait EventTransport: Send {
     async fn next_message(&mut self) -> Option<SourceResult<DecodedMessage>>;
     async fn send_status(&mut self, status: StandbyStatus) -> SourceResult<()>;
+}
+
+/// Fatal source-ingest boundaries used by process-recovery tests.
+///
+/// An observer error deliberately terminates the current replication run. The caller must discard
+/// the source adapter and reconnect from the target-authoritative checkpoint; continuing on the
+/// same transport after a consumed WAL message would be unsafe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIngestPoint {
+    AfterSourceRead,
+    AfterSpoolCommit,
+}
+
+pub trait SourceIngestObserver: Send + Sync {
+    fn observe(&self, point: SourceIngestPoint) -> Result<(), String>;
 }
 
 #[async_trait]
@@ -51,6 +66,7 @@ pub struct PgOutputTransactionSource {
     next_resource_heartbeat: Option<Instant>,
     forced_resource_wait: Option<ResourceState>,
     resource_wait_active: bool,
+    ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
     #[cfg(test)]
     injected_actual_capacity_failures: usize,
 }
@@ -84,6 +100,23 @@ impl PgOutputTransactionSource {
     }
 
     #[must_use]
+    pub fn new_with_telemetry_and_observer(
+        transport: ReplicationTransport,
+        assembler: TransactionAssembler,
+        durable_applied_lsn: PgLsn,
+        telemetry: PipelineTelemetryHandle,
+        observer: Arc<dyn SourceIngestObserver>,
+    ) -> Self {
+        Self::from_transport_with_observer(
+            transport,
+            assembler,
+            durable_applied_lsn,
+            Some(telemetry),
+            Some(observer),
+        )
+    }
+
+    #[must_use]
     pub const fn durable_applied_lsn(&self) -> PgLsn {
         self.durable_applied_lsn
     }
@@ -102,6 +135,22 @@ impl PgOutputTransactionSource {
         durable_applied_lsn: PgLsn,
         telemetry: Option<PipelineTelemetryHandle>,
     ) -> Self {
+        Self::from_transport_with_observer(
+            transport,
+            assembler,
+            durable_applied_lsn,
+            telemetry,
+            None,
+        )
+    }
+
+    fn from_transport_with_observer(
+        transport: impl EventTransport + 'static,
+        assembler: TransactionAssembler,
+        durable_applied_lsn: PgLsn,
+        telemetry: Option<PipelineTelemetryHandle>,
+        ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
+    ) -> Self {
         Self {
             transport: Box::new(transport),
             assembler,
@@ -114,9 +163,21 @@ impl PgOutputTransactionSource {
             next_resource_heartbeat: None,
             forced_resource_wait: None,
             resource_wait_active: false,
+            ingest_observer,
             #[cfg(test)]
             injected_actual_capacity_failures: 0,
         }
+    }
+
+    fn observe_ingest(&self, point: SourceIngestPoint) -> Result<(), PipelineError> {
+        let Some(observer) = &self.ingest_observer else {
+            return Ok(());
+        };
+        observer.observe(point).map_err(|message| {
+            PipelineError::Source(format!(
+                "source ingest observer failed at {point:?}: {message}"
+            ))
+        })
     }
 
     async fn send_durable_status(&mut self) -> Result<(), PipelineError> {
@@ -252,8 +313,9 @@ impl TransactionSource for PgOutputTransactionSource {
                         .map_err(|error| PipelineError::Source(error.to_string()))?;
                     return Ok(None);
                 };
-                self.pending_message =
-                    Some(message.map_err(|error| PipelineError::Source(error.to_string()))?);
+                let message = message.map_err(|error| PipelineError::Source(error.to_string()))?;
+                self.observe_ingest(SourceIngestPoint::AfterSourceRead)?;
+                self.pending_message = Some(message);
             }
             let spool_write = self.wait_for_spool_capacity().await?;
             let message = self
@@ -290,6 +352,9 @@ impl TransactionSource for PgOutputTransactionSource {
             self.clear_resource_wait_after_write();
             match assembled {
                 Some(AssembledEvent::Transaction(committed)) => {
+                    if matches!(&committed.change_source, ChangeSource::Spool(_)) {
+                        self.observe_ingest(SourceIngestPoint::AfterSpoolCommit)?;
+                    }
                     self.delivered_commits
                         .push_back(committed.transaction.final_position.lsn);
                     return Ok(Some(*committed));
@@ -347,6 +412,32 @@ mod tests {
 
     use super::*;
     use crate::telemetry::PipelineRuntimeState;
+
+    #[derive(Debug)]
+    struct RecordingObserver {
+        points: Mutex<Vec<SourceIngestPoint>>,
+        fail_at: Option<SourceIngestPoint>,
+    }
+
+    impl RecordingObserver {
+        fn new(fail_at: Option<SourceIngestPoint>) -> Arc<Self> {
+            Arc::new(Self {
+                points: Mutex::new(Vec::new()),
+                fail_at,
+            })
+        }
+    }
+
+    impl SourceIngestObserver for RecordingObserver {
+        fn observe(&self, point: SourceIngestPoint) -> Result<(), String> {
+            self.points.lock().unwrap().push(point);
+            if self.fail_at == Some(point) {
+                Err("injected process termination".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     struct FakeTransport {
         messages: VecDeque<SourceResult<DecodedMessage>>,
@@ -619,5 +710,129 @@ mod tests {
             source.next_transaction().await,
             Err(PipelineError::Source(message)) if message.contains("injected")
         ));
+    }
+
+    #[tokio::test]
+    async fn source_read_observer_is_fatal_before_assembler_state_changes() {
+        let observer = RecordingObserver::new(Some(SourceIngestPoint::AfterSourceRead));
+        let transport = FakeTransport {
+            messages: VecDeque::from([Ok(DecodedMessage::Begin {
+                final_lsn: PgLsn::new(10),
+                timestamp: timestamp(10),
+                xid: 7,
+            })]),
+            statuses: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut source = PgOutputTransactionSource::from_transport_with_observer(
+            transport,
+            assembler(),
+            PgLsn::new(5),
+            None,
+            Some(Arc::<RecordingObserver>::clone(&observer)),
+        );
+
+        assert!(matches!(
+            source.next_transaction().await,
+            Err(PipelineError::Source(message))
+                if message.contains("AfterSourceRead") && message.contains("injected")
+        ));
+        assert_eq!(source.assembler.pending_xid(), None);
+        assert_eq!(
+            *observer.points.lock().unwrap(),
+            [SourceIngestPoint::AfterSourceRead]
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_commit_observer_fails_before_delivery_or_ack_eligibility() {
+        let root = temp_root();
+        let journal = SpoolJournal::open(
+            &root,
+            SpoolIdentity {
+                pipeline_id: PipelineId::new(),
+                topology_generation: 1,
+                node_id: identity().node_id,
+                system_identifier: identity().system_identifier,
+                timeline: identity().timeline,
+            },
+            SpoolLimits {
+                memory_high_water_bytes: 1,
+                segment_target_bytes: 128,
+                disk_high_water_bytes: 1024 * 1024,
+                minimum_free_disk_bytes: 1,
+            },
+        )
+        .unwrap();
+        let spooling_assembler = TransactionAssembler::with_spool(
+            identity(),
+            TransactionLimits {
+                max_changes: 1,
+                max_bytes: usize::MAX,
+            },
+            journal,
+        )
+        .unwrap();
+        let observer = RecordingObserver::new(Some(SourceIngestPoint::AfterSpoolCommit));
+        let transport = FakeTransport {
+            messages: VecDeque::from([
+                Ok(DecodedMessage::Relation(RelationEvent {
+                    relation_id: 42,
+                    namespace: "public".to_owned(),
+                    name: "items".to_owned(),
+                    generation: 1,
+                    replica_identity: WireReplicaIdentityKind::Default,
+                    columns: Vec::new(),
+                })),
+                Ok(DecodedMessage::Begin {
+                    final_lsn: PgLsn::new(10),
+                    timestamp: timestamp(10),
+                    xid: 7,
+                }),
+                Ok(DecodedMessage::Insert {
+                    relation_id: 42,
+                    generation: 1,
+                    new: Tuple { cells: Vec::new() },
+                }),
+                Ok(DecodedMessage::Insert {
+                    relation_id: 42,
+                    generation: 1,
+                    new: Tuple { cells: Vec::new() },
+                }),
+                Ok(DecodedMessage::Commit {
+                    commit_lsn: PgLsn::new(10),
+                    end_lsn: PgLsn::new(11),
+                    timestamp: timestamp(11),
+                    flags: 0,
+                }),
+            ]),
+            statuses: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut source = PgOutputTransactionSource::from_transport_with_observer(
+            transport,
+            spooling_assembler,
+            PgLsn::new(5),
+            None,
+            Some(Arc::<RecordingObserver>::clone(&observer)),
+        );
+
+        assert!(matches!(
+            source.next_transaction().await,
+            Err(PipelineError::Source(message))
+                if message.contains("AfterSpoolCommit") && message.contains("injected")
+        ));
+        assert_eq!(source.durable_applied_lsn(), PgLsn::new(5));
+        assert!(source.delivered_commits.is_empty());
+        assert_eq!(
+            *observer.points.lock().unwrap(),
+            [
+                SourceIngestPoint::AfterSourceRead,
+                SourceIngestPoint::AfterSourceRead,
+                SourceIngestPoint::AfterSourceRead,
+                SourceIngestPoint::AfterSourceRead,
+                SourceIngestPoint::AfterSourceRead,
+                SourceIngestPoint::AfterSpoolCommit,
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

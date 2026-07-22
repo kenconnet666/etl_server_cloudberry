@@ -1,13 +1,21 @@
 //! Opt-in durable chunk ledger coverage against Apache Cloudberry 2.1.
 
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use cloudberry_etl_core::{id::PipelineId, lsn::PgLsn};
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyError, DataChunkDisposition, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
+        ApplyError, DataChunkDisposition, LedgeredCommitKind, LedgeredCommitObserver,
+        LedgeredCommitPhase, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
         LedgeredEmptyTransactionOutcome, execute_ledgered_data_chunk,
-        execute_ledgered_empty_transaction, execute_register_manifest,
+        execute_ledgered_data_chunk_observed, execute_ledgered_empty_transaction,
+        execute_register_manifest,
     },
     checkpoint::{
         AdvanceOutcome, CheckpointError, CheckpointKey, NodeCheckpoint, PipelineFence,
@@ -243,9 +251,68 @@ async fn cloudberry21_chunk_ledger_replays_and_completes_exactly() -> Result<(),
     ));
     assert_eq!(ledger_counts(&client, multi_manifest.key).await?, (0, 0));
 
+    // Inject a real post-COMMIT error. The first call reports ambiguity even though the final
+    // receipt, checkpoint, and ledger retirement are durable; replay must classify the checkpoint
+    // and must not recreate ledger rows or execute DML.
+    let mut ambiguous_manifest = manifest.clone();
+    ambiguous_manifest.key.end_lsn = PgLsn::new(manifest.key.end_lsn.as_u64() + 4);
+    ambiguous_manifest.xid = 10;
+    ambiguous_manifest.record_count = 1;
+    ambiguous_manifest.manifest_digest = [0xE3; 32];
+    let ambiguous_request = LedgeredDataChunkRequest {
+        fence,
+        manifest: ambiguous_manifest.clone(),
+        chunk: chunk(0, 1, 0x71),
+        tables: Vec::new(),
+    };
+    let observer = FailOnceAfterFinalCommit::default();
+    assert!(matches!(
+        execute_ledgered_data_chunk_observed(&mut client, &ambiguous_request, &observer).await,
+        Err(ApplyError::CommitObserver(message)) if message == "injected post-commit disconnect"
+    ));
+    assert_eq!(
+        load_node_checkpoint(&client, checkpoint(&ambiguous_manifest).key)
+            .await?
+            .expect("ambiguous final commit must still publish its checkpoint")
+            .checkpoint,
+        checkpoint(&ambiguous_manifest)
+    );
+    assert_eq!(
+        ledger_counts(&client, ambiguous_manifest.key).await?,
+        (0, 0)
+    );
+    assert_eq!(
+        execute_ledgered_data_chunk(&mut client, &ambiguous_request).await?,
+        LedgeredDataChunkOutcome::AlreadyCheckpointed {
+            applied_lsn: ambiguous_manifest.key.end_lsn
+        }
+    );
+    assert_eq!(
+        ledger_counts(&client, ambiguous_manifest.key).await?,
+        (0, 0)
+    );
+
     cleanup(&client, fence.pipeline_id).await;
     connection_task.abort();
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct FailOnceAfterFinalCommit {
+    fired: AtomicBool,
+}
+
+impl LedgeredCommitObserver for FailOnceAfterFinalCommit {
+    fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String> {
+        if phase == LedgeredCommitPhase::AfterCommit
+            && kind == (LedgeredCommitKind::DataChunk { final_chunk: true })
+            && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            Err("injected post-commit disconnect".to_owned())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[tokio::test]

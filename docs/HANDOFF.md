@@ -4,8 +4,7 @@
 > （已删除）。每次换机或阶段推进后更新本文。
 
 **最后更新:** 2026-07-22
-**工作分支:** `codex/phase1-durable-cdc`（本地 ahead origin 20 commits，未 push）
-**最新 commit:** `ab2453e` Document Cloudberry image gap and WSL test workflow
+**工作分支:** `codex/phase1-durable-cdc`（以 `git status --short --branch` 为准）
 
 ## 换机快速开始
 
@@ -48,13 +47,14 @@ cargo test --workspace --lib
 - **1.1 Source keyset paging** ✅ `crates/source-postgres/src/snapshot.rs`：`read_canonical_pk_page`（`LIMIT+1` lookahead、typed `ROW(...)>ROW(...)`、`SnapshotKeyPage{has_more,next_key}`）、`read_canonical_row_page`、`copy_text_pk_range`。含真实 PG18 集成测试 `tests/snapshot_page_pg18.rs`（opt-in）。
 - **1.2 Target snapshot progress** ✅ `crates/target-cloudberry/src/snapshot/progress.rs`：`register_snapshot_table_progress`、`copy_snapshot_page`（COPY 与 cursor 同事务）、完整 CRUD SQL、V7 schema。
 - **1.4 Spool 自动清理** ✅ `crates/source-postgres/src/spool.rs`：`remove_superseded_generations` 在 `open` 时回收更低 generation 的目录，best-effort 非致命。
+- **故障注入边界** 🔶 source adapter 已暴露 fatal `AfterSourceRead` / `AfterSpoolCommit` observer；target ledger apply 已暴露 final/non-final chunk 与空事务的 commit 前后 observer。真实 Cloudberry ledger 测试会注入 final chunk 已提交但调用方收到错误，并验证 checkpoint fast path 不重放 DML。
 
 - **1.3 runtime 接入 bounded snapshot** ✅ `crates/engine/src/runtime/job.rs`：`load_table_snapshot` 按 PK page 循环（`read_canonical_pk_page` → `copy_range` → `copy_text_pk_range` → target `SnapshotPageLoader::apply_page` 同事务 cursor）；无 PK 表 fallback 整表 COPY。target 侧 `begin_snapshot_pages`/`SnapshotPageLoader`（`crates/target-cloudberry/src/snapshot.rs`）。含集成测试 `cloudberry21_snapshot_paging_with_resume`。**源侧 PK 分页已在真实 PG18 验证通过**。
 
 **未完成（下一位优先处理，按顺序）：**
 
 1. **1.4 补充按时间的 spool 清理（可选增强）。** 现在只按 generation 回收。若要"checkpoint 后保留 N 小时再删当前 generation 内已 retire 的 journal"，需在 `SpoolLimits`/config 增加 `retention` 字段并在 checkpoint 推进后调用。当前 ENOSPC → `RESOURCE_WAIT` 背压已就绪。
-2. **1.5 E2E kill-point 测试。** `tests/integration/` 下补半自动脚本，覆盖 5 个 kill 点：source read 后、spool write 后、target chunk commit 前、checkpoint commit 后/ACK 前、final chunk commit ambiguity。验证重启后数据最终一致（PK count + canonical digest）。
+2. **1.5 E2E kill-point 测试。** 将现有 typed observer 接入跨进程 harness，覆盖 5 个 kill 点：source read 后、spool write 后、target chunk commit 前、checkpoint commit 后/ACK 前、final chunk commit ambiguity。验证重启后数据最终一致（PK count + canonical digest）。target final chunk commit ambiguity 已有真实 Cloudberry 场景，剩余四个仍需跨进程证据。
 
 **Phase 1 退出条件：** 最大测试事务显著大于进程内存预算且内存保持水位内；上述 5 个 kill 点均收敛；磁盘 high-water 进入 `RESOURCE_WAIT`，扩容后继续且不触发 rebuild。
 

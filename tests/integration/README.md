@@ -6,17 +6,16 @@ This directory contains disposable database containers for integration testing.
 
 ### Basic PG18 + Cloudberry Environment
 
-Start the test environment:
+Start PostgreSQL 18:
 ```bash
 cd tests/integration
-docker compose up -d
-docker compose ps
+docker compose up -d pg18-source
 ```
 
-Wait for health checks:
+Build and start the runnable Cloudberry 2.1 single-node cluster:
 ```bash
-docker compose ps
-# Both containers should show "healthy"
+bash cloudberry/build-local-image.sh
+docker ps
 ```
 
 Connect to databases:
@@ -25,12 +24,13 @@ Connect to databases:
 psql "postgresql://postgres:pg2cb_test@127.0.0.1:55432/source"
 
 # Cloudberry 2.1 target
-psql "postgresql://postgres:pg2cb_test@127.0.0.1:55433/target"
+psql "postgresql://gpadmin@127.0.0.1:55433/target"
 ```
 
 Stop and clean up:
 ```bash
 docker compose down -v
+docker rm -f cbdb
 ```
 
 ## Container Details
@@ -38,15 +38,13 @@ docker compose down -v
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | pg18-source | postgres:18-alpine | 55432 | Source database with logical replication |
-| cloudberry-target | apache/cloudberry:2.1.0-incubating | 55433 | Target data warehouse |
+| Cloudberry 2.1 | locally built `cbdb-local:2.1.0` | 55433 | Target data warehouse |
 
-> **Cloudberry image caveat:** Apache Cloudberry 2.1 does not yet publish an
-> official ready-to-run server image on Docker Hub — only build/test environment
-> images exist (`apache/incubator-cloudberry:cbdb-build-*`). The
-> `cloudberry-target` image above is a placeholder; running target integration
-> tests requires a Cloudberry built from source or the upstream sandbox
-> `run.sh`, or a CI job that provisions one. The PG18 source service runs as-is
-> and all `source-postgres` `--ignored` integration tests pass against it.
+> **Cloudberry image caveat:** Apache Cloudberry 2.1 does not publish a
+> ready-to-run server image. `cloudberry/build-local-image.sh` installs the
+> official 2.1.0 EL9 RPM into Rocky Linux 9 and initializes a single-node demo
+> cluster with `gpinitsystem`. The `cloudberry-target` compose service remains a
+> historical placeholder and is not part of the supported startup path.
 
 ### Running integration tests (WSL)
 
@@ -79,9 +77,8 @@ cd citus
 
 ## Environment Variables
 
-Both containers use default test credentials:
-- Username: `postgres`
-- Password: `pg2cb_test`
-- Database: `source` (PG18), `target` (Cloudberry)
+Test credentials:
+- PostgreSQL 18: `postgres` / `pg2cb_test`, database `source`.
+- Cloudberry 2.1: `gpadmin`, database `target` (local trust authentication in the disposable cluster).
 
 **DO NOT use these credentials in production.**

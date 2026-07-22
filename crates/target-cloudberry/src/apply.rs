@@ -68,7 +68,45 @@ pub enum ApplyError {
     InvalidBatch(String),
     #[error("empty transaction apply received a manifest with {record_count} records")]
     NonEmptyManifest { record_count: u64 },
+    #[error("target commit observer failed: {0}")]
+    CommitObserver(String),
 }
+
+/// Durable transaction boundary exposed for fault injection and commit-latency instrumentation.
+///
+/// `AfterCommit` is intentionally observable even though returning an error from that point makes
+/// the commit result ambiguous to the caller. Replay must classify the durable checkpoint or
+/// chunk receipt instead of assuming the transaction rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgeredCommitPhase {
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgeredCommitKind {
+    DataChunk { final_chunk: bool },
+    EmptyTransaction,
+}
+
+pub trait LedgeredCommitObserver: Send + Sync {
+    fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String>;
+}
+
+#[derive(Debug)]
+struct NoopLedgeredCommitObserver;
+
+impl LedgeredCommitObserver for NoopLedgeredCommitObserver {
+    fn observe(
+        &self,
+        _phase: LedgeredCommitPhase,
+        _kind: LedgeredCommitKind,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+static NOOP_LEDGERED_COMMIT_OBSERVER: NoopLedgeredCommitObserver = NoopLedgeredCommitObserver;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceColumn {
@@ -247,6 +285,18 @@ pub async fn execute_ledgered_data_chunk(
     client: &mut Client,
     request: &LedgeredDataChunkRequest,
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    execute_ledgered_data_chunk_observed(client, request, &NOOP_LEDGERED_COMMIT_OBSERVER).await
+}
+
+/// Applies one ledgered chunk while observing its target commit boundary.
+///
+/// This is the deterministic fault-injection entry point used by recovery tests. Production
+/// callers normally use [`execute_ledgered_data_chunk`].
+pub async fn execute_ledgered_data_chunk_observed(
+    client: &mut Client,
+    request: &LedgeredDataChunkRequest,
+    observer: &dyn LedgeredCommitObserver,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
     validate_tables(&request.tables)?;
     let transaction = client.transaction().await?;
     let prepared = prepare_data_chunk(
@@ -268,6 +318,7 @@ pub async fn execute_ledgered_data_chunk(
                 request,
                 next_seq,
                 DataChunkDisposition::Applied { stats },
+                observer,
             )
             .await
         }
@@ -277,6 +328,7 @@ pub async fn execute_ledgered_data_chunk(
                 request,
                 next_seq,
                 DataChunkDisposition::AlreadyCommitted,
+                observer,
             )
             .await
         }
@@ -286,6 +338,7 @@ pub async fn execute_ledgered_data_chunk(
                 request,
                 next_seq,
                 DataChunkDisposition::ResumeAt,
+                observer,
             )
             .await
         }
@@ -301,6 +354,21 @@ pub async fn execute_ledgered_empty_transaction(
     client: &mut Client,
     fence: PipelineFence,
     manifest: &TransactionChunkManifest,
+) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
+    execute_ledgered_empty_transaction_observed(
+        client,
+        fence,
+        manifest,
+        &NOOP_LEDGERED_COMMIT_OBSERVER,
+    )
+    .await
+}
+
+pub async fn execute_ledgered_empty_transaction_observed(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+    observer: &dyn LedgeredCommitObserver,
 ) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
     if manifest.record_count != 0 {
         return Err(ApplyError::NonEmptyManifest {
@@ -319,7 +387,7 @@ pub async fn execute_ledgered_empty_transaction(
             let checkpoint = manifest.node_checkpoint();
             let checkpoint =
                 complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;
-            transaction.commit().await?;
+            commit_observed(transaction, observer, LedgeredCommitKind::EmptyTransaction).await?;
             Ok(LedgeredEmptyTransactionOutcome::Completed { checkpoint })
         }
         ProgressRegistration::Existing { next_seq } => Err(ApplyError::ChunkLedger(
@@ -336,6 +404,7 @@ async fn finish_ledgered_data_chunk(
     request: &LedgeredDataChunkRequest,
     next_seq: u64,
     disposition: DataChunkDisposition,
+    observer: &dyn LedgeredCommitObserver,
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
     if next_seq > request.manifest.record_count {
         return Err(ApplyError::ChunkLedger(
@@ -351,7 +420,12 @@ async fn finish_ledgered_data_chunk(
         let checkpoint = request.manifest.node_checkpoint();
         let checkpoint =
             complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;
-        transaction.commit().await?;
+        commit_observed(
+            transaction,
+            observer,
+            LedgeredCommitKind::DataChunk { final_chunk: true },
+        )
+        .await?;
         return Ok(LedgeredDataChunkOutcome::Completed {
             next_seq,
             disposition,
@@ -360,7 +434,12 @@ async fn finish_ledgered_data_chunk(
     }
 
     if matches!(disposition, DataChunkDisposition::Applied { .. }) {
-        transaction.commit().await?;
+        commit_observed(
+            transaction,
+            observer,
+            LedgeredCommitKind::DataChunk { final_chunk: false },
+        )
+        .await?;
     } else {
         transaction.rollback().await?;
     }
@@ -368,6 +447,20 @@ async fn finish_ledgered_data_chunk(
         next_seq,
         disposition,
     })
+}
+
+async fn commit_observed(
+    transaction: Transaction<'_>,
+    observer: &dyn LedgeredCommitObserver,
+    kind: LedgeredCommitKind,
+) -> Result<(), ApplyError> {
+    observer
+        .observe(LedgeredCommitPhase::BeforeCommit, kind)
+        .map_err(ApplyError::CommitObserver)?;
+    transaction.commit().await?;
+    observer
+        .observe(LedgeredCommitPhase::AfterCommit, kind)
+        .map_err(ApplyError::CommitObserver)
 }
 
 /// Durably registers an immutable manifest without applying a data chunk.
