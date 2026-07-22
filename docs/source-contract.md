@@ -29,11 +29,13 @@
 - publication 输出 insert、update、delete、truncate；其中 TRUNCATE 默认触发重建，而不是直接清空目标。
 - partitioned table 使用 `publish_via_partition_root=true`，保证 WAL relation identity 与逻辑父表映射一致，且不能同时把叶子表作为另一个逻辑对象重复发布。
 - 存在 supported stored generated column 时使用 PostgreSQL 18 的 `publish_generated_columns=stored`，并在预检中用真实变更证明 pgoutput 携带目标所需值。
-- replication connection 开启 logical messages；DDL notice prefix 固定为 `pg2cloudberry_ddl_v1`。
+- replication connection 开启 logical messages；当前 DDL notice 使用
+  `pg2cloudberry_ddl_v2`/payload version 2；consumer 继续解码 legacy
+  `pg2cloudberry_ddl_v1`/version 1，并一律按未知能力进入受影响表重拉。
 - 源端时区、`DateStyle`、`IntervalStyle`、`bytea_output` 和 extra float digits 由连接初始化固定，不依赖用户默认值。
 - `pg2cb_meta`、Citus metadata 和 PostgreSQL system schema 永远排除在 publication 与快照之外。
 
-服务安装的 event trigger 只发 transactional logical message 并维护 schema identity，不保存业务行。不得解析 `current_query()` 来重放 DDL；DDL 真相来自提交后的 `pg_catalog` snapshot。
+服务安装的 event trigger 只发 transactional logical message 并维护 schema identity，不保存业务行。不得解析 `current_query()` 来重放 DDL。v2 在 `ddl_command_end` 捕获有序 typed after-schema（stable attnum、类型/typmod、nullability、generated/identity、collation、default、PK、partition），DROP 在 `sql_drop` 捕获对象身份。一个事务有多条 DDL 时，中间快照用于解释 WAL 内 schema 演化，只把每个 relation 的最后状态与提交后 `pg_catalog` 对齐；不能要求所有中间状态都等于最终 catalog。
 
 ## 拓扑模式
 
@@ -163,7 +165,7 @@ Binary(bytes)    pgoutput binary encoding，按已验证类型解析
 
 ## DDL 分类
 
-每个 DDL notice 触发 catalog rescan。schema fingerprint 是列顺序、类型身份/typmod、nullability、generated 属性、key、partition 和 Citus distribution 的规范化 hash。
+每个已提交 DDL 事务触发一次有序规划。consumer 按事务内 message ordinal 保留 v2 快照，以每个 relation 的最后 after-schema/fingerprint 对提交后 catalog 做 rapid-DDL 防竞态校验，再与当前 binding 的 before-schema 比较。schema fingerprint 覆盖列顺序、类型身份/typmod、nullability、generated 属性、key 和 partition；Citus distribution/dependency closure 由提交后的 catalog planner 补齐。
 
 ### 在线跟随候选
 

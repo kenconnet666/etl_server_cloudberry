@@ -1,8 +1,9 @@
 //! Durable schema-event ledger access for Phase 2 tight DDL follow.
 //!
-//! Each source DDL that touches a managed relation is recorded in
+//! Each committed source transaction that contains managed DDL is recorded in
 //! `pg2cb_meta.schema_events` (migration V8) keyed by `(pipeline_id, source_lsn,
-//! source_xid)` so replayed WAL is idempotent. The engine records an event as
+//! source_xid)` so replayed WAL is idempotent. Ordered DDL messages share one event payload,
+//! matching PostgreSQL's commit boundary. The engine records an event as
 //! `Pending`, drives it through `InTransition`, then `Completed`/`Failed`; a
 //! restart lists unfinished events in source-LSN order and resumes them. This
 //! module owns the typed CRUD and the state-transition guards; it never advances

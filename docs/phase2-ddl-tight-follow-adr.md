@@ -1,177 +1,103 @@
-# Phase 2: DDL 紧密跟随设计(ADR)
+# Phase 2: DDL 紧密跟随实施设计
 
-> 状态:设计中。本文档规划 DDL 事件 v2、table-level transition 和 dynamic binding registry 的实现路径。
+> 状态：进行中。权威架构决策见 `adr/0005-online-schema-evolution.md`；本文记录当前代码、下一里程碑和验收顺序。
 
-## 目标
+## 目标与不变量
 
-普通 DDL(ADD COLUMN、DROP COLUMN、RENAME、widening 等)不再触发全量 pipeline rebuild,而是 table-level shadow reload + catch-up + cutover,实现在线 schema evolution。
+普通 DDL 不再触发整条 pipeline rebuild。只有能够证明安全的变更才原地跟随；其他变更自动重拉受影响 table 或共享依赖 closure。slot/WAL、source identity 或 topology coverage 失真时才允许整 pipeline rebuild。
 
-## 当前机制(Phase 1)
+PostgreSQL 源事务是 schema event 的原子边界。一个事务内可以有多条 DDL 和 DML，target checkpoint/ACK 不能越过未完成的 schema event，但其他 table 可以继续进入有界 spool 或 apply。
 
-1. source `ddl.rs` event trigger 发出 `pg2cloudberry_ddl_v1` 消息
-2. engine adapter 检查 `requires_barrier(DdlMessage)` → 返回 `SchemaBarrier` error
-3. runtime job 捕获 error,调用 `request_pipeline_rebuild` → 全量 snapshot 重做
+## 已落地基础
 
-退出条件:pipeline 停止 → snapshot → activation。DDL 期间停服。
+- DDL 分类、schema diff、`TransitionKind` 和保守 online-safe 判定。
+- target V8 `pg2cb_meta.schema_events` ledger，状态为 `pending -> in_transition -> completed|failed`。
+- `TableBindingRegistry` 的 insert/remove/swap 与唯一 target/staging 不变量。
+- v2 source capture、legacy v1 解码、spool format v2 typed transition round-trip。
+- 真实 PG18 覆盖同事务 ADD、RENAME、varchar widening、DROP 的四个中间 after-schema，以及 CREATE/DROP TABLE。
 
-## Phase 2 架构
+## DDL Event v2
 
-### 1. DDL Event v2 Envelope
+当前 wire prefix/version 为 `pg2cloudberry_ddl_v2`/2。payload 包含：
 
-扩展 `DdlMessage`,增加:
-- `table_transitions: Vec<TableTransition>`:受影响表的 before/after schema + transition type
-- `schema_event_id: Uuid`:持久化 event 标识,支持 idempotent replay
-- `whitelisted_operations: Vec<DdlOp>`:已知安全的在线 DDL 类型
+- `command_tag`、`relation_ids`、`affected_schemas`、event fingerprint；
+- 每个持久 table-like relation 的 `relation_id`、after-fingerprint、typed after-schema；
+- CREATE TABLE 标记 `AddTable`；DROP TABLE 标记 `DropTable` 且没有 after-schema；
+- 其他 surviving table DDL 在 source 保持 `Unknown`，由 engine 用 bound before-schema 分类。
 
-`TableTransition`:
-```rust
-struct TableTransition {
-    relation_id: u32,
-    before_generation: u64,
-    after_generation: u64,
-    before_schema: TableSchema,  // 从 WAL 前 snapshot 捕获
-    after_schema: TableSchema,   // DDL 后立即 catalog 快照
-    transition_type: TransitionType,
-}
+typed after-schema 覆盖 relation name/kind、replica identity、stable attnum、列名、类型 OID/name/kind/typmod、nullability、generated/identity、collation、default、PK 和 partition attnum。它刻意低于完整 `TableSchema`：domain/enum/array、Citus 属性、依赖 closure 和 target capability 由提交后的 catalog planner 解析。
 
-enum TransitionType {
-    AddColumn { nullable: bool, has_default: bool },
-    DropColumn,
-    RenameColumn { old_name: String, new_name: String },
-    AlterType { widening: bool },  // widening=true 表示兼容(int4->int8)
-    AddTable,  // 新表自动准入
-    DropTable, // → quarantine
-}
-```
+v1 prefix/version 继续解码，但缺少 typed after-schema，必须进入受影响 scope 的 shadow reload，不能猜测在线能力。
 
-### 2. 持久化 Schema Event
+## 事务级规划
 
-新表 `pg2cb_meta.schema_events`:
-```sql
-CREATE TABLE schema_events (
-    event_id UUID PRIMARY KEY,
-    pipeline_id UUID NOT NULL,
-    source_lsn PG_LSN NOT NULL,
-    source_xid BIGINT NOT NULL,
-    command_tag TEXT NOT NULL,
-    table_transitions JSONB NOT NULL,  -- Vec<TableTransition> 序列化
-    whitelisted_operations JSONB NOT NULL,
-    emitted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at TIMESTAMPTZ,
-    state TEXT NOT NULL,  -- 'pending' | 'in_transition' | 'completed' | 'failed'
-    UNIQUE (pipeline_id, source_lsn, source_xid)
-);
-```
+`schema_events` 每个已提交 source transaction 只写一行，幂等键为 `(pipeline_id, source_lsn, source_xid)`；ordered DDL messages 及其 transitions 作为一个 JSON payload 持久化。这样与 PostgreSQL commit、target completion gap 和重复 WAL 的边界一致。
 
-用途:
-- DDL 到达时持久化 event,防止 process crash 丢失
-- `state='pending'` → runtime 启动时恢复未完成 transition
-- Idempotent replay:相同 LSN+xid 的 DDL 只处理一次
+planner 按以下顺序工作：
 
-### 3. Dynamic Binding Registry
+1. 按 transaction change ordinal 收集全部 DDL/TRUNCATE，并保留中间 after-schema。
+2. 对每个 relation 找到 terminal post-state；DROP 的 terminal state 是不存在。
+3. 事务提交后读取一次权威 catalog，要求 terminal state/fingerprint 对齐。中间快照不能逐条与最终 catalog 比较。
+4. 用 active binding 的 before-schema 与 terminal catalog schema 做 diff，并补齐类型、collation、partition、Citus 和依赖 closure。
+5. 将完整计划先写入 `schema_events.pending`，再选择 online apply、table/closure reload、quarantine 或 blocked retry。
 
-当前 `TableBindingRegistry` 是 run-scoped immutable `Arc<HashMap>`。Phase 2 改为:
-```rust
-pub struct DynamicBindingRegistry {
-    bindings: Arc<RwLock<HashMap<u32, Arc<TableBinding>>>>,
-    // relation_id → binding
-}
-```
+若 event terminal state 与 catalog 不一致，说明 rapid later DDL 已经越过当前事件。planner 必须按 LSN 顺序合并/重规划到可验证的最新 terminal state，不能把旧快照当当前 catalog，也不能提前 ACK。
 
-Row hot path:
-```rust
-// 读路径:shared lock,Arc clone
-let binding = registry.bindings.read().get(&relation_id).cloned();
+## Binding 发布
 
-// DDL transition:exclusive lock,swap Arc
-registry.bindings.write().insert(relation_id, new_binding);
-```
+Phase 2 的 standalone applier 仍是单序列数据路径，registry 只在 source transaction/table cutover 边界由 coordinator 可变更新，row hot path 不查 catalog。当前不引入每行 `RwLock`。
 
-DDL transition 期间旧 binding 的 Arc 仍被 inflight batches 持有,直到它们 commit 完成;新 rows 拿到新 binding。
+未来 Phase 3 并行 table applier 需要并发 binding 时，再通过基准和故障矩阵选择 `ArcSwap`/RCU 或短临界区锁；旧 binding 必须由 inflight batch 持有到 target commit 完成。
 
-### 4. Table-Level Transition 流程
+## Table Transition
 
-DDL 到达 → 不返回 `SchemaBarrier`,而是:
+保守默认流程：
 
-1. **Pause table**:该表的 CDC apply 进入 barrier 等待(spool 继续接收)
-2. **Persist event**:`schema_events` 插入 `state='pending'`
-3. **Shadow reload**:
-   - 复用 `begin_snapshot_pages` + bounded paging
-   - 用 DDL 后的 `after_schema` 创建新 shadow
-   - 从 source 当前 snapshot 全量重新加载(PK 一致性保证)
-4. **Catch-up**:从 spool 回放该表 barrier 后的 CDC changes(apply 到新 shadow)
-5. **Cutover**:
-   - 原子 RENAME:old_target → quarantine,shadow → target
-   - Swap binding registry:relation_id → new binding
-   - Resume CDC apply
-6. **Mark completed**:`state='completed'`
+1. 持久化 schema event 并建立该 table 的 completion barrier。
+2. 创建 pending generation 和 typed shadow。
+3. 复用 bounded `begin_snapshot_pages` 从新 source snapshot 重载。
+4. 从 barrier 后 spool 按 WAL 顺序 catch up 该 table。
+5. 执行 reconciliation；不一致继续重拉或 blocked retry，不能带差异 cutover。
+6. 一个 Cloudberry transaction 内校验 fence，旧表进入 quarantine，shadow 激活，metadata/generation 切换。
+7. target commit 成功后发布新 binding，完成 event 和 completion gap；随后才推进 checkpoint/ACK。
 
-崩溃恢复:runtime 启动时扫描 `state='pending'|'in_transition'`,按 LSN 顺序重放。
+崩溃恢复按 source LSN 加载 `pending|in_transition`，检查 target metadata/物理对象后幂等继续。commit ambiguity 必须通过 ledger 和对象 identity 判定，不能盲目重做 RENAME。
 
-### 5. 在线 DDL 白名单
+## 在线候选与 fallback
 
-初版只支持安全操作:
-- `ADD COLUMN ... DEFAULT NULL` 或 `NOT NULL DEFAULT <literal>`(no rewrite)
-- `DROP COLUMN`(target 侧忽略该列,source 继续发送旧 schema 直到 cutover)
-- `RENAME COLUMN`(binding plan 更新列名映射)
-- `ALTER TYPE` widening(int4→int8,varchar(10)→varchar(20))
-- `ADD TABLE`(新表自动准入,复用 snapshot 路径)
+在线候选逐项开放：nullable/defaulted ADD COLUMN、DROP/RENAME COLUMN、SET/DROP DEFAULT、经过数据验证的 nullability、明确白名单 widening、enum append。每项都需要真实 Cloudberry 2.1 capability test、target DDL 幂等证明和 crash matrix。
 
-不支持(仍 fail-closed):
-- `ALTER TYPE` narrowing 或不兼容转换
-- `ADD CONSTRAINT`(需要 validation scan)
-- Partition DDL(Phase 4)
-- Citus distribution key 变更(Phase 4)
+PK/distribution/collation 改变、不兼容类型、generated/partition/table kind、TRUNCATE、复杂同事务 shape、v1 event 或任何未知条件走 table/closure shadow reload。DROP TABLE 进入 quarantine；CREATE TABLE 走准入、snapshot、catch-up、activation。
 
-### 6. DROP 与 Quarantine
+## 里程碑
 
-`DROP TABLE` → 不立即删除 target,而是:
-1. target table RENAME 到 `pg2cb_quarantine.<uuid>`
-2. Binding registry 移除该表
-3. 后续 CDC 忽略该 relation_id
-4. 周期性 GC:保留 `quarantine_retention` 天后物理删除
+### M1：v2 捕获和传输（已完成）
 
-用户可手动 `SELECT * FROM pg2cb_quarantine.<uuid>` 救回数据。
+- [x] source v2 typed after-schema 和 v1 compatibility
+- [x] spool v2 完整 round-trip、格式升级恢复证明、typed DDL memory spill
+- [x] 同事务多 DDL、CREATE/DROP 的真实 PG18 测试
 
-## 实现路径
+### M2：事务 planner 和 ledger 接入（下一步）
 
-### Milestone 1: DDL Event v2 + 持久化(本次会话)
-- [ ] source `ddl.rs` 增强:emit v2 envelope with `TableTransition`
-- [ ] target migration 添加 `schema_events` 表
-- [ ] engine 解析 v2,持久化到 `schema_events`
-- [ ] 单测:v2 envelope 序列化/反序列化
+- [ ] terminal-state catalog validation 和 rapid-DDL 合并规则
+- [ ] before/after diff、依赖 closure、事务级 `schema_events` record/replay
+- [ ] table completion barrier，替换普通 DDL 的 pipeline rebuild 分支
 
-### Milestone 2: Dynamic Binding Registry
-- [ ] 重构 `TableBindingRegistry` → `Arc<RwLock<HashMap>>`
-- [ ] Hot path benchmark:验证 RwLock 读性能
-- [ ] Transition API:`registry.swap_binding(relation_id, new_binding)`
+### M3：shadow reload 和 cutover
 
-### Milestone 3: Shadow Reload + Cutover
-- [ ] Table barrier 机制(spool 继续,apply 等待)
-- [ ] Shadow reload 复用 `begin_snapshot_pages`
-- [ ] Catch-up from spool
-- [ ] 原子 cutover(RENAME + registry swap)
+- [ ] bounded table snapshot、spool catch-up、reconciliation
+- [ ] quarantine/activation/binding swap 的 fence 与 commit ambiguity 恢复
+- [ ] DROP quarantine 和新表自动准入
 
-### Milestone 4: 白名单 + E2E
-- [ ] `ADD COLUMN` transition handler
-- [ ] `DROP COLUMN` transition handler
-- [ ] Integration test:DDL + concurrent DML
-- [ ] Crash recovery test
+### M4：在线白名单和生产矩阵
 
-## 风险与 Tradeoff
+- [ ] 逐项 Cloudberry 2.1 online handler
+- [ ] 并发 DML+DDL、同事务 DML/多 DDL、rapid DDL、rename/drop/recreate
+- [ ] process kill、重复 WAL、target commit ambiguity、RESOURCE_WAIT、soak
 
-**风险**:
-- Dynamic binding 引入 RwLock 争用(hot path 读锁)
-- Shadow reload + catch-up 期间表双写(target 负载增加)
-- Cutover RENAME 不是真正的 MVCC(短暂锁表)
+## Phase 2 退出条件
 
-**Tradeoff**:
-- Phase 2 只支持白名单 DDL;复杂 DDL 仍 fail-closed 或手动 rebuild
-- Quarantine 机制增加存储开销
-- 需要额外 metadata 表(`schema_events`)
-
-## 退出条件
-
-- 并发 DML + DDL 矩阵通过(ADD/DROP/RENAME COLUMN)
-- 同事务多次 DDL、rapid DDL、process crash + replay 测试通过
-- 普通 DDL 不调用 `request_pipeline_rebuild`
+- 上述真实 PG18 -> Cloudberry 2.1 矩阵最终逐行/schema 一致。
+- 普通 DDL 不调用 `request_pipeline_rebuild`；不安全变更只重拉受影响 table/closure。
+- checkpoint/ACK 永不越过未完成 schema event，重启能从 target ledger 幂等恢复。
+- row hot path 保持无 catalog 查询且资源有界，旧整 pipeline DDL 路径只保留给全局正确性损坏。

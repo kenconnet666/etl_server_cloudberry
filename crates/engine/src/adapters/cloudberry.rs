@@ -1300,6 +1300,7 @@ mod tests {
                 after_generation: Some(2),
                 before_fingerprint: Some("before".to_owned()),
                 after_fingerprint: Some("after".to_owned()),
+                after_schema: None,
                 kind: TransitionKind::AddColumn {
                     name: "note".to_owned(),
                     nullable_or_defaulted: true,
@@ -1326,6 +1327,7 @@ mod tests {
                 after_generation: Some(2),
                 before_fingerprint: Some("before".to_owned()),
                 after_fingerprint: Some("after".to_owned()),
+                after_schema: None,
                 kind: TransitionKind::Unknown,
             }],
         })]);

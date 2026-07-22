@@ -4,7 +4,12 @@
 //! command-end trigger covers ordinary DDL, while the sql-drop trigger covers objects that no
 //! longer exist by the time the command completes.
 
-use cloudberry_etl_core::change::{DdlMessage, TableTransition, TransitionKind};
+use std::collections::HashSet;
+
+use cloudberry_etl_core::{
+    change::{DdlMessage, RelationSchemaSnapshot, TableTransition, TransitionKind},
+    schema::validate_identifier,
+};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
@@ -13,11 +18,13 @@ use crate::{
     sql::{quote_identifier, quote_literal},
 };
 
-pub const DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v1";
-pub const DDL_MESSAGE_VERSION: u16 = 1;
-/// Marker stored on both event triggers and their functions. Bumped to v5 when
-/// the command-end trigger began emitting per-relation `relation_fingerprints`.
-pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v5";
+pub const DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v2";
+pub const DDL_MESSAGE_VERSION: u16 = 2;
+const LEGACY_DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v1";
+const LEGACY_DDL_MESSAGE_VERSION: u16 = 1;
+/// Marker stored on both event triggers and their functions. Bumped to v6 when the command-end
+/// trigger began emitting typed per-relation after-schema snapshots in the v2 envelope.
+pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v6";
 pub const CANONICAL_DDL_TRIGGER_NAME: &str = "pg2cb_ddl_command_end";
 
 #[derive(Debug, Clone)]
@@ -76,43 +83,65 @@ impl DdlInstallSpec {
         self.validate()?;
         let schema = quote_identifier(&self.metadata_schema)?;
         let snapshot = quote_identifier("schema_snapshot")?;
-        let fingerprint = quote_identifier("schema_fingerprint")?;
         let worker_guard = self.worker_guard_sql();
 
         let schema_snapshot = r#"
     SELECT jsonb_build_object(
-        'relation_id', c.oid::text,
-        'schema', n.nspname,
-        'name', c.relname,
-        'relkind', c.relkind::text,
+        'relation_id', c.oid::bigint,
+        'name', jsonb_build_object('schema', n.nspname, 'name', c.relname),
+        'relation_kind', c.relkind::text,
         'replica_identity', c.relreplident::text,
         'columns', COALESCE((
             SELECT jsonb_agg(jsonb_build_object(
                 'attnum', a.attnum,
                 'name', a.attname,
-                'type_oid', a.atttypid::text,
+                'type_oid', a.atttypid::bigint,
+                'type_name', jsonb_build_object(
+                    'schema', type_namespace.nspname,
+                    'name', type_definition.typname
+                ),
+                'type_kind', type_definition.typtype::text,
                 'type_modifier', a.atttypmod,
-                'not_null', a.attnotnull,
+                'nullable', NOT a.attnotnull,
                 'generated', a.attgenerated::text,
-                'identity', a.attidentity::text
+                'identity', a.attidentity::text,
+                'collation', CASE WHEN collation_definition.oid IS NULL THEN NULL ELSE
+                    jsonb_build_object(
+                        'schema', collation_namespace.nspname,
+                        'name', collation_definition.collname
+                    )
+                END,
+                'default_expression', pg_get_expr(default_value.adbin, default_value.adrelid)
             ) ORDER BY a.attnum)
             FROM pg_attribute a
+            JOIN pg_type type_definition ON type_definition.oid = a.atttypid
+            JOIN pg_namespace type_namespace
+              ON type_namespace.oid = type_definition.typnamespace
+            LEFT JOIN pg_attrdef default_value
+              ON default_value.adrelid = a.attrelid AND default_value.adnum = a.attnum
+            LEFT JOIN pg_collation collation_definition
+              ON collation_definition.oid = a.attcollation AND a.attcollation <> 0
+            LEFT JOIN pg_namespace collation_namespace
+              ON collation_namespace.oid = collation_definition.collnamespace
             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
         ), '[]'::jsonb),
         'primary_key', COALESCE((
-            SELECT to_jsonb(i.indkey::text)
+            SELECT to_jsonb(i.indkey::int2[])
             FROM pg_index i
             WHERE i.indrelid = c.oid AND i.indisprimary
-        ), 'null'::jsonb),
+              AND i.indisvalid AND i.indisready AND i.indimmediate
+        ), '[]'::jsonb),
         'partition_key', COALESCE((
-            SELECT to_jsonb(p.partattrs::text)
+            SELECT to_jsonb(p.partattrs::int2[])
             FROM pg_partitioned_table p
             WHERE p.partrelid = c.oid
-        ), 'null'::jsonb)
+        ), '[]'::jsonb)
     )
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.oid = target_oid;
+    WHERE c.oid = target_oid
+      AND c.relkind IN ('r', 'p', 'f')
+      AND c.relpersistence = 'p';
 "#
         .to_owned();
 
@@ -127,7 +156,7 @@ DECLARE
     relation_ids oid[];
     affected_schemas text[];
     fingerprint text;
-    relation_fingerprints jsonb;
+    table_transitions jsonb;
     payload jsonb;
 BEGIN
     -- DROP is emitted by the sql_drop trigger below. This prevents one logical DDL event from
@@ -150,10 +179,16 @@ BEGIN
       INTO commands
       FROM pg_event_trigger_ddl_commands();
 
-    SELECT COALESCE(array_agg(objid ORDER BY objid), '{{}}'::oid[])
+    SELECT COALESCE(array_agg(relation_id ORDER BY relation_id), '{{}}'::oid[])
       INTO relation_ids
-      FROM pg_event_trigger_ddl_commands()
-     WHERE classid = 'pg_class'::regclass;
+      FROM (
+          SELECT DISTINCT command.objid AS relation_id
+            FROM pg_event_trigger_ddl_commands() command
+            JOIN pg_class relation ON relation.oid = command.objid
+           WHERE command.classid = 'pg_class'::regclass
+             AND relation.relkind IN ('r', 'p', 'f')
+             AND relation.relpersistence = 'p'
+      ) relations;
 
     SELECT COALESCE(array_agg(DISTINCT affected_schema ORDER BY affected_schema), '{{}}'::text[])
       INTO affected_schemas
@@ -166,28 +201,31 @@ BEGIN
       ) objects
      WHERE affected_schema IS NOT NULL AND affected_schema <> '';
 
-    SELECT md5(COALESCE(
-        (SELECT jsonb_agg({schema}.{fingerprint}(objid) ORDER BY objid)::text
-           FROM pg_event_trigger_ddl_commands()
-          WHERE classid = 'pg_class'::regclass),
-        '[]')) INTO fingerprint;
-    -- Per-relation after-DDL fingerprints so a consumer can tell exactly which managed
-    -- relations changed and to what shape, without re-reading the source catalog. Distinct
-    -- relation oids only; the engine pairs each with its own before-schema to classify.
-    SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
-        'relation_id', objid::text,
-        'fingerprint', {schema}.{fingerprint}(objid)
-    )), '[]'::jsonb)
-      INTO relation_fingerprints
-      FROM pg_event_trigger_ddl_commands()
-     WHERE classid = 'pg_class'::regclass;
+    -- Capture each table's post-command catalog shape inside the DDL transaction. Messages remain
+    -- ordered in WAL. After commit, the consumer validates only the terminal post-state for each
+    -- relation against pg_catalog; earlier snapshots describe intermediate shapes in a multi-DDL
+    -- transaction and cannot all equal the final catalog.
+    WITH snapshots AS (
+        SELECT relation_id, {schema}.{snapshot}(relation_id) AS after_schema
+          FROM unnest(relation_ids) AS relation_id
+    )
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'relation_id', relation_id::text,
+        'after_fingerprint', md5(after_schema::text),
+        'after_schema', after_schema,
+        'kind', CASE WHEN TG_TAG LIKE 'CREATE TABLE%' THEN 'add_table' ELSE 'unknown' END
+    ) ORDER BY relation_id), '[]'::jsonb)
+      INTO table_transitions
+      FROM snapshots
+     WHERE after_schema IS NOT NULL;
+    fingerprint := md5(table_transitions::text);
     payload := jsonb_build_object(
         'version', {version},
         'command_tag', TG_TAG,
         'relation_ids', to_jsonb(ARRAY(SELECT value::text FROM unnest(relation_ids) AS value)),
         'affected_schemas', to_jsonb(affected_schemas),
         'schema_fingerprint', fingerprint,
-        'relation_fingerprints', relation_fingerprints,
+        'table_transitions', table_transitions,
         'commands', commands
     );
 
@@ -199,7 +237,7 @@ END;
 "#,
             worker_guard = worker_guard,
             schema = schema,
-            fingerprint = fingerprint,
+            snapshot = snapshot,
             version = DDL_MESSAGE_VERSION,
             prefix = DDL_MESSAGE_PREFIX,
         );
@@ -211,6 +249,7 @@ DECLARE
     relation_ids oid[];
     affected_schemas text[];
     fingerprint text;
+    table_transitions jsonb;
     payload jsonb;
 BEGIN
     IF current_setting('pg2cb.internal_ddl', true) = 'on' THEN
@@ -261,12 +300,19 @@ BEGIN
      WHERE affected_schema IS NOT NULL AND affected_schema <> '';
 
     fingerprint := md5(dropped::text);
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'relation_id', relation_id::text,
+        'kind', 'drop_table'
+    ) ORDER BY relation_id), '[]'::jsonb)
+      INTO table_transitions
+      FROM unnest(relation_ids) AS relation_id;
     payload := jsonb_build_object(
         'version', {version},
         'command_tag', TG_TAG,
         'relation_ids', to_jsonb(ARRAY(SELECT value::text FROM unnest(relation_ids) AS value)),
         'affected_schemas', to_jsonb(affected_schemas),
         'schema_fingerprint', fingerprint,
+        'table_transitions', table_transitions,
         'commands', dropped
     );
 
@@ -677,6 +723,10 @@ struct DdlEnvelope {
     /// event conservatively.
     #[serde(default)]
     relation_fingerprints: Vec<RelationFingerprint>,
+    /// Typed v2 per-table post-command snapshots. Empty is valid for database-wide DDL such as
+    /// ALTER PUBLICATION, whose scope must remain fail-closed.
+    #[serde(default)]
+    table_transitions: Vec<TableTransitionEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,37 +735,50 @@ struct RelationFingerprint {
     fingerprint: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TableTransitionEnvelope {
+    relation_id: serde_json::Value,
+    #[serde(default)]
+    after_fingerprint: Option<String>,
+    #[serde(default)]
+    after_schema: Option<RelationSchemaSnapshot>,
+    #[serde(default = "unknown_transition_kind")]
+    kind: String,
+}
+
+fn unknown_transition_kind() -> String {
+    "unknown".to_owned()
+}
+
+#[must_use]
+pub fn is_ddl_message_prefix(prefix: &str) -> bool {
+    matches!(prefix, DDL_MESSAGE_PREFIX | LEGACY_DDL_MESSAGE_PREFIX)
+}
+
 pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessage> {
-    if prefix != DDL_MESSAGE_PREFIX {
-        return Err(SourceError::Ddl(format!(
-            "unknown DDL message prefix `{prefix}`"
-        )));
-    }
+    let expected_version = match prefix {
+        DDL_MESSAGE_PREFIX => DDL_MESSAGE_VERSION,
+        LEGACY_DDL_MESSAGE_PREFIX => LEGACY_DDL_MESSAGE_VERSION,
+        _ => {
+            return Err(SourceError::Ddl(format!(
+                "unknown DDL message prefix `{prefix}`"
+            )));
+        }
+    };
     let envelope: DdlEnvelope = serde_json::from_slice(payload)?;
-    if envelope.version != DDL_MESSAGE_VERSION {
+    if envelope.version != expected_version {
         return Err(SourceError::Ddl(format!(
-            "unsupported DDL message version {}",
-            envelope.version
+            "DDL message prefix `{prefix}` does not match payload version {}",
+            envelope.version,
         )));
     }
-    let relation_ids = envelope
+    let mut relation_ids = envelope
         .relation_ids
         .into_iter()
-        .map(|value| {
-            let text = match value {
-                serde_json::Value::String(value) => value,
-                serde_json::Value::Number(value) => value.to_string(),
-                other => {
-                    return Err(SourceError::Ddl(format!(
-                        "invalid relation OID JSON value `{other}` in DDL message"
-                    )));
-                }
-            };
-            text.parse::<u32>().map_err(|_| {
-                SourceError::Ddl(format!("invalid relation OID `{text}` in DDL message"))
-            })
-        })
+        .map(|value| parse_relation_id(value, "DDL message"))
         .collect::<SourceResult<Vec<_>>>()?;
+    relation_ids.sort_unstable();
+    relation_ids.dedup();
     if envelope.command_tag.is_empty() || envelope.schema_fingerprint.is_empty() {
         return Err(SourceError::Ddl(
             "DDL message has an empty command tag or fingerprint".to_owned(),
@@ -726,26 +789,51 @@ pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessa
     // after side. The source event trigger fires at command-end and cannot observe
     // the pre-DDL shape, so `kind` stays Unknown here; the engine refines it by
     // diffing against the relation's bound before-schema (classify_relation_diff).
-    let transitions = envelope
-        .relation_fingerprints
-        .into_iter()
-        .map(|relation| {
-            let relation_id = relation.relation_id.parse::<u32>().map_err(|_| {
-                SourceError::Ddl(format!(
-                    "invalid relation OID `{}` in DDL relation_fingerprints",
-                    relation.relation_id
-                ))
-            })?;
-            Ok(TableTransition {
-                relation_id,
-                before_generation: None,
-                after_generation: None,
-                before_fingerprint: None,
-                after_fingerprint: Some(relation.fingerprint),
-                kind: TransitionKind::Unknown,
+    let mut transitions = if expected_version == LEGACY_DDL_MESSAGE_VERSION {
+        envelope
+            .relation_fingerprints
+            .into_iter()
+            .map(|relation| {
+                let relation_id = relation.relation_id.parse::<u32>().map_err(|_| {
+                    SourceError::Ddl(format!(
+                        "invalid relation OID `{}` in DDL relation_fingerprints",
+                        relation.relation_id
+                    ))
+                })?;
+                Ok(TableTransition {
+                    relation_id,
+                    before_generation: None,
+                    after_generation: None,
+                    before_fingerprint: None,
+                    after_fingerprint: Some(relation.fingerprint),
+                    after_schema: None,
+                    kind: TransitionKind::Unknown,
+                })
             })
-        })
-        .collect::<SourceResult<Vec<_>>>()?;
+            .collect::<SourceResult<Vec<_>>>()?
+    } else {
+        envelope
+            .table_transitions
+            .into_iter()
+            .map(decode_table_transition)
+            .collect::<SourceResult<Vec<_>>>()?
+    };
+    transitions.sort_by_key(|transition| transition.relation_id);
+    let mut seen = HashSet::with_capacity(transitions.len());
+    for transition in &transitions {
+        if !seen.insert(transition.relation_id) {
+            return Err(SourceError::Ddl(format!(
+                "DDL message repeats transition for relation {}",
+                transition.relation_id
+            )));
+        }
+        if !relation_ids.contains(&transition.relation_id) {
+            return Err(SourceError::Ddl(format!(
+                "DDL transition relation {} is absent from relation_ids",
+                transition.relation_id
+            )));
+        }
+    }
     Ok(DdlMessage {
         version: envelope.version,
         command_tag: envelope.command_tag,
@@ -754,6 +842,101 @@ pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessa
         schema_fingerprint: envelope.schema_fingerprint,
         transitions,
     })
+}
+
+fn parse_relation_id(value: serde_json::Value, context: &str) -> SourceResult<u32> {
+    let text = match value {
+        serde_json::Value::String(value) => value,
+        serde_json::Value::Number(value) => value.to_string(),
+        other => {
+            return Err(SourceError::Ddl(format!(
+                "invalid relation OID JSON value `{other}` in {context}"
+            )));
+        }
+    };
+    text.parse::<u32>()
+        .map_err(|_| SourceError::Ddl(format!("invalid relation OID `{text}` in {context}")))
+}
+
+fn decode_table_transition(wire: TableTransitionEnvelope) -> SourceResult<TableTransition> {
+    let relation_id = parse_relation_id(wire.relation_id, "DDL table transition")?;
+    let kind = match wire.kind.as_str() {
+        "unknown" => TransitionKind::Unknown,
+        "add_table" => TransitionKind::AddTable,
+        "drop_table" => TransitionKind::DropTable,
+        other => {
+            return Err(SourceError::Ddl(format!(
+                "unknown DDL table transition kind `{other}`"
+            )));
+        }
+    };
+    if wire.after_fingerprint.as_deref().is_some_and(str::is_empty) {
+        return Err(SourceError::Ddl(
+            "DDL table transition has an empty after fingerprint".to_owned(),
+        ));
+    }
+    if let Some(snapshot) = &wire.after_schema {
+        validate_relation_snapshot(snapshot, relation_id)?;
+        if wire.after_fingerprint.is_none() {
+            return Err(SourceError::Ddl(
+                "DDL table transition has after-schema without a fingerprint".to_owned(),
+            ));
+        }
+    } else if !matches!(kind, TransitionKind::DropTable) {
+        return Err(SourceError::Ddl(
+            "non-drop DDL table transition is missing after-schema".to_owned(),
+        ));
+    }
+    Ok(TableTransition {
+        relation_id,
+        before_generation: None,
+        after_generation: None,
+        before_fingerprint: None,
+        after_fingerprint: wire.after_fingerprint,
+        after_schema: wire.after_schema,
+        kind,
+    })
+}
+
+fn validate_relation_snapshot(
+    snapshot: &RelationSchemaSnapshot,
+    relation_id: u32,
+) -> SourceResult<()> {
+    if snapshot.relation_id != relation_id
+        || snapshot.relation_kind.len() != 1
+        || snapshot.replica_identity.len() != 1
+    {
+        return Err(SourceError::Ddl(format!(
+            "DDL after-schema identity does not match relation {relation_id}"
+        )));
+    }
+    let mut previous_attnum = 0_i16;
+    for column in &snapshot.columns {
+        validate_identifier(&column.name).map_err(|error| SourceError::Ddl(error.to_string()))?;
+        if column.attnum <= previous_attnum
+            || column.type_oid == 0
+            || column.type_kind.len() != 1
+            || column.generated.len() > 1
+            || column.identity.len() > 1
+        {
+            return Err(SourceError::Ddl(format!(
+                "DDL after-schema has invalid column facts for relation {relation_id}"
+            )));
+        }
+        previous_attnum = column.attnum;
+    }
+    if snapshot.primary_key.iter().any(|attnum| {
+        *attnum <= 0
+            || !snapshot
+                .columns
+                .iter()
+                .any(|column| column.attnum == *attnum)
+    }) {
+        return Err(SourceError::Ddl(format!(
+            "DDL after-schema has an invalid primary key for relation {relation_id}"
+        )));
+    }
+    Ok(())
 }
 
 fn canonicalize_schemas(mut schemas: Vec<String>) -> SourceResult<Vec<String>> {
@@ -800,6 +983,9 @@ mod tests {
         assert!(sql.contains("TG_TAG LIKE 'DROP %'"));
         assert!(sql.contains("to_regclass('pg_catalog.pg_dist_node')"));
         assert!(sql.contains("current_setting('pg2cb.internal_ddl', true)"));
+        assert!(sql.contains("'table_transitions', table_transitions"));
+        assert!(sql.contains("'default_expression'"));
+        assert!(sql.contains(DDL_MESSAGE_PREFIX));
         assert!(sql.contains(DDL_CAPTURE_MARKER));
         assert!(sql.contains("COMMENT ON FUNCTION"));
         assert!(!sql.contains("current_query"));
@@ -808,14 +994,16 @@ mod tests {
     #[test]
     fn decoder_rejects_unknown_prefix_and_version() {
         assert!(decode_ddl_message("other", b"{}").is_err());
-        let payload = br#"{"version":2,"command_tag":"ALTER TABLE","schema_fingerprint":"x"}"#;
+        let payload = br#"{"version":1,"command_tag":"ALTER TABLE","schema_fingerprint":"x"}"#;
         assert!(decode_ddl_message(DDL_MESSAGE_PREFIX, payload).is_err());
+        let payload = br#"{"version":2,"command_tag":"ALTER TABLE","schema_fingerprint":"x"}"#;
+        assert!(decode_ddl_message(LEGACY_DDL_MESSAGE_PREFIX, payload).is_err());
     }
 
     #[test]
     fn decoder_maps_relation_ids_and_canonicalizes_schemas() {
         let payload = br#"{"version":1,"command_tag":"ALTER TABLE","relation_ids":["42"],"affected_schemas":["z","a","z"],"schema_fingerprint":"abc"}"#;
-        let message = decode_ddl_message(DDL_MESSAGE_PREFIX, payload).unwrap();
+        let message = decode_ddl_message(LEGACY_DDL_MESSAGE_PREFIX, payload).unwrap();
         assert_eq!(message.relation_ids, vec![42]);
         assert_eq!(message.affected_schemas, ["a", "z"]);
     }
@@ -824,7 +1012,75 @@ mod tests {
     fn old_payload_defaults_to_unknown_schema_scope() {
         let payload =
             br#"{"version":1,"command_tag":"ALTER PUBLICATION","schema_fingerprint":"abc"}"#;
-        let message = decode_ddl_message(DDL_MESSAGE_PREFIX, payload).unwrap();
+        let message = decode_ddl_message(LEGACY_DDL_MESSAGE_PREFIX, payload).unwrap();
         assert!(message.affected_schemas.is_empty());
+    }
+
+    #[test]
+    fn v2_decoder_preserves_typed_after_schema() {
+        let payload = br#"{
+            "version": 2,
+            "command_tag": "ALTER TABLE",
+            "relation_ids": ["42"],
+            "affected_schemas": ["public"],
+            "schema_fingerprint": "event-fingerprint",
+            "table_transitions": [{
+                "relation_id": "42",
+                "after_fingerprint": "table-fingerprint",
+                "kind": "unknown",
+                "after_schema": {
+                    "relation_id": 42,
+                    "name": {"schema": "public", "name": "items"},
+                    "relation_kind": "r",
+                    "replica_identity": "d",
+                    "columns": [{
+                        "attnum": 1,
+                        "name": "id",
+                        "type_oid": 20,
+                        "type_name": {"schema": "pg_catalog", "name": "int8"},
+                        "type_kind": "b",
+                        "type_modifier": -1,
+                        "nullable": false,
+                        "generated": "",
+                        "identity": "",
+                        "collation": null,
+                        "default_expression": null
+                    }],
+                    "primary_key": [1],
+                    "partition_key": []
+                }
+            }]
+        }"#;
+        let message = decode_ddl_message(DDL_MESSAGE_PREFIX, payload).unwrap();
+        assert_eq!(message.version, 2);
+        assert_eq!(message.transitions.len(), 1);
+        let transition = &message.transitions[0];
+        assert!(matches!(transition.kind, TransitionKind::Unknown));
+        let snapshot = transition.after_schema.as_ref().unwrap();
+        assert_eq!(snapshot.relation_id, 42);
+        assert_eq!(snapshot.name.to_string(), "public.items");
+        assert_eq!(snapshot.primary_key, [1]);
+        assert_eq!(snapshot.columns[0].type_name.to_string(), "pg_catalog.int8");
+    }
+
+    #[test]
+    fn v2_decoder_accepts_drop_without_after_schema() {
+        let payload = br#"{
+            "version": 2,
+            "command_tag": "DROP TABLE",
+            "relation_ids": ["42"],
+            "affected_schemas": ["public"],
+            "schema_fingerprint": "drop-fingerprint",
+            "table_transitions": [{"relation_id": "42", "kind": "drop_table"}]
+        }"#;
+        let message = decode_ddl_message(DDL_MESSAGE_PREFIX, payload).unwrap();
+        assert!(matches!(
+            message.transitions.as_slice(),
+            [TableTransition {
+                kind: TransitionKind::DropTable,
+                after_schema: None,
+                ..
+            }]
+        ));
     }
 }

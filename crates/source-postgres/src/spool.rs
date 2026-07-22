@@ -18,7 +18,10 @@ use std::{
 
 use bincode::config;
 use cloudberry_etl_core::{
-    change::{Cell, DdlMessage, RowChange, TableChange, TransactionChange, Tuple},
+    change::{
+        Cell, DdlMessage, RelationSchemaSnapshot, RowChange, TableChange, TableTransition,
+        TransactionChange, TransitionKind, Tuple,
+    },
     id::PipelineId,
     lsn::PgLsn,
 };
@@ -29,7 +32,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAGIC: [u8; 8] = *b"PG2CBSPL";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const RECORD_CHANGE: u16 = 1;
 const HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 4;
 const MAX_RECORD_BYTES: u64 = 1 << 34;
@@ -77,6 +80,40 @@ struct WireDdlMessage {
     relation_ids: Vec<u32>,
     affected_schemas: Vec<String>,
     schema_fingerprint: String,
+    transitions: Vec<WireTableTransition>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireTableTransition {
+    relation_id: u32,
+    before_generation: Option<u64>,
+    after_generation: Option<u64>,
+    before_fingerprint: Option<String>,
+    after_fingerprint: Option<String>,
+    after_schema: Option<RelationSchemaSnapshot>,
+    kind: WireTransitionKind,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WireTransitionKind {
+    AddColumn {
+        name: String,
+        nullable_or_defaulted: bool,
+    },
+    DropColumn {
+        name: String,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    AlterColumnType {
+        name: String,
+        widening: bool,
+    },
+    AddTable,
+    DropTable,
+    Unknown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1306,6 +1343,11 @@ impl From<&DdlMessage> for WireDdlMessage {
             relation_ids: message.relation_ids.clone(),
             affected_schemas: message.affected_schemas.clone(),
             schema_fingerprint: message.schema_fingerprint.clone(),
+            transitions: message
+                .transitions
+                .iter()
+                .map(WireTableTransition::from)
+                .collect(),
         }
     }
 }
@@ -1318,9 +1360,87 @@ impl From<WireDdlMessage> for DdlMessage {
             relation_ids: message.relation_ids,
             affected_schemas: message.affected_schemas,
             schema_fingerprint: message.schema_fingerprint,
-            // The spool/barrier path does not carry structured transitions; they
-            // are derived at DDL parse time and acted on before spooling.
-            transitions: Vec::new(),
+            transitions: message
+                .transitions
+                .into_iter()
+                .map(TableTransition::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&TableTransition> for WireTableTransition {
+    fn from(transition: &TableTransition) -> Self {
+        Self {
+            relation_id: transition.relation_id,
+            before_generation: transition.before_generation,
+            after_generation: transition.after_generation,
+            before_fingerprint: transition.before_fingerprint.clone(),
+            after_fingerprint: transition.after_fingerprint.clone(),
+            after_schema: transition.after_schema.clone(),
+            kind: WireTransitionKind::from(&transition.kind),
+        }
+    }
+}
+
+impl From<WireTableTransition> for TableTransition {
+    fn from(transition: WireTableTransition) -> Self {
+        Self {
+            relation_id: transition.relation_id,
+            before_generation: transition.before_generation,
+            after_generation: transition.after_generation,
+            before_fingerprint: transition.before_fingerprint,
+            after_fingerprint: transition.after_fingerprint,
+            after_schema: transition.after_schema,
+            kind: TransitionKind::from(transition.kind),
+        }
+    }
+}
+
+impl From<&TransitionKind> for WireTransitionKind {
+    fn from(kind: &TransitionKind) -> Self {
+        match kind {
+            TransitionKind::AddColumn {
+                name,
+                nullable_or_defaulted,
+            } => Self::AddColumn {
+                name: name.clone(),
+                nullable_or_defaulted: *nullable_or_defaulted,
+            },
+            TransitionKind::DropColumn { name } => Self::DropColumn { name: name.clone() },
+            TransitionKind::RenameColumn { from, to } => Self::RenameColumn {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            TransitionKind::AlterColumnType { name, widening } => Self::AlterColumnType {
+                name: name.clone(),
+                widening: *widening,
+            },
+            TransitionKind::AddTable => Self::AddTable,
+            TransitionKind::DropTable => Self::DropTable,
+            TransitionKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<WireTransitionKind> for TransitionKind {
+    fn from(kind: WireTransitionKind) -> Self {
+        match kind {
+            WireTransitionKind::AddColumn {
+                name,
+                nullable_or_defaulted,
+            } => Self::AddColumn {
+                name,
+                nullable_or_defaulted,
+            },
+            WireTransitionKind::DropColumn { name } => Self::DropColumn { name },
+            WireTransitionKind::RenameColumn { from, to } => Self::RenameColumn { from, to },
+            WireTransitionKind::AlterColumnType { name, widening } => {
+                Self::AlterColumnType { name, widening }
+            }
+            WireTransitionKind::AddTable => Self::AddTable,
+            WireTransitionKind::DropTable => Self::DropTable,
+            WireTransitionKind::Unknown => Self::Unknown,
         }
     }
 }
@@ -1370,8 +1490,12 @@ mod tests {
 
     use bytes::Bytes;
     use cloudberry_etl_core::{
-        change::{Cell, RowChange, TableChange, TransactionChange, Tuple},
+        change::{
+            Cell, DdlMessage, RelationSchemaSnapshot, RowChange, TableChange, TableTransition,
+            TransactionChange, TransitionKind, Tuple,
+        },
         id::PipelineId,
+        schema::QualifiedName,
     };
 
     use super::*;
@@ -1393,6 +1517,36 @@ mod tests {
                     cells: vec![Cell::Binary(Bytes::from(vec![value; 32]))],
                 },
             },
+        })
+    }
+
+    fn ddl_change() -> TransactionChange {
+        TransactionChange::Ddl(DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "event-fingerprint".to_owned(),
+            transitions: vec![TableTransition {
+                relation_id: 42,
+                before_generation: Some(1),
+                after_generation: Some(2),
+                before_fingerprint: Some("before".to_owned()),
+                after_fingerprint: Some("after".to_owned()),
+                after_schema: Some(RelationSchemaSnapshot {
+                    relation_id: 42,
+                    name: QualifiedName::new("public", "items").unwrap(),
+                    relation_kind: "r".to_owned(),
+                    replica_identity: "d".to_owned(),
+                    columns: Vec::new(),
+                    primary_key: Vec::new(),
+                    partition_key: Vec::new(),
+                }),
+                kind: TransitionKind::RenameColumn {
+                    from: "old_name".to_owned(),
+                    to: "new_name".to_owned(),
+                },
+            }],
         })
     }
 
@@ -1439,6 +1593,24 @@ mod tests {
     }
 
     #[test]
+    fn ddl_transitions_survive_spool_round_trip() {
+        let root = temp_root();
+        let journal = SpoolJournal::open(&root, identity(), SpoolLimits::default()).unwrap();
+        let expected = ddl_change();
+        let mut writer = journal.begin(7, PgLsn::new(10)).unwrap();
+        writer.append(&expected).unwrap();
+        let handle = writer.finish(PgLsn::new(20), PgLsn::new(21)).unwrap();
+        let restored = handle
+            .reader()
+            .unwrap()
+            .collect::<SpoolResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(restored, [expected]);
+        handle.remove().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verified_wal_replay_discards_partial_and_orphaned_artifacts() {
         let root = temp_root();
         let identity = identity();
@@ -1455,6 +1627,9 @@ mod tests {
             .unwrap();
         fs::remove_file(missing_segment).unwrap();
         fs::write(journal.directory().join("interrupted.seg"), b"orphan").unwrap();
+        // A binary upgrade may leave an artifact whose manifest cannot be decoded by the new
+        // format. Once WAL replay has been proved, reset must remove it without trying to parse it.
+        fs::write(journal.directory().join("legacy.manifest"), b"format-v1").unwrap();
 
         let reset = SpoolJournal::open_after_wal_replay_verified(&root, identity, limits).unwrap();
         assert_eq!(reset.used_bytes().unwrap(), 0);

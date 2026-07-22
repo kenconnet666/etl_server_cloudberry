@@ -274,7 +274,7 @@ CREATE INDEX IF NOT EXISTS snapshot_table_progress_pipeline_generation_idx
 /// by the source LSN and transaction id so replayed WAL is idempotent. The
 /// engine persists an event as `pending` before starting a table transition and
 /// advances it through `in_transition` to `completed`/`failed`; a restart scans
-/// unfinished rows and resumes them in source-LSN order. `transitions` holds the
+/// unfinished source-transaction rows and resumes them in source-LSN order. `transitions` holds the
 /// serialized per-table before/after descriptors so recovery does not depend on
 /// re-reading the source catalog after the fact. Distribution by pipeline keeps
 /// a pipeline's ordered event history colocated.

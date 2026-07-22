@@ -26,10 +26,11 @@ use postgres_replication::protocol::{
     self, LogicalReplicationMessage, ReplicaIdentity as WireReplicaIdentity, ReplicationMessage,
     TupleData,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     SourceError, SourceResult,
-    ddl::{DDL_MESSAGE_PREFIX, decode_ddl_message},
+    ddl::{decode_ddl_message, is_ddl_message_prefix},
     publication::start_replication_sql,
     spool::{
         ChangeSource, ResourceState, SpoolError, SpoolJournal, SpoolLimits, SpoolWriter,
@@ -334,6 +335,7 @@ struct PendingTransaction {
     changes: Vec<TransactionChange>,
     buffered_bytes: usize,
     spool_writer: Option<SpoolWriter>,
+    last_ddl_digest: Option<[u8; 32]>,
 }
 
 /// Turn decoded pgoutput events into complete, node-scoped source transactions.
@@ -452,10 +454,12 @@ impl TransactionAssembler {
                 let Some(change) = event.to_transaction_change()? else {
                     return Ok(None);
                 };
-                let duplicate_ddl = matches!(&change, TransactionChange::Ddl(message) if pending
-                    .changes
-                    .iter()
-                    .any(|existing| matches!(existing, TransactionChange::Ddl(previous) if previous == message)));
+                let duplicate_ddl = match &change {
+                    TransactionChange::Ddl(message) => {
+                        pending.last_ddl_digest == Some(ddl_message_digest(message)?)
+                    }
+                    _ => false,
+                };
                 if duplicate_ddl {
                     return Ok(None);
                 }
@@ -534,6 +538,7 @@ impl TransactionAssembler {
                     changes: Vec::new(),
                     buffered_bytes: 0,
                     spool_writer: None,
+                    last_ddl_digest: None,
                 });
                 Ok(None)
             }
@@ -561,16 +566,20 @@ impl TransactionAssembler {
                         row.relation_id, row.generation
                     )));
                 }
-                // Independent managed capture triggers can overlap during upgrades and emit the
-                // same DDL message in one transaction. Keep one barrier, but retain messages with
-                // a different fingerprint or schema scope.
-                if let TransactionChange::Ddl(message) = &change
-                    && self.pending.as_ref().is_some_and(|pending| {
-                        pending.changes.iter().any(|existing| {
-                            matches!(existing, TransactionChange::Ddl(previous) if previous == message)
-                        })
-                    })
-                {
+                // Independent managed capture triggers can overlap during upgrades and emit
+                // adjacent copies of the same DDL message. A fixed-size digest survives spill
+                // without retaining an unbounded schema snapshot in memory. Only adjacent
+                // messages are collapsed so a later command that returns to an earlier schema
+                // state remains visible.
+                let ddl_digest = match &change {
+                    TransactionChange::Ddl(message) => Some(ddl_message_digest(message)?),
+                    _ => None,
+                };
+                if ddl_digest.is_some_and(|digest| {
+                    self.pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.last_ddl_digest == Some(digest))
+                }) {
                     return Ok(None);
                 }
                 let bytes = transaction_change_bytes(&change);
@@ -613,6 +622,7 @@ impl TransactionAssembler {
                     pending.changes.clear();
                     pending.spool_writer = Some(writer);
                     pending.buffered_bytes = 0;
+                    pending.last_ddl_digest = ddl_digest;
                     return Ok(None);
                 }
                 let pending = self.pending.as_mut().expect("checked above");
@@ -625,6 +635,7 @@ impl TransactionAssembler {
                     pending.buffered_bytes = pending.buffered_bytes.saturating_add(bytes);
                     pending.changes.push(change);
                 }
+                pending.last_ddl_digest = ddl_digest;
                 Ok(None)
             }
         }
@@ -904,7 +915,7 @@ impl TransactionDecoder {
                 self.require_transaction("MESSAGE")?;
                 let prefix = body.prefix()?.to_owned();
                 let content = body.content()?.as_bytes();
-                if prefix != DDL_MESSAGE_PREFIX {
+                if !is_ddl_message_prefix(&prefix) {
                     return Err(SourceError::ReplicationProtocol(format!(
                         "unknown logical message prefix `{prefix}`"
                     )));
@@ -984,8 +995,17 @@ fn transaction_change_bytes(change: &TransactionChange) -> usize {
                     .iter()
                     .map(String::len)
                     .sum::<usize>()
+                + serde_json::to_vec(&message.transitions)
+                    .map_or(usize::MAX, |encoded| encoded.len())
         }
     }
+}
+
+fn ddl_message_digest(message: &DdlMessage) -> SourceResult<[u8; 32]> {
+    let encoded = serde_json::to_vec(message).map_err(|error| {
+        SourceError::ReplicationProtocol(format!("cannot encode DDL message identity: {error}"))
+    })?;
+    Ok(Sha256::digest(encoded).into())
 }
 
 fn tuple_bytes(cells: &[Cell]) -> usize {
@@ -1130,7 +1150,11 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use cloudberry_etl_core::id::PipelineId;
+    use cloudberry_etl_core::{
+        change::{RelationColumnSnapshot, RelationSchemaSnapshot, TableTransition, TransitionKind},
+        id::PipelineId,
+        schema::QualifiedName,
+    };
     use uuid::Uuid;
 
     use super::*;
@@ -1336,6 +1360,171 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn assembler_deduplicates_adjacent_ddl_after_spill() {
+        let root = temp_root("ddl-dedup-spill");
+        let mut assembler = spooling_assembler(&root, 1024 * 1024);
+        assembler
+            .push(DecodedMessage::Relation(relation(42, 1)))
+            .unwrap();
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(insert(42, 1)).unwrap();
+        let ddl = DecodedMessage::Ddl(DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "same".to_owned(),
+            transitions: Vec::new(),
+        });
+
+        assembler.push(ddl.clone()).unwrap();
+        assert!(assembler.spool_resource_state(&ddl).unwrap().is_none());
+        assembler.push(ddl).unwrap();
+
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(20, 21)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        let restored = committed
+            .change_source
+            .reader()
+            .unwrap()
+            .collect::<crate::spool::SpoolResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|change| matches!(change, TransactionChange::Ddl(_)))
+                .count(),
+            1
+        );
+        committed.cleanup_spool().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn assembler_retains_non_adjacent_equal_ddl_messages() {
+        let identity = SourceNodeIdentity {
+            node_id: 1,
+            system_identifier: 2,
+            timeline: 1,
+        };
+        let repeated = DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "state-a".to_owned(),
+            transitions: Vec::new(),
+        };
+        let intervening = DdlMessage {
+            schema_fingerprint: "state-b".to_owned(),
+            ..repeated.clone()
+        };
+        let mut assembler = TransactionAssembler::new(identity);
+        assembler.push(begin(1, 7)).unwrap();
+        assembler
+            .push(DecodedMessage::Ddl(repeated.clone()))
+            .unwrap();
+        assembler.push(DecodedMessage::Ddl(intervening)).unwrap();
+        assembler.push(DecodedMessage::Ddl(repeated)).unwrap();
+
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(2, 3)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        assert_eq!(committed.transaction.changes.len(), 3);
+    }
+
+    #[test]
+    fn typed_ddl_snapshot_counts_toward_memory_spill() {
+        let root = temp_root("ddl-transition-spill");
+        let identity = SourceNodeIdentity {
+            node_id: 7,
+            system_identifier: 99,
+            timeline: 3,
+        };
+        let journal = SpoolJournal::open(
+            &root,
+            crate::spool::SpoolIdentity {
+                pipeline_id: PipelineId::new(),
+                topology_generation: 1,
+                node_id: identity.node_id,
+                system_identifier: identity.system_identifier,
+                timeline: identity.timeline,
+            },
+            SpoolLimits::default(),
+        )
+        .unwrap();
+        let mut assembler = TransactionAssembler::with_spool(
+            identity,
+            TransactionLimits {
+                max_changes: usize::MAX,
+                max_bytes: 256,
+            },
+            journal,
+        )
+        .unwrap();
+        let after_schema = RelationSchemaSnapshot {
+            relation_id: 42,
+            name: QualifiedName::new("public", "items").unwrap(),
+            relation_kind: "r".to_owned(),
+            replica_identity: "d".to_owned(),
+            columns: vec![RelationColumnSnapshot {
+                attnum: 1,
+                name: "payload".to_owned(),
+                type_oid: 25,
+                type_name: QualifiedName::new("pg_catalog", "text").unwrap(),
+                type_kind: "b".to_owned(),
+                type_modifier: -1,
+                nullable: true,
+                generated: String::new(),
+                identity: String::new(),
+                collation: None,
+                default_expression: Some("x".repeat(4096)),
+            }],
+            primary_key: Vec::new(),
+            partition_key: Vec::new(),
+        };
+        let ddl = DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "after".to_owned(),
+            transitions: vec![TableTransition {
+                relation_id: 42,
+                before_generation: None,
+                after_generation: None,
+                before_fingerprint: None,
+                after_fingerprint: Some("after".to_owned()),
+                after_schema: Some(after_schema),
+                kind: TransitionKind::Unknown,
+            }],
+        };
+
+        assembler.push(begin(10, 11)).unwrap();
+        assembler.push(DecodedMessage::Ddl(ddl.clone())).unwrap();
+        let Some(AssembledEvent::Transaction(committed)) = assembler.push(commit(20, 21)).unwrap()
+        else {
+            panic!("commit did not produce a transaction");
+        };
+        assert!(matches!(committed.change_source, ChangeSource::Spool(_)));
+        assert_eq!(
+            committed
+                .change_source
+                .reader()
+                .unwrap()
+                .collect::<crate::spool::SpoolResult<Vec<_>>>()
+                .unwrap(),
+            [TransactionChange::Ddl(ddl)]
+        );
+        committed.cleanup_spool().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

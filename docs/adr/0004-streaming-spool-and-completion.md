@@ -62,14 +62,16 @@ CommittedTransaction {
 ### Spool 格式与生命周期
 
 - 根目录按 pipeline、topology generation 和 node identity 隔离。
-- segment 使用带版本、长度和 checksum 的 framed binary record，不使用 JSON 热路径。
+- 当前 spool format v2；segment 使用带版本、长度和 checksum 的 framed binary record，不使用
+  JSON 热路径。v2 显式保存完整 DDL transition/typed after-schema，不能静默丢字段。
 - manifest 原子发布；不完整尾记录在启动恢复时截断或丢弃。
 - spool 文件只允许服务账号访问，不在日志、metric 或 API 中暴露行值。
 - source WAL 和 Cloudberry checkpoint 仍是正确性权威；spool 不是外部消息队列。
 - target checkpoint 成功提交后，对应 spool 可删除。若 ACK 尚未发送，源 WAL 重放仍由目标
   checkpoint 和主键幂等处理。
-- 启动时可以复用校验通过的 committed spool；任何 identity、generation、checksum 或 manifest
-  不匹配都丢弃本地副本并从未 ACK WAL 重放。
+- 当前 runtime 先证明 managed slot 覆盖 target checkpoint，并成功从该 LSN 建立
+  `START_REPLICATION`，随后清空 exact identity 的所有中断 artifact，从未 ACK WAL 重放。清理阶段
+  不解析旧格式，因此二进制升级不依赖 spool 向后兼容；更低 topology generation 也会回收。
 
 ### 内存、磁盘与背压
 

@@ -62,15 +62,17 @@ cargo test --workspace --lib
 已完成（构建块 + 单测，见 `docs/phase2-ddl-tight-follow-adr.md`）：
 - **DDL 分类** ✅ `DdlMessage::replication_impact()`（`core/src/change.rs`）：CREATE INDEX/GRANT/ANALYZE 等证明无害命令不再触发 rebuild（fail-closed 白名单）。
 - **DDL event v2 类型** ✅ `TableTransition`/`TransitionKind`（AddColumn/DropColumn/RenameColumn/AlterColumnType/AddTable/DropTable/Unknown），`is_online_safe()` 保守判定；`DdlMessage.transitions`（`#[serde(default)]` 向后兼容 v1）。
+- **DDL event v2 source 捕获** ✅ prefix/version 升级为 `pg2cloudberry_ddl_v2`/2（v1/1 仍可解码）；v6 event trigger 在 `ddl_command_end` 捕获 typed after-schema，在 `sql_drop` 捕获 DropTable。真实 PG18 已验证同事务 ADD→RENAME→varchar widen→DROP 的四个有序中间快照，以及 CREATE/DROP table。
+- **spool DDL 完整性与有界内存** ✅ spool format v2 显式保存 transition/after-schema，修复旧 wire 静默丢失 `DdlMessage.transitions`；typed snapshot 字节计入 memory high-water，spill 后相邻重复 capture message 仍以固定 SHA-256 identity 去重。旧格式 artifact 只在 WAL replay 证明后直接清除，不作为恢复权威。
 - **schema-diff 分类器** ✅ `core/src/schema_diff.rs::classify_table_diff`：按 attnum 对比 before/after schema → TransitionKind；PK 变化/narrowing/未知 → `Unknown`（rebuild）。engine 侧 `TableBindingRegistry::classify_relation_diff` 接入。
 - **schema_events ledger** ✅ target V8 migration + `target-cloudberry/src/schema_event.rs`（record/load/list_unfinished/advance_state，forward-only 状态机）+ 集成测试。
 - **dynamic binding registry** ✅ `TableBindingRegistry` insert/remove/swap（运行时可 swap binding，维持唯一性不变量）。
 - **SchemaBarrier 结构化** ✅ 带 `command_tag`；online-safe 的 v2 DDL 在 barrier reason 中标注可跟随。
 
 **未完成（下一位优先处理，按顺序）：**
-1. **DDL event v2 的 source 端捕获。** `source-postgres/src/ddl.rs` 的 event trigger 目前只发 v1 envelope（command_tag + fingerprint）。需在 `ddl_command_end` 阶段用已有 `schema_snapshot(oid)` 捕获**受影响表的 after-schema**放入 payload（before-schema 由 engine 从 binding 提供，因 command_end 阶段拿不到 before）。需真实 PG18 验证 PL/pgSQL。
-2. **shadow reload / catch-up / cutover 流程。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 spool 回放 barrier 后 CDC → 原子 RENAME cutover + `registry.swap`。持久化用 `schema_events`（pending→in_transition→completed）。
-3. **在线白名单 handler 接入 barrier 决策。** 当 `classify_relation_diff` 全 online-safe 时走 transition 而非 rebuild；否则保持 rebuild。
+1. **事务级 catalog planner + schema event 持久化。** 按 transaction change ordinal 处理 v2 消息；只把每个 relation 的 terminal after-schema 与提交后 catalog 对齐，中间快照保留用于解释同事务 schema/DML；再用 bound before-schema 分类并写入 `schema_events`。
+2. **table barrier + shadow reload / catch-up / cutover。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 barrier 后 spool 回放该表 CDC → reconciliation → 原子 quarantine/activation + `registry.swap`。`schema_events` 状态随 target 变更同事务推进。
+3. **在线白名单 handler 接入。** 逐项验证 ADD/DROP/RENAME/default/nullability/widening 的 Cloudberry 2.1 capability；任一前置条件失败自动转受影响 table/dependency closure reload，不升级整 pipeline。
 4. **DROP quarantine + 新表自动准入。**
 
 **Phase 2 退出条件：** 并发 DML+DDL、同事务多次 DDL、rapid DDL、rename/drop/recreate、目标 commit ambiguity、进程重启和重复 WAL 矩阵通过；普通 DDL 不调用 `request_pipeline_rebuild`。

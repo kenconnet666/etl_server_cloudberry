@@ -2,7 +2,11 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, CoreResult, lsn::PgLsn, schema::TableSchema};
+use crate::{
+    CoreError, CoreResult,
+    lsn::PgLsn,
+    schema::{QualifiedName, TableSchema},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
@@ -141,7 +145,42 @@ pub struct TableTransition {
     pub before_fingerprint: Option<String>,
     /// Schema fingerprint after the DDL (None for a dropped table).
     pub after_fingerprint: Option<String>,
+    /// Catalog facts captured at `ddl_command_end`. Messages stay in source transaction order;
+    /// the planner validates the last post-state for each relation against the authoritative
+    /// catalog after commit and uses earlier snapshots to interpret intermediate schema shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_schema: Option<RelationSchemaSnapshot>,
     pub kind: TransitionKind,
+}
+
+/// Stable PostgreSQL catalog facts captured inside the source DDL transaction.
+///
+/// This deliberately stays below [`TableSchema`]: resolving domains, arrays, enums, Citus table
+/// kind, and target capabilities remains the catalog planner's job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationSchemaSnapshot {
+    pub relation_id: u32,
+    pub name: QualifiedName,
+    pub relation_kind: String,
+    pub replica_identity: String,
+    pub columns: Vec<RelationColumnSnapshot>,
+    pub primary_key: Vec<i16>,
+    pub partition_key: Vec<i16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationColumnSnapshot {
+    pub attnum: i16,
+    pub name: String,
+    pub type_oid: u32,
+    pub type_name: QualifiedName,
+    pub type_kind: String,
+    pub type_modifier: i32,
+    pub nullable: bool,
+    pub generated: String,
+    pub identity: String,
+    pub collation: Option<QualifiedName>,
+    pub default_expression: Option<String>,
 }
 
 /// Classified DDL operation for one relation. `Unknown` is the conservative
@@ -363,6 +402,7 @@ mod ddl_impact_tests {
             after_generation: Some(2),
             before_fingerprint: Some("a".to_owned()),
             after_fingerprint: Some("b".to_owned()),
+            after_schema: None,
             kind: TransitionKind::AddColumn {
                 name: "note".to_owned(),
                 nullable_or_defaulted: true,
@@ -410,6 +450,7 @@ mod ddl_impact_tests {
                 after_generation: Some(2),
                 before_fingerprint: Some("b".to_owned()),
                 after_fingerprint: Some("a".to_owned()),
+                after_schema: None,
                 kind: TransitionKind::AddColumn {
                     name: "note".to_owned(),
                     nullable_or_defaulted: true,
@@ -421,6 +462,7 @@ mod ddl_impact_tests {
                 after_generation: Some(1),
                 before_fingerprint: None,
                 after_fingerprint: Some("x".to_owned()),
+                after_schema: None,
                 kind: TransitionKind::AddTable,
             },
         ];

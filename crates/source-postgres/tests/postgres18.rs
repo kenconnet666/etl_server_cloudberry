@@ -9,7 +9,10 @@ use std::{collections::HashSet, panic::AssertUnwindSafe};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
-    change::{DdlMessage, RowChange, SourceTransaction, TransactionChange},
+    change::{
+        DdlMessage, RowChange, SourceTransaction, TableTransition, TransactionChange,
+        TransitionKind,
+    },
     schema::{GeneratedColumn, PgTypeKind, QualifiedName},
 };
 use cloudberry_etl_source_postgres::{
@@ -356,6 +359,7 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
         .iter()
         .find(|candidate| candidate.name == table)
         .expect("created test table must be discoverable");
+    let table_relation_id = table_schema.relation_id;
     assert_eq!(table_schema.primary_key().len(), 1);
     assert_eq!(table_schema.columns[0].primary_key_ordinal, Some(1));
     assert_eq!(table_schema.columns[3].name, "doubled");
@@ -398,9 +402,18 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
         .execute(&format!("DELETE FROM {table_sql} WHERE id = $1"), &[&1_i64])
         .await?;
 
-    // This ALTER is emitted by the installed event trigger as a transactional logical message.
+    // Every command-end snapshot is emitted transactionally. Keeping four schema changes in one
+    // source transaction proves the v2 event preserves each intermediate post-command shape and
+    // its WAL order instead of racing a later catalog read.
     client
-        .batch_execute(&format!("ALTER TABLE {table_sql} ADD COLUMN note text"))
+        .batch_execute(&format!(
+            "BEGIN;
+             ALTER TABLE {table_sql} ADD COLUMN note varchar(16) DEFAULT 'seed';
+             ALTER TABLE {table_sql} RENAME COLUMN note TO description;
+             ALTER TABLE {table_sql} ALTER COLUMN description TYPE varchar(32);
+             ALTER TABLE {table_sql} DROP COLUMN description;
+             COMMIT;"
+        ))
         .await?;
 
     // DROP events are emitted by sql_drop because the dropped catalog rows are no longer
@@ -446,7 +459,6 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     let mut saw_delete = false;
     let mut saw_ddl = false;
     let mut ddl_tags = HashSet::new();
-    let mut ddl_messages = Vec::<DdlMessage>::new();
     let mut generated_value = None;
     let mut relation_ids = HashSet::new();
 
@@ -461,7 +473,6 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
             DecodedMessage::Ddl(message) => {
                 saw_ddl = true;
                 ddl_tags.insert(message.command_tag.clone());
-                ddl_messages.push(message.clone());
             }
             DecodedMessage::Insert { new, .. } => {
                 assert_eq!(new.cells.len(), 4);
@@ -496,23 +507,95 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
     assert!(ddl_tags.contains("ALTER PUBLICATION"));
     assert!(ddl_tags.contains("ALTER TABLE"));
 
-    // The v5 command-end trigger emits per-relation after-fingerprints; the
-    // ALTER TABLE ADD COLUMN on the mirrored table must carry a transition with
-    // a populated after-fingerprint and no before side (command-end can't see it).
-    let alter_ddl = ddl_messages
+    let ddl_messages = transactions
         .iter()
-        .find(|message| message.command_tag == "ALTER TABLE")
-        .expect("ALTER TABLE DDL must be captured");
-    assert!(
-        !alter_ddl.transitions.is_empty(),
-        "ALTER TABLE must carry per-relation transitions (v5 capture)"
+        .flat_map(|transaction| transaction.changes.iter())
+        .filter_map(|change| match change {
+            TransactionChange::Ddl(message) => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<DdlMessage>>();
+
+    let table_ddl = ddl_messages
+        .iter()
+        .filter(|message| {
+            message.command_tag == "ALTER TABLE"
+                && message
+                    .transitions
+                    .iter()
+                    .any(|transition| transition.relation_id == table_relation_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_ddl.len(),
+        4,
+        "same-transaction DDL must retain all four distinct post-command snapshots"
     );
+    let transitions = table_ddl
+        .iter()
+        .map(|message| {
+            assert_eq!(message.version, 2);
+            let transition = message
+                .transitions
+                .iter()
+                .find(|transition| transition.relation_id == table_relation_id)
+                .expect("managed relation transition");
+            assert!(transition.after_fingerprint.is_some());
+            assert!(transition.before_fingerprint.is_none());
+            assert!(matches!(transition.kind, TransitionKind::Unknown));
+            transition
+        })
+        .collect::<Vec<_>>();
+    let fingerprints = transitions
+        .iter()
+        .map(|transition| transition.after_fingerprint.as_deref().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        fingerprints.len(),
+        4,
+        "each post-state must have its own digest"
+    );
+
+    let added = transitions[0].after_schema.as_ref().unwrap();
+    let note = added
+        .columns
+        .iter()
+        .find(|column| column.name == "note")
+        .expect("ADD COLUMN post-state");
+    assert_eq!(note.type_name.to_string(), "pg_catalog.varchar");
+    assert_eq!(note.type_modifier, 20);
     assert!(
-        alter_ddl
-            .transitions
+        note.default_expression
+            .as_deref()
+            .is_some_and(|expression| expression.contains("seed"))
+    );
+    let note_attnum = note.attnum;
+
+    let renamed = transitions[1].after_schema.as_ref().unwrap();
+    let description = renamed
+        .columns
+        .iter()
+        .find(|column| column.attnum == note_attnum)
+        .expect("RENAME COLUMN post-state");
+    assert_eq!(description.name, "description");
+    assert_eq!(description.type_modifier, 20);
+
+    let widened = transitions[2].after_schema.as_ref().unwrap();
+    let description = widened
+        .columns
+        .iter()
+        .find(|column| column.attnum == note_attnum)
+        .expect("ALTER TYPE post-state");
+    assert_eq!(description.name, "description");
+    assert_eq!(description.type_modifier, 36);
+
+    let dropped = transitions[3].after_schema.as_ref().unwrap();
+    assert!(
+        dropped
+            .columns
             .iter()
-            .all(|t| t.after_fingerprint.is_some() && t.before_fingerprint.is_none()),
-        "each transition must carry an after-fingerprint and no before side"
+            .all(|column| column.attnum != note_attnum),
+        "DROP COLUMN post-state must omit the dropped attnum"
     );
 
     let publication_ddl = ddl_messages
@@ -565,6 +648,25 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
             std::slice::from_ref(&objects.other_schema),
             "unexpected scope for {command_tag}: {message:?}"
         );
+        if command_tag == "CREATE TABLE" {
+            assert!(matches!(
+                message.transitions.as_slice(),
+                [TableTransition {
+                    kind: TransitionKind::AddTable,
+                    after_schema: Some(_),
+                    ..
+                }]
+            ));
+        } else if command_tag == "DROP TABLE" {
+            assert!(matches!(
+                message.transitions.as_slice(),
+                [TableTransition {
+                    kind: TransitionKind::DropTable,
+                    after_schema: None,
+                    ..
+                }]
+            ));
+        }
     }
     assert!(matches!(
         generated_value,

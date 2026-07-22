@@ -184,11 +184,15 @@ decoder 输出按 source node 有序。调度器可以把已提交事务拆成 t
 `pgoutput` 不复制 DDL。每个源 database 安装独立 `pg2cb_meta` schema 和 event trigger。trigger 不解析或重放 `current_query()`，而是在源事务中发送 transactional logical message：
 
 ```text
-prefix = pg2cloudberry_ddl_v1
-payload = change identity + affected relation identities
+prefix = pg2cloudberry_ddl_v2
+payload version = 2
+payload = command/scope identity + ordered per-relation typed after-schema
 ```
 
-消费端在消息提交后读取 `pg_catalog`，生成版本化 schema snapshot 和 fingerprint。安全变化先修改目标 schema，再放行使用新 relation version 的行事件；不安全变化创建 shadow generation，执行快照、WAL 追赶、reconciliation 和原子切换。
+legacy v1 仍可解码，但只能进入受影响表的保守重拉。消费端在整个源事务提交后读取
+`pg_catalog`，只把每个 relation 的 terminal after-schema 与当前 catalog 对齐；事务内中间快照保留
+用于解释有序 schema/DML。安全变化先修改目标 schema，再放行使用新 relation version 的行事件；
+不安全变化创建 shadow generation，执行快照、WAL 追赶、reconciliation 和原子切换。
 
 默认分类：
 
