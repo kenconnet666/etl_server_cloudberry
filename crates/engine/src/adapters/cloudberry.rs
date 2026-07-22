@@ -173,39 +173,93 @@ impl TableBinding {
     }
 }
 
-/// Read-only registry used for every batch handled by one source-node sink.
+/// Registry of active source-schema to target-table bindings for one source-node
+/// sink. Bindings can be swapped at runtime by a DDL table transition; every
+/// mutation preserves the same invariants the constructor enforces — unique
+/// `(relation_id, generation)` key, unique target, and unique staging name — so
+/// the row hot path can look up a binding without any catalog access.
 #[derive(Debug, Clone)]
 pub struct TableBindingRegistry {
     bindings: HashMap<(u32, u64), TableBinding>,
+    /// Derived uniqueness indexes kept in sync with `bindings` so insert/remove
+    /// stay O(1) and cannot admit a duplicate target or staging name.
+    targets: HashSet<QualifiedName>,
+    staging_names: HashSet<String>,
 }
 
 impl TableBindingRegistry {
     pub fn new(
         bindings: impl IntoIterator<Item = TableBinding>,
     ) -> Result<Self, AdapterConfigError> {
-        let mut by_key = HashMap::new();
-        let mut targets = HashSet::new();
-        let mut staging_names = HashSet::new();
+        let mut registry = Self {
+            bindings: HashMap::new(),
+            targets: HashSet::new(),
+            staging_names: HashSet::new(),
+        };
         for binding in bindings {
-            let key = binding.key();
-            if by_key.contains_key(&key) {
-                return Err(AdapterConfigError::DuplicateBinding {
-                    relation_id: key.0,
-                    generation: key.1,
-                });
-            }
-            let target = binding.plan.table.target.clone();
-            if !targets.insert(target.clone()) {
-                return Err(AdapterConfigError::DuplicateTarget(target.to_string()));
-            }
-            if !staging_names.insert(binding.plan.staging_name.clone()) {
-                return Err(AdapterConfigError::DuplicateStagingName(
-                    binding.plan.staging_name.clone(),
-                ));
-            }
-            by_key.insert(key, binding);
+            registry.insert(binding)?;
         }
-        Ok(Self { bindings: by_key })
+        Ok(registry)
+    }
+
+    /// Add a binding, rejecting a duplicate key, target, or staging name. The
+    /// registry is left unchanged when the binding is rejected.
+    pub fn insert(&mut self, binding: TableBinding) -> Result<(), AdapterConfigError> {
+        let key = binding.key();
+        if self.bindings.contains_key(&key) {
+            return Err(AdapterConfigError::DuplicateBinding {
+                relation_id: key.0,
+                generation: key.1,
+            });
+        }
+        let target = binding.plan.table.target.clone();
+        if self.targets.contains(&target) {
+            return Err(AdapterConfigError::DuplicateTarget(target.to_string()));
+        }
+        if self.staging_names.contains(&binding.plan.staging_name) {
+            return Err(AdapterConfigError::DuplicateStagingName(
+                binding.plan.staging_name.clone(),
+            ));
+        }
+        self.targets.insert(target);
+        self.staging_names.insert(binding.plan.staging_name.clone());
+        self.bindings.insert(key, binding);
+        Ok(())
+    }
+
+    /// Remove the binding for a `(relation_id, generation)` key, returning it if
+    /// present and releasing its target and staging-name reservations.
+    pub fn remove(&mut self, relation_id: u32, generation: u64) -> Option<TableBinding> {
+        let binding = self.bindings.remove(&(relation_id, generation))?;
+        self.targets.remove(&binding.plan.table.target);
+        self.staging_names.remove(&binding.plan.staging_name);
+        Some(binding)
+    }
+
+    /// Atomically replace the binding at `(previous_relation_id,
+    /// previous_generation)` with `binding` after a table transition. The old
+    /// binding is removed first so the new one may reuse its target or staging
+    /// name; on validation failure the old binding is restored and the registry
+    /// is left unchanged.
+    pub fn swap(
+        &mut self,
+        previous_relation_id: u32,
+        previous_generation: u64,
+        binding: TableBinding,
+    ) -> Result<Option<TableBinding>, AdapterConfigError> {
+        let removed = self.remove(previous_relation_id, previous_generation);
+        match self.insert(binding) {
+            Ok(()) => Ok(removed),
+            Err(error) => {
+                // Restore the prior state so a rejected swap is a no-op.
+                if let Some(previous) = removed {
+                    self.insert(previous).expect(
+                        "restoring the removed binding cannot conflict after its own removal",
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     #[must_use]
@@ -1187,6 +1241,67 @@ mod tests {
             duplicate_staging,
             Err(AdapterConfigError::DuplicateStagingName(_))
         ));
+    }
+
+    #[test]
+    fn registry_insert_and_remove_maintain_uniqueness() {
+        let mut registry = TableBindingRegistry::new([]).unwrap();
+        registry
+            .insert(binding(7, 3, "items", "items", "stage_items"))
+            .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(7, 3).is_some());
+
+        // Duplicate target is rejected and leaves the registry unchanged.
+        assert!(matches!(
+            registry.insert(binding(8, 1, "other", "items", "stage_other")),
+            Err(AdapterConfigError::DuplicateTarget(_))
+        ));
+        assert_eq!(registry.len(), 1);
+
+        // Removing frees the target and staging name for reuse.
+        let removed = registry.remove(7, 3).expect("binding present");
+        assert_eq!(removed.key(), (7, 3));
+        assert!(registry.is_empty());
+        registry
+            .insert(binding(8, 1, "other", "items", "stage_items"))
+            .expect("target and staging name are free after removal");
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_swap_replaces_binding_and_reuses_reservations() {
+        let mut registry =
+            TableBindingRegistry::new([binding(7, 3, "items", "items", "stage_items")]).unwrap();
+
+        // A new generation of the same table reuses the same target and staging name.
+        let previous = registry
+            .swap(7, 3, binding(7, 4, "items", "items", "stage_items"))
+            .expect("swap succeeds")
+            .expect("previous binding returned");
+        assert_eq!(previous.key(), (7, 3));
+        assert!(registry.get(7, 3).is_none());
+        assert_eq!(registry.get(7, 4).unwrap().key(), (7, 4));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_swap_restores_previous_binding_on_conflict() {
+        let mut registry = TableBindingRegistry::new([
+            binding(7, 3, "items", "items", "stage_items"),
+            binding(8, 1, "other", "other", "stage_other"),
+        ])
+        .unwrap();
+
+        // Swapping table 7 to a binding whose target collides with table 8 must fail and
+        // leave the original table-7 binding intact.
+        let result = registry.swap(7, 3, binding(7, 4, "items", "other", "stage_new"));
+        assert!(matches!(
+            result,
+            Err(AdapterConfigError::DuplicateTarget(_))
+        ));
+        assert_eq!(registry.get(7, 3).unwrap().key(), (7, 3));
+        assert_eq!(registry.len(), 2);
     }
 
     #[test]
