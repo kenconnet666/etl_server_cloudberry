@@ -4,8 +4,8 @@
 > （已删除）。每次换机或阶段推进后更新本文。
 
 **最后更新:** 2026-07-22
-**工作分支:** `origin/codex/phase1-durable-cdc`
-**最新 commit:** `78f9a8c` Auto-reclaim superseded spool generations (Phase 1.4)
+**工作分支:** `codex/phase1-durable-cdc`（本地 ahead origin 20 commits，未 push）
+**最新 commit:** `ab2453e` Document Cloudberry image gap and WSL test workflow
 
 ## 换机快速开始
 
@@ -17,7 +17,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --lib
 ```
 
-预期：编译通过，clippy 零 warning，**246 项单元测试全部通过**。真实数据库集成测试是 opt-in（见下"测试环境"），不在默认 `--lib` 范围内。
+预期：编译通过，clippy 零 warning，**271 项单元测试全部通过**。真实数据库集成测试是 opt-in（见下"测试环境"），不在默认 `--lib` 范围内。source-postgres 的 PG18 集成测试已在真实 PostgreSQL 18.4 上全部通过（4/4，在 WSL 内运行）。
 
 ## 核心目标（不变）
 
@@ -29,15 +29,16 @@ cargo test --workspace --lib
 - **版本锁定:** 只支持 PG18 ↔ Cloudberry 2.1，启动时 `SELECT version()` 严格校验，其它版本拒绝启动。
 - **Spool:** 固定目录（`engine.spool_directory`，默认 `data/spool`），不设硬容量上限；按 topology generation 自动清理被取代的旧目录；磁盘水位到达时进入 `RESOURCE_WAIT` 背压，不提前 ACK、不丢数据。
 - **Reconciliation:** Phase 1-2 差异一律触发 shadow rebuild；原地 repair 保持 capability-gated，直到 replay-compatible 协议对 PK move/delete/reuse/swap 的证明与故障矩阵成立。见 [reconciliation.md](reconciliation.md)。
-- **Citus:** 数据面推到 Phase 4；Phase 2 末评估是否有真实需求提前到 Phase 3。discovery/catalog 已有，`Citus`/`PhysicalHa` 拓扑当前 fail-closed。
-- **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 target V7。
-- **Web UI:** 计划 Vue 3 + Naive UI + JWT（账号密码）。当前仍是占位 Svelte，重建推迟到数据面稳定后。
+- **Citus:** 真实数据面推到 Phase 4（per-worker slot/checkpoint/topology generation），当前 fail-closed（`DataPlane::Gated`）。**`PhysicalHa` 已启用**，复用 Standalone 数据面（`data_plane_for_topology`）：failover 改 timeline 由 checkpoint identity 校验捕获并安全 rebuild。
+- **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 **target V8**（V8 = `schema_events` DDL transition ledger）。
+- **Web UI:** **已重建为 Vue 3 + Naive UI + Pinia + Vue Router**（`9e48e29`），5 视图 + API 层 + 认证 store，构建通过。JWT/CSRF 认证待后端对接。
+- **Cloudberry 镜像:** Apache Cloudberry 2.1 **无官方即用 server 镜像**（Docker Hub 只有 build/test 环境镜像）；target 集成测试需源码构建/sandbox/CI 提供。见 `tests/integration/README.md`。
 
 ## 进度
 
 ### Phase 0 — 工程门禁与基础设施 ✅ 完成
 - `.github/workflows/ci.yml`：fmt / clippy / build / lib+bins 测试。
-- control migration（`crates/metadata/src/migration.rs`，到 V2）与 target metadata migration（`crates/target-cloudberry/src/migration.rs`，到 V7，含 `snapshot_table_progress`、`transaction_chunk_progress`、`transaction_committed_chunks`）。
+- control migration（`crates/metadata/src/migration.rs`，到 V2）与 target metadata migration（`crates/target-cloudberry/src/migration.rs`，到 V8，含 `snapshot_table_progress`、`transaction_chunk_progress`、`transaction_committed_chunks`、`schema_events`）。
 - 版本校验：`source-postgres` `verify_pg18_version`、`target-cloudberry::version::verify_cloudberry_21_version`。
 - `tests/integration/docker-compose.yml`：PG18(55432) + Cloudberry 2.1(55433)，含 init 脚本与 healthcheck。
 
@@ -47,23 +48,34 @@ cargo test --workspace --lib
 - **1.2 Target snapshot progress** ✅ `crates/target-cloudberry/src/snapshot/progress.rs`：`register_snapshot_table_progress`、`copy_snapshot_page`（COPY 与 cursor 同事务）、完整 CRUD SQL、V7 schema。
 - **1.4 Spool 自动清理** ✅ `crates/source-postgres/src/spool.rs`：`remove_superseded_generations` 在 `open` 时回收更低 generation 的目录，best-effort 非致命。
 
+- **1.3 runtime 接入 bounded snapshot** ✅ `crates/engine/src/runtime/job.rs`：`load_table_snapshot` 按 PK page 循环（`read_canonical_pk_page` → `copy_range` → `copy_text_pk_range` → target `SnapshotPageLoader::apply_page` 同事务 cursor）；无 PK 表 fallback 整表 COPY。target 侧 `begin_snapshot_pages`/`SnapshotPageLoader`（`crates/target-cloudberry/src/snapshot.rs`）。含集成测试 `cloudberry21_snapshot_paging_with_resume`。**源侧 PK 分页已在真实 PG18 验证通过**。
+
 **未完成（下一位优先处理，按顺序）：**
 
-1. **1.3 把 runtime 接到 bounded snapshot（最关键）。**
-   `crates/engine/src/runtime/job.rs::prepare_initial_snapshot` 目前仍用整表
-   `snapshot.copy_text_table(...)` + `apply.copy_from_stream`，**尚未**调用 1.1/1.2 的
-   `read_canonical_pk_page` / `copy_snapshot_page`。需要改成按 PK page 循环：source 读一页边界 →
-   target `copy_snapshot_page` 写同事务 cursor → 直到 `has_more=false`。并处理：
-   - 同一存活 `SnapshotSession`/S0 内 target commit ambiguity 可按 cursor 续传；
-   - 进程崩溃、S0 消失后**不得**沿旧 cursor 续传，必须新 slot/S1/L1 从表头重拉并清理旧 loading group
-     （`snapshot::cleanup` 与 `open_after_wal_replay_verified` 已提供原语）。
-2. **1.4 补充按时间的 spool 清理（可选增强）。** 现在只按 generation 回收。若要"checkpoint 后保留 N 小时再删当前 generation 内已 retire 的 journal"，需在 `SpoolLimits`/config 增加 `retention` 字段并在 checkpoint 推进后调用。当前 ENOSPC → `RESOURCE_WAIT` 背压已就绪。
-3. **1.5 E2E kill-point 测试。** `tests/integration/` 下补半自动脚本，覆盖 5 个 kill 点：source read 后、spool write 后、target chunk commit 前、checkpoint commit 后/ACK 前、final chunk commit ambiguity。验证重启后数据最终一致（PK count + canonical digest）。
+1. **1.4 补充按时间的 spool 清理（可选增强）。** 现在只按 generation 回收。若要"checkpoint 后保留 N 小时再删当前 generation 内已 retire 的 journal"，需在 `SpoolLimits`/config 增加 `retention` 字段并在 checkpoint 推进后调用。当前 ENOSPC → `RESOURCE_WAIT` 背压已就绪。
+2. **1.5 E2E kill-point 测试。** `tests/integration/` 下补半自动脚本，覆盖 5 个 kill 点：source read 后、spool write 后、target chunk commit 前、checkpoint commit 后/ACK 前、final chunk commit ambiguity。验证重启后数据最终一致（PK count + canonical digest）。
 
 **Phase 1 退出条件：** 最大测试事务显著大于进程内存预算且内存保持水位内；上述 5 个 kill 点均收敛；磁盘 high-water 进入 `RESOURCE_WAIT`，扩容后继续且不触发 rebuild。
 
-### Phase 2 / 3 / 4
-DDL 紧密跟随 / 吞吐延迟与 soak / Citus 多节点。详见 [delivery-plan.md](delivery-plan.md)。
+### Phase 2 — DDL 紧密跟随 🔶 进行中（本轮 2026-07-22 打下基础）
+已完成（构建块 + 单测，见 `docs/phase2-ddl-tight-follow-adr.md`）：
+- **DDL 分类** ✅ `DdlMessage::replication_impact()`（`core/src/change.rs`）：CREATE INDEX/GRANT/ANALYZE 等证明无害命令不再触发 rebuild（fail-closed 白名单）。
+- **DDL event v2 类型** ✅ `TableTransition`/`TransitionKind`（AddColumn/DropColumn/RenameColumn/AlterColumnType/AddTable/DropTable/Unknown），`is_online_safe()` 保守判定；`DdlMessage.transitions`（`#[serde(default)]` 向后兼容 v1）。
+- **schema-diff 分类器** ✅ `core/src/schema_diff.rs::classify_table_diff`：按 attnum 对比 before/after schema → TransitionKind；PK 变化/narrowing/未知 → `Unknown`（rebuild）。engine 侧 `TableBindingRegistry::classify_relation_diff` 接入。
+- **schema_events ledger** ✅ target V8 migration + `target-cloudberry/src/schema_event.rs`（record/load/list_unfinished/advance_state，forward-only 状态机）+ 集成测试。
+- **dynamic binding registry** ✅ `TableBindingRegistry` insert/remove/swap（运行时可 swap binding，维持唯一性不变量）。
+- **SchemaBarrier 结构化** ✅ 带 `command_tag`；online-safe 的 v2 DDL 在 barrier reason 中标注可跟随。
+
+**未完成（下一位优先处理，按顺序）：**
+1. **DDL event v2 的 source 端捕获。** `source-postgres/src/ddl.rs` 的 event trigger 目前只发 v1 envelope（command_tag + fingerprint）。需在 `ddl_command_end` 阶段用已有 `schema_snapshot(oid)` 捕获**受影响表的 after-schema**放入 payload（before-schema 由 engine 从 binding 提供，因 command_end 阶段拿不到 before）。需真实 PG18 验证 PL/pgSQL。
+2. **shadow reload / catch-up / cutover 流程。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 spool 回放 barrier 后 CDC → 原子 RENAME cutover + `registry.swap`。持久化用 `schema_events`（pending→in_transition→completed）。
+3. **在线白名单 handler 接入 barrier 决策。** 当 `classify_relation_diff` 全 online-safe 时走 transition 而非 rebuild；否则保持 rebuild。
+4. **DROP quarantine + 新表自动准入。**
+
+**Phase 2 退出条件：** 并发 DML+DDL、同事务多次 DDL、rapid DDL、rename/drop/recreate、目标 commit ambiguity、进程重启和重复 WAL 矩阵通过；普通 DDL 不调用 `request_pipeline_rebuild`。
+
+### Phase 3 / 4
+吞吐延迟与 soak / Citus 真实多节点数据面。详见 [delivery-plan.md](delivery-plan.md)。Citus 当前 `DataPlane::Gated`；PhysicalHa 已复用 Standalone。
 
 ## 测试环境
 
