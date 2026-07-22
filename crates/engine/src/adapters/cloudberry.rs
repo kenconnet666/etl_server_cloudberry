@@ -91,6 +91,14 @@ impl DdlScope {
     }
 
     fn requires_barrier(&self, message: &cloudberry_etl_core::change::DdlMessage) -> bool {
+        use cloudberry_etl_core::change::DdlReplicationImpact;
+
+        // Commands proven harmless to the mirrored row stream (index maintenance,
+        // comments, privileges, statistics) never need a barrier, even when they
+        // touch a managed schema. Everything else stays fail-closed below.
+        if message.replication_impact() == DdlReplicationImpact::Irrelevant {
+            return false;
+        }
         if message.affected_schemas.is_empty() {
             return true;
         }
@@ -1085,6 +1093,38 @@ mod tests {
             &known,
         )
         .unwrap();
+        assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
+    }
+
+    #[test]
+    fn replication_irrelevant_ddl_never_raises_a_barrier() {
+        let registry = TableBindingRegistry::new([]).unwrap();
+        // CREATE INDEX on an in-scope managed schema must not trigger a rebuild:
+        // it cannot change the mirrored relation's columns, types, PK, or rows.
+        let create_index = batch(vec![TransactionChange::Ddl(DdlMessage {
+            version: 1,
+            command_tag: "CREATE INDEX".to_owned(),
+            relation_ids: vec![7],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "abc".to_owned(),
+        })]);
+        let request =
+            build_apply_request(fence(), "slot", &registry, &create_index).unwrap();
+        assert!(request.tables.is_empty());
+        assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
+
+        // An unrelated privilege change is likewise ignored under an include list.
+        let grant = batch(vec![TransactionChange::Ddl(DdlMessage {
+            version: 1,
+            command_tag: "GRANT".to_owned(),
+            relation_ids: vec![],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "abc".to_owned(),
+        })]);
+        let scope = DdlScope::new(Some(HashSet::from(["public".to_owned()])), HashSet::new());
+        let request =
+            build_apply_request_scoped(fence(), "slot", &registry, &scope, &grant).unwrap();
+        assert!(request.tables.is_empty());
         assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
     }
 
