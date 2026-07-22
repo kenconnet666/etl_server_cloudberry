@@ -47,6 +47,10 @@ pub enum SchemaPlanError {
     Encode(String),
     #[error("catalog validation omitted relation {0}")]
     MissingCatalogRelation(u32),
+    #[error("capability action for relation {0} has no active persistent table generation")]
+    MissingActiveTableGeneration(u32),
+    #[error("persistent table generation overflow for relation {0}")]
+    TableGenerationOverflow(u32),
 }
 
 #[derive(Debug, Error)]
@@ -505,6 +509,7 @@ pub async fn prepare_schema_capability_event<C>(
     fence: PipelineFence,
     plan: SchemaTransactionPlan,
     before: &BTreeMap<u32, TableSchema>,
+    active_generations: &BTreeMap<u32, u64>,
 ) -> Result<PreparedSchemaCapabilityEvent, SchemaCoordinatorError>
 where
     C: GenericClient + Sync,
@@ -538,6 +543,8 @@ where
     let target_transaction = target.transaction().await?;
     let record_outcome = record_schema_event_in_transaction(&target_transaction, &record).await?;
     for (relation_id, action) in &capability.actions {
+        let (active_table_generation, pending_table_generation) =
+            transition_generations(*relation_id, action, active_generations)?;
         let action_record = TableTransitionRecord {
             event_id: record.event_id,
             fence,
@@ -548,8 +555,8 @@ where
             plan: serde_json::to_value(action)
                 .map_err(|error| SchemaPlanError::Encode(error.to_string()))?,
             barrier_lsn: plan.source_position.lsn,
-            active_table_generation: None,
-            pending_table_generation: None,
+            active_table_generation,
+            pending_table_generation,
             snapshot_group_id: None,
         };
         record_table_transition_in_transaction(&target_transaction, &action_record).await?;
@@ -565,6 +572,32 @@ where
         },
         capability,
     })
+}
+
+fn transition_generations(
+    relation_id: u32,
+    action: &SchemaAction,
+    active_generations: &BTreeMap<u32, u64>,
+) -> Result<(Option<u64>, Option<u64>), SchemaPlanError> {
+    match action {
+        SchemaAction::Noop => Ok((None, None)),
+        SchemaAction::Add { .. } => Ok((None, Some(1))),
+        SchemaAction::Drop => active_generations
+            .get(&relation_id)
+            .copied()
+            .map(|active| (Some(active), None))
+            .ok_or(SchemaPlanError::MissingActiveTableGeneration(relation_id)),
+        SchemaAction::Online { .. } | SchemaAction::Reload { .. } => {
+            let active = active_generations
+                .get(&relation_id)
+                .copied()
+                .ok_or(SchemaPlanError::MissingActiveTableGeneration(relation_id))?;
+            let pending = active
+                .checked_add(1)
+                .ok_or(SchemaPlanError::TableGenerationOverflow(relation_id))?;
+            Ok((Some(active), Some(pending)))
+        }
+    }
 }
 
 const fn table_transition_action(action: &SchemaAction) -> TableTransitionAction {
@@ -1285,6 +1318,58 @@ mod tests {
         assert!(matches!(
             unmanaged_drop.actions.get(&42),
             Some(SchemaAction::Noop)
+        ));
+    }
+
+    #[test]
+    fn persistent_transition_generations_follow_action_lifecycle() {
+        let after = table(42, &[("id", false)]);
+        let active = BTreeMap::from([(42, 9)]);
+        assert_eq!(
+            transition_generations(42, &SchemaAction::Noop, &active).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            transition_generations(
+                42,
+                &SchemaAction::Add {
+                    after: after.clone()
+                },
+                &active
+            )
+            .unwrap(),
+            (None, Some(1))
+        );
+        assert_eq!(
+            transition_generations(42, &SchemaAction::Drop, &active).unwrap(),
+            (Some(9), None)
+        );
+        assert_eq!(
+            transition_generations(
+                42,
+                &SchemaAction::Reload {
+                    after,
+                    reason: ReloadReason::UnsafeDiff,
+                },
+                &active,
+            )
+            .unwrap(),
+            (Some(9), Some(10))
+        );
+        assert!(matches!(
+            transition_generations(7, &SchemaAction::Drop, &active),
+            Err(SchemaPlanError::MissingActiveTableGeneration(7))
+        ));
+        assert!(matches!(
+            transition_generations(
+                42,
+                &SchemaAction::Reload {
+                    after: table(42, &[("id", false)]),
+                    reason: ReloadReason::UnsafeDiff,
+                },
+                &BTreeMap::from([(42, u64::MAX)]),
+            ),
+            Err(SchemaPlanError::TableGenerationOverflow(42))
         ));
     }
 

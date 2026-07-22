@@ -143,6 +143,7 @@ async fn run_test(
         fence,
         plan.clone(),
         &Default::default(),
+        &Default::default(),
     )
     .await?;
     assert!(prepared.event.catalog_validation.is_exact_match());
@@ -162,6 +163,8 @@ async fn run_test(
         .expect("bound table action is persisted with the event");
     assert_eq!(table_transition.event_id, prepared.event.event_id);
     assert_eq!(table_transition.action, TableTransitionAction::Add);
+    assert_eq!(table_transition.active_table_generation, None);
+    assert_eq!(table_transition.pending_table_generation, Some(1));
     let persisted_action: SchemaAction = serde_json::from_value(table_transition.plan)?;
     assert!(matches!(persisted_action, SchemaAction::Add { .. }));
 
@@ -171,6 +174,7 @@ async fn run_test(
         &catalog_options,
         fence,
         plan,
+        &Default::default(),
         &Default::default(),
     )
     .await?;

@@ -311,6 +311,27 @@ impl TableBindingRegistry {
         Ok(schemas)
     }
 
+    /// Snapshot the persistent target generation for each active relation. This generation is
+    /// independent from `TableSchema::generation`, which tracks only the current pgoutput
+    /// connection's relation-cache shape.
+    pub fn active_table_generations(&self) -> Result<BTreeMap<u32, u64>, AdapterConfigError> {
+        let mut generations = BTreeMap::new();
+        for binding in self.bindings.values() {
+            if generations
+                .insert(
+                    binding.schema.relation_id,
+                    binding.identity.table_generation,
+                )
+                .is_some()
+            {
+                return Err(AdapterConfigError::AmbiguousActiveRelation(
+                    binding.schema.relation_id,
+                ));
+            }
+        }
+        Ok(generations)
+    }
+
     /// Classify a DDL against the currently bound schema for `(relation_id,
     /// generation)`, comparing the binding's mirrored (before) schema to the
     /// supplied post-DDL (after) schema. Returns `None` when no binding exists
@@ -764,6 +785,10 @@ impl CloudberryTransactionSink {
             .registry
             .active_schemas()
             .map_err(|error| PipelineError::Target(error.to_string()))?;
+        let active_generations = self
+            .registry
+            .active_table_generations()
+            .map_err(|error| PipelineError::Target(error.to_string()))?;
         let mut source_client = source.client.lock().await;
         let source_transaction = source_client
             .build_transaction()
@@ -779,6 +804,7 @@ impl CloudberryTransactionSink {
             self.fence,
             plan,
             &before,
+            &active_generations,
         )
         .await
         .map_err(|error| PipelineError::Target(error.to_string()))?;
@@ -1695,6 +1721,20 @@ mod tests {
             .insert(binding(8, 1, "other", "items", "stage_items"))
             .expect("target and staging name are free after removal");
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn persistent_table_generations_are_separate_from_wire_generations() {
+        let registry = TableBindingRegistry::new([binding(
+            7,
+            3,
+            "source_items",
+            "target_items",
+            "stage_items",
+        )])
+        .unwrap();
+        assert_eq!(registry.active_schemas().unwrap()[&7].generation, 3);
+        assert_eq!(registry.active_table_generations().unwrap()[&7], 4);
     }
 
     #[test]

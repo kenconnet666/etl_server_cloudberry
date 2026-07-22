@@ -17,7 +17,8 @@ use cloudberry_etl_target_cloudberry::{
     table_transition::{
         TableTransitionAction, TableTransitionKey, TableTransitionRecord,
         TableTransitionRecordOutcome, TableTransitionState, advance_table_transition_state,
-        list_unfinished_table_transitions, load_table_transition, record_table_transition,
+        begin_table_snapshot_transition, list_unfinished_table_transitions, load_table_transition,
+        record_table_transition,
     },
 };
 use tokio_postgres::{Client, NoTls};
@@ -118,6 +119,7 @@ async fn run_ledger_test(
         source_xid: 4242,
         source_relation_id: 100,
     };
+    let snapshot_group_id = Uuid::now_v7();
     let table_record = TableTransitionRecord {
         event_id,
         fence: newer_fence,
@@ -129,7 +131,7 @@ async fn run_ledger_test(
         barrier_lsn: table_key.source_lsn,
         active_table_generation: Some(1),
         pending_table_generation: Some(2),
-        snapshot_group_id: Some(Uuid::now_v7()),
+        snapshot_group_id: None,
     };
     assert_eq!(
         record_table_transition(client, &table_record).await?,
@@ -148,15 +150,25 @@ async fn run_ledger_test(
     assert_eq!(unfinished_tables.len(), 1);
     assert_eq!(unfinished_tables[0].key, table_key);
 
-    advance_table_transition_state(
+    let snapshotting = begin_table_snapshot_transition(
         client,
         newer_fence,
         table_key,
         TableTransitionState::Pending,
-        TableTransitionState::Snapshotting,
-        None,
+        snapshot_group_id,
     )
     .await?;
+    assert_eq!(snapshotting.state, TableTransitionState::Snapshotting);
+    assert_eq!(snapshotting.snapshot_group_id, Some(snapshot_group_id));
+    let replayed_snapshotting = begin_table_snapshot_transition(
+        client,
+        newer_fence,
+        table_key,
+        TableTransitionState::Pending,
+        snapshot_group_id,
+    )
+    .await?;
+    assert_eq!(replayed_snapshotting, snapshotting);
     advance_table_transition_state(
         client,
         newer_fence,
@@ -285,7 +297,7 @@ async fn run_ledger_test(
             plan: serde_json::json!({"action": "reload"}),
             barrier_lsn: failed.source_lsn,
             active_table_generation: Some(1),
-            pending_table_generation: None,
+            pending_table_generation: Some(2),
             snapshot_group_id: None,
         },
     )

@@ -257,6 +257,12 @@ pub enum TableTransitionError {
     GenerationOutOfRange { field: &'static str, value: u64 },
     #[error("table transition snapshot group id cannot be nil")]
     InvalidSnapshotGroupId,
+    #[error("new table transitions cannot preassign a snapshot group")]
+    UnexpectedSnapshotGroupAssignment,
+    #[error("action {0} does not use a table snapshot")]
+    SnapshotUnsupportedAction(&'static str),
+    #[error("table snapshot transition has no pending generation")]
+    MissingPendingGeneration,
     #[error("persisted table transition contains invalid {field}: {value}")]
     InvalidPersistedValue { field: &'static str, value: String },
     #[error("replayed table transition differs in immutable field `{0}`")]
@@ -472,6 +478,94 @@ pub async fn advance_table_transition_state_in_transaction(
     Ok(())
 }
 
+/// Durably assigns a snapshot group and starts a reload/add shadow load.
+///
+/// Assignment and state movement share the pipeline fence transaction. An exact retry after an
+/// ambiguous commit returns the already-assigned transition; a different group fails closed.
+pub async fn begin_table_snapshot_transition(
+    client: &mut Client,
+    fence: PipelineFence,
+    key: TableTransitionKey,
+    expected: TableTransitionState,
+    snapshot_group_id: Uuid,
+) -> Result<TableTransition, TableTransitionError> {
+    if snapshot_group_id.is_nil() {
+        return Err(TableTransitionError::InvalidSnapshotGroupId);
+    }
+    validate_key(key)?;
+    if key.pipeline_id != fence.pipeline_id {
+        return Err(TableTransitionError::PipelineMismatch {
+            key: key.pipeline_id,
+            fence: fence.pipeline_id,
+        });
+    }
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let mut current = load_locked(&transaction, key)
+        .await?
+        .ok_or(TableTransitionError::NotFound)?;
+    if current.fencing_token != fence.fencing_token {
+        return Err(TableTransitionError::FenceMismatch {
+            stored: current.fencing_token,
+            active: fence.fencing_token,
+        });
+    }
+    if current.topology_generation != fence.topology_generation {
+        return Err(TableTransitionError::TopologyMismatch {
+            stored: current.topology_generation,
+            active: fence.topology_generation,
+        });
+    }
+    if !matches!(
+        current.action,
+        TableTransitionAction::Reload | TableTransitionAction::Add
+    ) {
+        return Err(TableTransitionError::SnapshotUnsupportedAction(
+            current.action.as_str(),
+        ));
+    }
+    if current.pending_table_generation.is_none() {
+        return Err(TableTransitionError::MissingPendingGeneration);
+    }
+    if current.state == TableTransitionState::Snapshotting
+        && current.snapshot_group_id == Some(snapshot_group_id)
+    {
+        transaction.commit().await?;
+        return Ok(current);
+    }
+    if current.state != expected {
+        return Err(TableTransitionError::StateMismatch {
+            expected: expected.as_str(),
+            actual: current.state.as_str(),
+        });
+    }
+    if current.snapshot_group_id.is_some() {
+        return Err(TableTransitionError::ReplayMismatch("snapshot_group_id"));
+    }
+    if !current
+        .action
+        .can_transition(expected, TableTransitionState::Snapshotting)
+    {
+        return Err(TableTransitionError::IllegalStateTransition {
+            action: current.action.as_str(),
+            from: expected.as_str(),
+            to: TableTransitionState::Snapshotting.as_str(),
+        });
+    }
+    let written = transaction
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions SET snapshot_group_id = $7, state = 'snapshotting', failure_reason = NULL, updated_at = clock_timestamp() WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn AND source_xid = $3 AND source_relation_id = $4 AND fencing_token = $5 AND state = $6 AND snapshot_group_id IS NULL",
+            &[&key.pipeline_id.as_uuid(), &key.source_lsn.to_string(), &database_xid(key.source_xid)?, &i64::from(key.source_relation_id), &fence.fencing_token, &expected.as_str(), &snapshot_group_id],
+        )
+        .await?;
+    ensure_one(written)?;
+    current.snapshot_group_id = Some(snapshot_group_id);
+    current.state = TableTransitionState::Snapshotting;
+    current.failure_reason = None;
+    transaction.commit().await?;
+    Ok(current)
+}
+
 fn record_key(record: &TableTransitionRecord) -> TableTransitionKey {
     TableTransitionKey {
         pipeline_id: record.fence.pipeline_id,
@@ -549,8 +643,28 @@ fn validate_record(record: &TableTransitionRecord) -> Result<(), TableTransition
     if record.plan.is_null() {
         return Err(TableTransitionError::InvalidPlan);
     }
-    if record.snapshot_group_id.is_some_and(|id| id.is_nil()) {
-        return Err(TableTransitionError::InvalidSnapshotGroupId);
+    if record.snapshot_group_id.is_some() {
+        return Err(TableTransitionError::UnexpectedSnapshotGroupAssignment);
+    }
+    let valid_generations = match record.action {
+        TableTransitionAction::Noop => {
+            record.active_table_generation.is_none() && record.pending_table_generation.is_none()
+        }
+        TableTransitionAction::Online | TableTransitionAction::Reload => {
+            matches!(
+                (record.active_table_generation, record.pending_table_generation),
+                (Some(active), Some(pending)) if pending == active.saturating_add(1) && active != u64::MAX
+            )
+        }
+        TableTransitionAction::Drop => {
+            record.active_table_generation.is_some() && record.pending_table_generation.is_none()
+        }
+        TableTransitionAction::Add => {
+            record.active_table_generation.is_none() && record.pending_table_generation == Some(1)
+        }
+    };
+    if !valid_generations {
+        return Err(TableTransitionError::ReplayMismatch("table_generations"));
     }
     database_generation("topology", record.fence.topology_generation)?;
     database_xid(record.source_xid)?;
@@ -587,10 +701,6 @@ fn validate_replay(
         (
             stored.pending_table_generation == record.pending_table_generation,
             "pending_table_generation",
-        ),
-        (
-            stored.snapshot_group_id == record.snapshot_group_id,
-            "snapshot_group_id",
         ),
     ];
     if let Some((_, field)) = fields.into_iter().find(|(matches, _)| !matches) {
@@ -719,5 +829,37 @@ mod tests {
             validate_key(key),
             Err(TableTransitionError::InvalidSourceRelationId)
         ));
+    }
+
+    #[test]
+    fn record_generations_match_action_lifecycle() {
+        let fence = PipelineFence {
+            pipeline_id: PipelineId::new(),
+            topology_generation: 3,
+            fencing_token: 7,
+        };
+        let mut record = TableTransitionRecord {
+            event_id: Uuid::now_v7(),
+            fence,
+            source_lsn: PgLsn::new(10),
+            source_xid: 11,
+            source_relation_id: 42,
+            action: TableTransitionAction::Reload,
+            plan: serde_json::json!({"action": "reload"}),
+            barrier_lsn: PgLsn::new(10),
+            active_table_generation: Some(4),
+            pending_table_generation: Some(5),
+            snapshot_group_id: None,
+        };
+        assert!(validate_record(&record).is_ok());
+        record.pending_table_generation = Some(6);
+        assert!(matches!(
+            validate_record(&record),
+            Err(TableTransitionError::ReplayMismatch("table_generations"))
+        ));
+        record.action = TableTransitionAction::Add;
+        record.active_table_generation = None;
+        record.pending_table_generation = Some(1);
+        assert!(validate_record(&record).is_ok());
     }
 }
