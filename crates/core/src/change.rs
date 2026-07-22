@@ -395,6 +395,42 @@ mod ddl_impact_tests {
         assert!(message.transitions.is_empty());
         assert_eq!(message.command_tag, "ALTER TABLE");
     }
+
+    #[test]
+    fn v2_transitions_round_trip_through_json() {
+        // schema_events stores transitions as JSONB; the tagged TransitionKind
+        // encoding must survive a serialize/deserialize round trip unchanged.
+        use super::{TableTransition, TransitionKind};
+        let mut original = ddl("ALTER TABLE");
+        original.version = 2;
+        original.transitions = vec![
+            TableTransition {
+                relation_id: 7,
+                before_generation: Some(1),
+                after_generation: Some(2),
+                before_fingerprint: Some("b".to_owned()),
+                after_fingerprint: Some("a".to_owned()),
+                kind: TransitionKind::AddColumn {
+                    name: "note".to_owned(),
+                    nullable_or_defaulted: true,
+                },
+            },
+            TableTransition {
+                relation_id: 8,
+                before_generation: None,
+                after_generation: Some(1),
+                before_fingerprint: None,
+                after_fingerprint: Some("x".to_owned()),
+                kind: TransitionKind::AddTable,
+            },
+        ];
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: DdlMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+        // The kind tag is present in the serialized form.
+        assert!(json.contains("\"kind\":\"add_column\""));
+        assert!(json.contains("\"kind\":\"add_table\""));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
