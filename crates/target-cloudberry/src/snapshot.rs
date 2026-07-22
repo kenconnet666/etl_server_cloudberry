@@ -40,7 +40,7 @@ pub use activation::{
 pub use cleanup::{
     QuarantineGcOutcome, QuarantineGcPolicy, SnapshotCleanupOutcome, SnapshotGroupCleanupRequest,
     cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
-    garbage_collect_quarantined_tables,
+    garbage_collect_quarantined_tables, reset_interrupted_table_snapshot_group,
 };
 pub use manifest::{SnapshotGroupRegistrationDisposition, begin_snapshot_group};
 pub use progress::{
@@ -142,6 +142,10 @@ pub enum SnapshotTargetError {
     SnapshotGroupNotLoading(Uuid),
     #[error("snapshot group `{0}` is owned by a table schema transition")]
     SnapshotGroupOwnedByTableTransition(Uuid),
+    #[error("snapshot group `{0}` is not owned by a reload/add table transition")]
+    SnapshotGroupNotOwnedByTableTransition(Uuid),
+    #[error("snapshot group `{0}` cannot be reset because its transition ownership is invalid")]
+    SnapshotGroupTransitionMismatch(Uuid),
     #[error("snapshot group cleanup authority and group fence do not match")]
     InvalidSnapshotCleanupFence,
     #[error(

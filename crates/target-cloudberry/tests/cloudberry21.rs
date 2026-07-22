@@ -28,10 +28,12 @@ use cloudberry_etl_target_cloudberry::{
     schema::plan_create_table_with_storage,
     snapshot::{
         ActiveTableRequirement, SnapshotActivationDisposition, SnapshotActivationRequest,
-        SnapshotApplyMode, SnapshotApplyOutcome, SnapshotGroupRegistrationDisposition,
-        SnapshotOwnership, SnapshotPageApplyOutcome, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, activate_table_snapshot_group, begin_snapshot_apply,
-        begin_snapshot_group, begin_snapshot_pages, plan_snapshot_target,
+        SnapshotApplyMode, SnapshotApplyOutcome, SnapshotGroupCleanupRequest,
+        SnapshotGroupRegistrationDisposition, SnapshotOwnership, SnapshotPageApplyOutcome,
+        SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group,
+        activate_table_snapshot_group, begin_snapshot_apply, begin_snapshot_group,
+        begin_snapshot_pages, cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
+        plan_snapshot_target, reset_interrupted_table_snapshot_group,
         validate_active_snapshot_group, validate_active_tables,
     },
     storage::{TargetStorage, load_relation_storage},
@@ -235,6 +237,224 @@ async fn cloudberry21_snapshot_paging_with_resume() -> Result<(), Box<dyn Error>
     cleanup(&client, &target_schema, pipeline_id).await;
     connection_task.abort();
     result
+}
+
+#[tokio::test]
+#[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_interrupted_table_snapshot_resets_to_fresh_start()
+-> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (mut client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("integration test Cloudberry connection ended: {error}");
+        }
+    });
+
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_schema = format!("pg2cb_reset_it_{suffix}");
+    let pipeline_id = PipelineId::new();
+    let result =
+        run_interrupted_table_snapshot_reset_test(&mut client, &target_schema, pipeline_id).await;
+    cleanup(&client, &target_schema, pipeline_id).await;
+    connection_task.abort();
+    result
+}
+
+async fn run_interrupted_table_snapshot_reset_test(
+    client: &mut Client,
+    target_schema: &str,
+    pipeline_id: PipelineId,
+) -> Result<(), Box<dyn Error>> {
+    migrate_target_database(client).await?;
+    let original_fence = PipelineFence {
+        pipeline_id,
+        topology_generation: 1,
+        fencing_token: 20,
+    };
+    activate_pipeline_fence(client, original_fence).await?;
+
+    let mut reloaded_schema = source_schema();
+    reloaded_schema.generation = 2;
+    let plan = plan_snapshot_target(
+        &reloaded_schema,
+        QualifiedName::new(target_schema, "items")?,
+        QualifiedName::new(target_schema, "items__reload_shadow")?,
+    )?;
+    let snapshot_group_id = Uuid::now_v7();
+    let request = SnapshotActivationRequest {
+        fence: original_fence,
+        snapshot_group_id,
+        tables: vec![plan.activation_table("sha256:reload-generation-2")],
+        initial_checkpoints: vec![NodeCheckpoint {
+            key: CheckpointKey {
+                pipeline_id,
+                topology_generation: 1,
+                node_id: 0,
+            },
+            system_identifier: 1_234,
+            timeline: 1,
+            slot_name: "pg2cb_reload_snapshot_slot".to_owned(),
+            applied_lsn: PgLsn::new(0x2000),
+        }],
+    };
+    begin_snapshot_group(client, &request).await?;
+    let ownership = SnapshotOwnership {
+        fence: original_fence,
+        snapshot_group_id,
+        schema_fingerprint: "sha256:reload-generation-2".to_owned(),
+    };
+    let mut loader = begin_snapshot_pages(client, plan.clone(), &ownership).await?;
+    let partial_page =
+        futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from("1\tpartial\t1\n"))]);
+    loader
+        .apply_page(client, vec!["1".to_owned()], false, partial_page)
+        .await?;
+
+    let event_id = Uuid::now_v7();
+    client
+        .execute(
+            "INSERT INTO pg2cb_meta.table_schema_transitions (
+                event_id, pipeline_id, topology_generation, source_lsn, source_xid,
+                source_relation_id, action, plan, barrier_lsn, active_table_generation,
+                pending_table_generation, snapshot_group_id, state, fencing_token
+             ) VALUES ($1, $2, $3, $4::text::pg_lsn, $5, $6, 'reload', $7,
+                       $4::text::pg_lsn, 1, 2, $8, 'snapshotting', $9)",
+            &[
+                &event_id,
+                &pipeline_id.as_uuid(),
+                &1_i64,
+                &PgLsn::new(0x1800).to_string(),
+                &7_i64,
+                &i64::from(reloaded_schema.relation_id),
+                &serde_json::json!({"action": "reload"}),
+                &snapshot_group_id,
+                &original_fence.fencing_token,
+            ],
+        )
+        .await?;
+
+    let current_fence = PipelineFence {
+        fencing_token: 21,
+        ..original_fence
+    };
+    activate_pipeline_fence(client, current_fence).await?;
+    assert!(matches!(
+        reset_interrupted_table_snapshot_group(client, original_fence, snapshot_group_id).await,
+        Err(SnapshotTargetError::Checkpoint(
+            cloudberry_etl_target_cloudberry::checkpoint::CheckpointError::StaleFence { .. }
+        ))
+    ));
+    assert!(
+        cleanup_stale_snapshot_groups(client, current_fence)
+            .await?
+            .is_empty(),
+        "generic stale cleanup must preserve transition-owned groups"
+    );
+
+    for invalid_state in ["catching_up", "cutover_pending"] {
+        client
+            .execute(
+                "UPDATE pg2cb_meta.table_schema_transitions SET state = $3
+                  WHERE pipeline_id = $1 AND snapshot_group_id = $2",
+                &[&pipeline_id.as_uuid(), &snapshot_group_id, &invalid_state],
+            )
+            .await?;
+        assert!(matches!(
+            reset_interrupted_table_snapshot_group(client, current_fence, snapshot_group_id).await,
+            Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(group))
+                if group == snapshot_group_id
+        ));
+    }
+    client
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions
+                SET state = 'snapshotting', pending_table_generation = 3
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2",
+            &[&pipeline_id.as_uuid(), &snapshot_group_id],
+        )
+        .await?;
+    assert!(matches!(
+        reset_interrupted_table_snapshot_group(client, current_fence, snapshot_group_id).await,
+        Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(group))
+            if group == snapshot_group_id
+    ));
+    client
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions SET pending_table_generation = 2
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2",
+            &[&pipeline_id.as_uuid(), &snapshot_group_id],
+        )
+        .await?;
+
+    let outcome =
+        reset_interrupted_table_snapshot_group(client, current_fence, snapshot_group_id).await?;
+    assert_eq!(outcome.dropped_shadows, vec![plan.shadow.target.clone()]);
+    let shadow_exists: bool = client
+        .query_one(
+            "SELECT to_regclass(format('%I.%I', $1, $2)) IS NOT NULL",
+            &[&plan.shadow.target.schema, &plan.shadow.target.name],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(!shadow_exists);
+    for table in [
+        "snapshot_groups",
+        "snapshot_group_tables",
+        "snapshot_group_nodes",
+        "snapshot_table_progress",
+    ] {
+        let remaining: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM pg2cb_meta.{table} WHERE snapshot_group_id = $1"),
+                &[&snapshot_group_id],
+            )
+            .await?
+            .try_get(0)?;
+        assert_eq!(remaining, 0, "{table} must be removed atomically");
+    }
+    let transition = client
+        .query_one(
+            "SELECT state, snapshot_group_id, fencing_token, failure_reason
+               FROM pg2cb_meta.table_schema_transitions
+              WHERE pipeline_id = $1 AND source_lsn = $2::text::pg_lsn",
+            &[&pipeline_id.as_uuid(), &PgLsn::new(0x1800).to_string()],
+        )
+        .await?;
+    assert_eq!(transition.try_get::<_, String>("state")?, "pending");
+    assert_eq!(
+        transition.try_get::<_, Option<Uuid>>("snapshot_group_id")?,
+        None
+    );
+    assert_eq!(transition.try_get::<_, i64>("fencing_token")?, 21);
+    assert_eq!(
+        transition.try_get::<_, Option<String>>("failure_reason")?,
+        None
+    );
+
+    let unrelated_group_id = Uuid::now_v7();
+    let unrelated_request = SnapshotActivationRequest {
+        snapshot_group_id: unrelated_group_id,
+        fence: current_fence,
+        tables: request.tables.clone(),
+        initial_checkpoints: request.initial_checkpoints.clone(),
+    };
+    begin_snapshot_group(client, &unrelated_request).await?;
+    assert!(matches!(
+        reset_interrupted_table_snapshot_group(client, current_fence, unrelated_group_id).await,
+        Err(SnapshotTargetError::SnapshotGroupNotOwnedByTableTransition(group))
+            if group == unrelated_group_id
+    ));
+    cleanup_loading_snapshot_group(
+        client,
+        SnapshotGroupCleanupRequest {
+            current_fence,
+            group_fence: current_fence,
+            snapshot_group_id: unrelated_group_id,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run_snapshot_paging_test(
@@ -1410,6 +1630,18 @@ fn text(value: &'static str) -> Cell {
 
 async fn cleanup(client: &Client, target_schema: &str, pipeline_id: PipelineId) {
     let id = pipeline_id.as_uuid();
+    let _ = client
+        .execute(
+            "DELETE FROM pg2cb_meta.table_schema_transitions WHERE pipeline_id = $1",
+            &[&id],
+        )
+        .await;
+    let _ = client
+        .execute(
+            "DELETE FROM pg2cb_meta.schema_events WHERE pipeline_id = $1",
+            &[&id],
+        )
+        .await;
     let group_ids = client
         .query(
             "SELECT snapshot_group_id FROM pg2cb_meta.snapshot_groups WHERE pipeline_id = $1",
@@ -1421,6 +1653,12 @@ async fn cleanup(client: &Client, target_schema: &str, pipeline_id: PipelineId) 
         .map(|row| row.get::<_, Uuid>(0))
         .collect::<Vec<_>>();
     for group_id in group_ids {
+        let _ = client
+            .execute(
+                "DELETE FROM pg2cb_meta.snapshot_table_progress WHERE snapshot_group_id = $1",
+                &[&group_id],
+            )
+            .await;
         let _ = client
             .execute(
                 "DELETE FROM pg2cb_meta.snapshot_reconciliation_log WHERE snapshot_group_id = $1",

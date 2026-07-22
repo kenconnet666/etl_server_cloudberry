@@ -375,6 +375,161 @@ async fn cleanup_loading_snapshot_group_locked(
     })
 }
 
+/// Discards an interrupted COPY whose exported source snapshot no longer exists.
+///
+/// Every transition referencing the group must still be in `snapshotting`. The old shadow,
+/// cursor and manifest are removed with the transition reset, so a later attempt must establish a
+/// fresh source snapshot and bind a new group instead of reusing an invalid cursor.
+pub async fn reset_interrupted_table_snapshot_group(
+    client: &mut Client,
+    current_fence: PipelineFence,
+    snapshot_group_id: Uuid,
+) -> Result<SnapshotCleanupOutcome, SnapshotTargetError> {
+    if snapshot_group_id.is_nil() {
+        return Err(SnapshotTargetError::InvalidSnapshotGroupId);
+    }
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, current_fence).await?;
+    let group = transaction
+        .query_opt(
+            "SELECT pipeline_id, topology_generation, fencing_token, state
+               FROM pg2cb_meta.snapshot_groups
+              WHERE snapshot_group_id = $1
+              FOR UPDATE",
+            &[&snapshot_group_id],
+        )
+        .await?
+        .ok_or(SnapshotTargetError::SnapshotGroupNotRegistered(
+            snapshot_group_id,
+        ))?;
+    let group_pipeline = PipelineId::from_uuid(group.try_get("pipeline_id")?);
+    let group_generation_raw: i64 = group.try_get("topology_generation")?;
+    let group_generation = u64::try_from(group_generation_raw)
+        .map_err(|_| SnapshotTargetError::CorruptSnapshotGroupManifest(snapshot_group_id))?;
+    let group_token: i64 = group.try_get("fencing_token")?;
+    let group_state: String = group.try_get("state")?;
+    if group_pipeline != current_fence.pipeline_id
+        || group_generation != current_fence.topology_generation
+        || group_token <= 0
+        || group_token > current_fence.fencing_token
+    {
+        return Err(SnapshotTargetError::SnapshotGroupFenceMismatch {
+            group: snapshot_group_id,
+            expected_generation: current_fence.topology_generation,
+            expected_token: current_fence.fencing_token,
+            actual_generation: group_generation,
+            actual_token: group_token,
+        });
+    }
+    if group_state != "loading" {
+        return Err(SnapshotTargetError::SnapshotGroupNotLoading(
+            snapshot_group_id,
+        ));
+    }
+
+    let stored = manifest::load_snapshot_group(&transaction, snapshot_group_id).await?;
+
+    let transitions = transaction
+        .query(
+            "SELECT source_relation_id, pending_table_generation, action, state,
+                    topology_generation, fencing_token
+               FROM pg2cb_meta.table_schema_transitions
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2
+              ORDER BY source_lsn, source_xid, source_relation_id
+              FOR UPDATE",
+            &[&current_fence.pipeline_id.as_uuid(), &snapshot_group_id],
+        )
+        .await?;
+    if transitions.is_empty() {
+        return Err(SnapshotTargetError::SnapshotGroupNotOwnedByTableTransition(
+            snapshot_group_id,
+        ));
+    }
+    let expected_generation = database_generation(current_fence.topology_generation)?;
+    let mut transition_tables = HashSet::with_capacity(transitions.len());
+    for row in &transitions {
+        let relation_id_raw: i64 = row.try_get("source_relation_id")?;
+        let relation_id = u32::try_from(relation_id_raw)
+            .map_err(|_| SnapshotTargetError::SnapshotGroupTransitionMismatch(snapshot_group_id))?;
+        let table_generation_raw: Option<i64> = row.try_get("pending_table_generation")?;
+        let table_generation = table_generation_raw
+            .and_then(|generation| u64::try_from(generation).ok())
+            .ok_or(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                snapshot_group_id,
+            ))?;
+        let action: String = row.try_get("action")?;
+        let state: String = row.try_get("state")?;
+        let generation: i64 = row.try_get("topology_generation")?;
+        let token: i64 = row.try_get("fencing_token")?;
+        if !matches!(action.as_str(), "reload" | "add")
+            || state != "snapshotting"
+            || generation != expected_generation
+            || token > current_fence.fencing_token
+        {
+            return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                snapshot_group_id,
+            ));
+        }
+        if !transition_tables.insert((relation_id, table_generation)) {
+            return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+                snapshot_group_id,
+            ));
+        }
+    }
+
+    let manifest_tables = stored
+        .request
+        .tables
+        .iter()
+        .map(|table| (table.source_relation_id, table.table_generation))
+        .collect::<HashSet<_>>();
+    if manifest_tables.len() != stored.request.tables.len() || transition_tables != manifest_tables
+    {
+        return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+            snapshot_group_id,
+        ));
+    }
+
+    // Remove the association before invoking the normal cleanup path. Both changes are in this
+    // transaction, so cleanup failure restores the transition ownership and every shadow.
+    let reset = transaction
+        .execute(
+            "UPDATE pg2cb_meta.table_schema_transitions
+                SET state = 'pending', snapshot_group_id = NULL, failure_reason = NULL,
+                    fencing_token = $3, updated_at = clock_timestamp()
+              WHERE pipeline_id = $1 AND snapshot_group_id = $2 AND state = 'snapshotting'
+                AND action IN ('reload', 'add') AND topology_generation = $4
+                AND fencing_token <= $3",
+            &[
+                &current_fence.pipeline_id.as_uuid(),
+                &snapshot_group_id,
+                &current_fence.fencing_token,
+                &expected_generation,
+            ],
+        )
+        .await?;
+    if reset != transitions.len() as u64 {
+        return Err(SnapshotTargetError::SnapshotGroupTransitionMismatch(
+            snapshot_group_id,
+        ));
+    }
+    let cleanup = cleanup_loading_snapshot_group_locked(
+        &transaction,
+        SnapshotGroupCleanupRequest {
+            current_fence,
+            group_fence: PipelineFence {
+                pipeline_id: group_pipeline,
+                topology_generation: group_generation,
+                fencing_token: group_token,
+            },
+            snapshot_group_id,
+        },
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(cleanup)
+}
+
 /// Garbage-collects eligible quarantines for one pipeline.
 ///
 /// The default policy is disabled. When enabled, each candidate is checked against its immutable
