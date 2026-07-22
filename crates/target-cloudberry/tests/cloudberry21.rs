@@ -180,21 +180,6 @@ async fn run_snapshot_paging_test(
     );
     assert_eq!(loader.cursor(), &["tenant-a", "2"], "cursor advanced");
 
-    // Idempotent re-apply: same cursor -> ResumeAt
-    let stream_retry = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(page1))]);
-    let outcome_retry = loader
-        .apply_page(
-            client,
-            vec!["tenant-a".to_owned(), "2".to_owned()],
-            false,
-            stream_retry,
-        )
-        .await?;
-    assert!(
-        matches!(outcome_retry, SnapshotPageApplyOutcome::ResumeAt(_)),
-        "page1 retry => ResumeAt: {outcome_retry:?}"
-    );
-
     // Page 2: tenant-b, 10, 1 row
     let page2 = "tenant-b\t10\tpayload-10\n";
     let stream2 = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(page2))]);

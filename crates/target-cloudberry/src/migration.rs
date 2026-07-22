@@ -294,8 +294,12 @@ CREATE TABLE IF NOT EXISTS pg2cb_meta.schema_events (
     fencing_token bigint NOT NULL CHECK (fencing_token > 0),
     emitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     processed_at timestamptz,
+    -- Cloudberry requires the distribution key to be a subset of every UNIQUE/PK
+    -- constraint. The real idempotency key is (pipeline_id, source_lsn, source_xid)
+    -- and pipeline_id distributes a pipeline's ordered history to one segment.
+    -- event_id is a UUIDv7 used only as an opaque record handle (never a lookup
+    -- or FK), so it does not carry a separate UNIQUE constraint.
     PRIMARY KEY (pipeline_id, source_lsn, source_xid),
-    UNIQUE (event_id),
     CHECK ((state IN ('completed', 'failed')) = (processed_at IS NOT NULL)),
     CHECK ((state = 'failed') OR (failure_reason IS NULL))
 )
@@ -566,7 +570,9 @@ mod tests {
         assert!(TARGET_V8_SQL.contains("transitions jsonb NOT NULL"));
         assert!(TARGET_V8_SQL.contains("state text NOT NULL DEFAULT 'pending'"));
         assert!(TARGET_V8_SQL.contains("PRIMARY KEY (pipeline_id, source_lsn, source_xid)"));
-        assert!(TARGET_V8_SQL.contains("UNIQUE (event_id)"));
+        // No standalone UNIQUE(event_id): Cloudberry requires the distribution key
+        // to be a subset of every unique constraint, and event_id is not a lookup key.
+        assert!(!TARGET_V8_SQL.contains("UNIQUE (event_id)"));
         assert!(TARGET_V8_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
         assert!(TARGET_V8_SQL.contains("schema_events_pending_idx"));
     }
