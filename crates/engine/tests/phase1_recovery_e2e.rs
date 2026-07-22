@@ -18,6 +18,7 @@ use std::{
 use chrono::Utc;
 use cloudberry_etl_core::{
     id::{PipelineId, SourceId, TargetId},
+    lsn::PgLsn,
     mapping::SourcePrefix,
     pipeline::SourceTopology,
     schema::QualifiedName,
@@ -39,6 +40,7 @@ use cloudberry_etl_metadata::{
 use cloudberry_etl_target_cloudberry::apply::{
     LedgeredCommitKind, LedgeredCommitObserver, LedgeredCommitPhase,
 };
+use cloudberry_etl_target_cloudberry::snapshot::SnapshotPageCommitObserver;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use secrecy::SecretString;
 use serde_json::json;
@@ -106,6 +108,7 @@ const CAPACITY_PROFILE: RuntimeProfile = RuntimeProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryFault {
+    SnapshotPageAfterCommit,
     Source(SourceIngestPoint),
     Target {
         phase: LedgeredCommitPhase,
@@ -156,6 +159,12 @@ impl SourceIngestObserver for FaultController {
 impl LedgeredCommitObserver for FaultController {
     fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String> {
         self.trigger(RecoveryFault::Target { phase, kind })
+    }
+}
+
+impl SnapshotPageCommitObserver for FaultController {
+    fn observe_after_commit(&self) -> Result<(), String> {
+        self.trigger(RecoveryFault::SnapshotPageAfterCommit)
     }
 }
 
@@ -233,9 +242,20 @@ async fn full_runtime_proves_phase1_recovery_and_capacity_boundaries() -> Result
     let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
     let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
 
+    run_snapshot_restart_case(&source_dsn, &target_dsn).await?;
     run_recovery_case(&source_dsn, &target_dsn).await?;
     run_large_transaction_case(&source_dsn, &target_dsn).await?;
     run_capacity_wait_case(&source_dsn, &target_dsn).await
+}
+
+async fn run_snapshot_restart_case(
+    source_dsn: &str,
+    target_dsn: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, RECOVERY_PROFILE).await?;
+    let result = run_snapshot_restart(&mut context).await;
+    context.cleanup().await;
+    result
 }
 
 async fn run_recovery_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
@@ -334,6 +354,145 @@ async fn run_recovery_matrix(context: &mut TestContext) -> Result<(), Box<dyn Er
         );
     }
 
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LoadingSnapshotState {
+    group_id: Uuid,
+    shadow_schema: String,
+    shadow_table: String,
+    shadow_relation_oid: i64,
+    cursor: Vec<String>,
+    pages_copied: i64,
+    rows_copied: i64,
+    consistent_lsn: PgLsn,
+}
+
+#[derive(Debug)]
+struct ActiveSnapshotState {
+    group_id: Uuid,
+    relation_oid: i64,
+    consistent_lsn: PgLsn,
+    checkpoint_lsn: PgLsn,
+}
+
+async fn run_snapshot_restart(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload) SELECT value, 'snapshot-' || value::text FROM generate_series(2::bigint, 6::bigint) AS value",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+    context
+        .controller
+        .arm(RecoveryFault::SnapshotPageAfterCommit);
+
+    let mut active = context.start_job().await?;
+    context.controller.wait_until_fired().await?;
+    active.expect_fault(context.store.as_ref()).await?;
+
+    let old = load_single_loading_snapshot(&context.target, context.pipeline.id).await?;
+    assert_eq!(old.cursor, ["2"]);
+    assert_eq!(old.pages_copied, 1);
+    assert_eq!(old.rows_copied, 2);
+    let old_shadow = format!("{}.{}", old.shadow_schema, old.shadow_table);
+    let old_shadow_exists: bool = context
+        .target
+        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&old_shadow])
+        .await?
+        .get(0);
+    assert!(
+        old_shadow_exists,
+        "committed first page must leave its shadow"
+    );
+
+    let names = replication_names(context.pipeline.id, 0);
+    assert_eq!(
+        source_slot_count(&context.source, &names.slot).await?,
+        0,
+        "the failed initial source snapshot must drop S0's logical slot"
+    );
+
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload) VALUES (0, 'inserted-before-old-cursor')",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+
+    active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 7, &active).await?;
+
+    let new = load_single_active_snapshot(&context.target, context.pipeline.id).await?;
+    assert_ne!(
+        new.group_id, old.group_id,
+        "restart must create a new S1 group"
+    );
+    assert!(
+        new.consistent_lsn > old.consistent_lsn,
+        "S1 must be exported after the source write that followed S0"
+    );
+    assert_eq!(
+        new.checkpoint_lsn, new.consistent_lsn,
+        "activation must initialize the checkpoint from S1"
+    );
+    assert_ne!(
+        new.relation_oid, old.shadow_relation_oid,
+        "the stale shadow must be dropped instead of adopted by S1"
+    );
+    assert_eq!(
+        stale_snapshot_artifact_count(&context.target, context.pipeline.id, old.group_id).await?,
+        0,
+        "every old group, progress, manifest, and managed-table row must be removed"
+    );
+    let old_relation_exists: bool = context
+        .target
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE oid::bigint=$1)",
+            &[&old.shadow_relation_oid],
+        )
+        .await?
+        .get(0);
+    assert!(!old_relation_exists, "the old physical shadow must be gone");
+    assert_eq!(
+        snapshot_group_count(&context.target, context.pipeline.id, "loading").await?,
+        0
+    );
+    assert_eq!(
+        snapshot_group_count(&context.target, context.pipeline.id, "active").await?,
+        1
+    );
+    assert_eq!(source_slot_count(&context.source, &names.slot).await?, 1);
+    let sentinel: i64 = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.items WHERE id=0 AND payload='inserted-before-old-cursor'",
+                quote_identifier(&context.target_schema)
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(sentinel, 1, "S1 must restart before the old S0 cursor");
+    assert_eq!(rebuild_operation_count(context).await?, 0);
     assert_source_target_equal(
         &context.source,
         &context.target,
@@ -543,7 +702,8 @@ impl TestContext {
         )
         .with_spool_root(&self.spool_root)
         .with_source_ingest_observer(Arc::<FaultController>::clone(&self.controller))
-        .with_target_commit_observer(Arc::<FaultController>::clone(&self.controller));
+        .with_target_commit_observer(Arc::<FaultController>::clone(&self.controller))
+        .with_snapshot_page_commit_observer(Arc::<FaultController>::clone(&self.controller));
         let telemetry = PipelineTelemetryHandle::new(self.pipeline.id);
         let job = factory
             .create(&self.pipeline, &lease, telemetry.clone())
@@ -873,6 +1033,131 @@ async fn target_ledger_rows(
                  (SELECT count(*) FROM pg2cb_meta.transaction_chunk_progress WHERE pipeline_id=$1) +
                  (SELECT count(*) FROM pg2cb_meta.transaction_committed_chunks WHERE pipeline_id=$1)",
             &[&pipeline_id.as_uuid()],
+        )
+        .await
+        .map(|row| row.get(0))
+}
+
+async fn load_single_loading_snapshot(
+    target: &Client,
+    pipeline_id: PipelineId,
+) -> Result<LoadingSnapshotState, Box<dyn Error>> {
+    let rows = target
+        .query(
+            "SELECT g.snapshot_group_id, t.shadow_schema, t.shadow_table,
+                    p.shadow_relation_oid, p.cursor_values, p.pages_copied, p.rows_copied,
+                    n.consistent_lsn::text AS consistent_lsn
+             FROM pg2cb_meta.snapshot_groups AS g
+             JOIN pg2cb_meta.snapshot_group_tables AS t
+               ON t.snapshot_group_id=g.snapshot_group_id
+             JOIN pg2cb_meta.snapshot_table_progress AS p
+               ON p.snapshot_group_id=t.snapshot_group_id
+              AND p.target_schema=t.target_schema AND p.target_table=t.target_table
+             JOIN pg2cb_meta.snapshot_group_nodes AS n
+               ON n.snapshot_group_id=g.snapshot_group_id
+             WHERE g.pipeline_id=$1 AND g.state='loading'",
+            &[&pipeline_id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(rows.len(), 1, "expected exactly one loading snapshot table");
+    let row = &rows[0];
+    Ok(LoadingSnapshotState {
+        group_id: row.try_get("snapshot_group_id")?,
+        shadow_schema: row.try_get("shadow_schema")?,
+        shadow_table: row.try_get("shadow_table")?,
+        shadow_relation_oid: row.try_get("shadow_relation_oid")?,
+        cursor: row.try_get("cursor_values")?,
+        pages_copied: row.try_get("pages_copied")?,
+        rows_copied: row.try_get("rows_copied")?,
+        consistent_lsn: row.try_get::<_, String>("consistent_lsn")?.parse()?,
+    })
+}
+
+async fn load_single_active_snapshot(
+    target: &Client,
+    pipeline_id: PipelineId,
+) -> Result<ActiveSnapshotState, Box<dyn Error>> {
+    let rows = target
+        .query(
+            "SELECT g.snapshot_group_id, m.relation_oid,
+                    n.consistent_lsn::text AS consistent_lsn,
+                    c.applied_lsn::text AS checkpoint_lsn
+             FROM pg2cb_meta.snapshot_groups AS g
+             JOIN pg2cb_meta.snapshot_group_tables AS t
+               ON t.snapshot_group_id=g.snapshot_group_id
+             JOIN pg2cb_meta.snapshot_group_nodes AS n
+               ON n.snapshot_group_id=g.snapshot_group_id
+             JOIN pg2cb_meta.node_checkpoints AS c
+               ON c.pipeline_id=g.pipeline_id
+              AND c.topology_generation=g.topology_generation
+              AND c.node_id=n.node_id
+             JOIN pg2cb_meta.managed_tables AS m
+               ON m.pipeline_id=g.pipeline_id
+              AND m.target_schema=t.target_schema AND m.target_table=t.target_table
+              AND m.state='active'
+             WHERE g.pipeline_id=$1 AND g.state='active'",
+            &[&pipeline_id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(rows.len(), 1, "expected exactly one active snapshot table");
+    let row = &rows[0];
+    Ok(ActiveSnapshotState {
+        group_id: row.try_get("snapshot_group_id")?,
+        relation_oid: row.try_get("relation_oid")?,
+        consistent_lsn: row.try_get::<_, String>("consistent_lsn")?.parse()?,
+        checkpoint_lsn: row.try_get::<_, String>("checkpoint_lsn")?.parse()?,
+    })
+}
+
+async fn stale_snapshot_artifact_count(
+    target: &Client,
+    pipeline_id: PipelineId,
+    group_id: Uuid,
+) -> Result<i64, tokio_postgres::Error> {
+    target
+        .query_one(
+            "SELECT
+                 (SELECT count(*) FROM pg2cb_meta.snapshot_groups WHERE snapshot_group_id=$1) +
+                 (SELECT count(*) FROM pg2cb_meta.snapshot_group_tables WHERE snapshot_group_id=$1) +
+                 (SELECT count(*) FROM pg2cb_meta.snapshot_group_nodes WHERE snapshot_group_id=$1) +
+                 (SELECT count(*) FROM pg2cb_meta.snapshot_table_progress WHERE snapshot_group_id=$1) +
+                 (SELECT count(*) FROM pg2cb_meta.managed_tables WHERE pipeline_id=$2 AND snapshot_group_id=$1)",
+            &[&group_id, &pipeline_id.as_uuid()],
+        )
+        .await
+        .map(|row| row.get(0))
+}
+
+async fn snapshot_group_count(
+    target: &Client,
+    pipeline_id: PipelineId,
+    state: &str,
+) -> Result<i64, tokio_postgres::Error> {
+    target
+        .query_one(
+            "SELECT count(*) FROM pg2cb_meta.snapshot_groups WHERE pipeline_id=$1 AND state=$2",
+            &[&pipeline_id.as_uuid(), &state],
+        )
+        .await
+        .map(|row| row.get(0))
+}
+
+async fn source_slot_count(source: &Client, slot_name: &str) -> Result<i64, tokio_postgres::Error> {
+    source
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name=$1",
+            &[&slot_name],
+        )
+        .await
+        .map(|row| row.get(0))
+}
+
+async fn rebuild_operation_count(context: &TestContext) -> Result<i64, tokio_postgres::Error> {
+    context
+        .source
+        .query_one(
+            "SELECT count(*) FROM cloudberry_etl_control.operations WHERE pipeline_id=$1 AND operation_type='rebuild'",
+            &[&context.pipeline.id.as_uuid()],
         )
         .await
         .map(|row| row.get(0))

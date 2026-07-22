@@ -115,6 +115,8 @@ pub enum SnapshotTargetError {
     SourceStream(String),
     #[error("target COPY sink failed: {0}")]
     CopySink(String),
+    #[error("snapshot page commit observer failed: {0}")]
+    PageCommitObserver(String),
     #[error("snapshot COPY has already completed")]
     CopyAlreadyCompleted,
     #[error("snapshot transaction cannot commit before COPY completes")]
@@ -477,6 +479,27 @@ pub struct SnapshotPageLoader {
     completed: bool,
 }
 
+/// Observes the durable boundary after a bounded snapshot page transaction commits.
+///
+/// Returning an error makes the commit result intentionally ambiguous to the caller. The caller
+/// must discard the source snapshot session; a later owner then fences and removes the loading
+/// group before starting a fresh source snapshot.
+pub trait SnapshotPageCommitObserver: Send + Sync {
+    fn observe_after_commit(&self) -> Result<(), String>;
+}
+
+#[derive(Debug)]
+struct NoopSnapshotPageCommitObserver;
+
+impl SnapshotPageCommitObserver for NoopSnapshotPageCommitObserver {
+    fn observe_after_commit(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+static NOOP_SNAPSHOT_PAGE_COMMIT_OBSERVER: NoopSnapshotPageCommitObserver =
+    NoopSnapshotPageCommitObserver;
+
 impl SnapshotPageLoader {
     /// The last durably committed cursor. Empty means the scan starts at the
     /// table head; the caller maps this to `None` for the source pager.
@@ -515,6 +538,29 @@ impl SnapshotPageLoader {
         S: Stream<Item = Result<Bytes, E>>,
         E: Display,
     {
+        self.apply_page_observed(
+            client,
+            next_cursor,
+            completed,
+            stream,
+            &NOOP_SNAPSHOT_PAGE_COMMIT_OBSERVER,
+        )
+        .await
+    }
+
+    /// Deterministic fault-injection entry point for the page commit boundary.
+    pub async fn apply_page_observed<S, E>(
+        &mut self,
+        client: &mut Client,
+        next_cursor: Vec<String>,
+        completed: bool,
+        stream: S,
+        observer: &dyn SnapshotPageCommitObserver,
+    ) -> Result<SnapshotPageApplyOutcome, SnapshotTargetError>
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+        E: Display,
+    {
         let transaction = client.transaction().await?;
         lock_pipeline_fence(&transaction, self.ownership.fence).await?;
         let outcome = progress::copy_snapshot_page(
@@ -528,6 +574,9 @@ impl SnapshotPageLoader {
         )
         .await?;
         transaction.commit().await?;
+        observer
+            .observe_after_commit()
+            .map_err(SnapshotTargetError::PageCommitObserver)?;
         let progress = match &outcome {
             SnapshotPageApplyOutcome::Applied(progress)
             | SnapshotPageApplyOutcome::ResumeAt(progress)

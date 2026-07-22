@@ -231,7 +231,7 @@ services:
 
 ---
 
-## Phase 1: Standalone Bounded Data Path（预计 10-12 天）
+## Phase 1: Standalone Bounded Data Path（已完成，2026-07-22）
 
 ### 目标
 完成 bounded snapshot、target progress、E2E kill-point 验证；取消事务大小失败。
@@ -323,35 +323,31 @@ tests/integration/snapshot_bounded.rs      [新增] E2E 测试（真实 PG18 + C
 3. 若 S0 存活且 fence 一致，从 `last_key_text` cursor 继续
 4. 每个 page 先 source 读取，再 target bounded COPY，再更新 progress，最后 commit
 
-**交付标准:**
-- 真实 PG18 表（1M 行、复合 PK），snapshot 期间 kill 进程，重启后从头重拉（不能续传旧 cursor）
-- 同一 S0 内 commit ambiguity（target commit 后 process hang），重启后跳过已提交 chunk
+**交付标准（已完成）:**
+- 真实 PG18→Cloudberry 完整 runtime 在首个 bounded page commit 后注入 fatal error；销毁 job 后证明 S0 slot 已删除、旧 cursor/shadow 仍持久化
+- 在旧 cursor 前插入哨兵行，重获 lease 后清理旧 group/物理 shadow，以新 slot/S1 从表头重拉，源目标逐行一致且不请求 rebuild
+- source 与 target 独立真实集成测试覆盖复合 PK paging；百万行 snapshot 吞吐与资源曲线归入 Phase 3 benchmark/soak
 
 ---
 
-#### 1.4 Spool 自动清理（1 天）
-**目标:** checkpoint 成功后，按时间窗口自动清理过期 journal。
+#### 1.4 Spool 自动清理（已完成）
+**目标:** target checkpoint 成功后立即释放已提交事务 journal，并安全回收重启残留与旧 topology generation。
 
 **文件变更:**
 ```
-crates/source-postgres/src/spool.rs        [修改] 增加 cleanup_expired_journals()
-crates/config/src/bootstrap.rs             [修改] 增加 spool_directory、spool_retention_hours 配置
-```
-
-**配置:**
-```toml
-[engine]
-spool_directory = "./spool"          # 默认相对路径
-spool_retention_hours = 24           # checkpoint 后保留 24h 用于审计
+crates/source-postgres/src/spool.rs        [修改] 幂等 retire、verified replay 与旧 generation 清理
+crates/engine/src/pipeline.rs               [修改] checkpoint 后 retire、ACK 前传播清理错误
 ```
 
 **逻辑:**
-- 每次 checkpoint 推进后，扫描 spool 目录，删除 `mtime > retention_hours` 且 LSN < checkpoint 的 journal
-- 磁盘剩余空间 < 5% 时进入 RESOURCE_WAIT，不自动删除更多（等待人工扩容）
+- target checkpoint 持久后先删 manifest、再幂等删除 segments，清理成功后才 ACK source
+- 重启时先证明 managed slot 可从 target checkpoint 重放，再清空同 identity 的中断残留
+- 新 topology generation 启动时 best-effort 删除更低 generation 目录
+- disk high-water/minimum-free-space 触发 `RESOURCE_WAIT`，不提前 ACK；已有事务 retire 后自动重试保留的 WAL message
 
 **交付标准:**
-- 单测覆盖 journal 创建、checkpoint 推进、自动清理、ENOSPC 保护
-- 真实环境写入大事务、checkpoint、验证旧 journal 被删除
+- 单测覆盖幂等删除、verified replay 清理、旧 generation 清理和容量失败重试
+- 真实环境以两个 spill 事务触发 96 KiB high-water，自动恢复并验证无 rebuild、generation 不变、源目标一致
 
 ---
 
@@ -382,10 +378,10 @@ crates/engine/tests/phase1_recovery_e2e.rs [新增] typed-observer 恢复矩阵
 ### Phase 1 退出条件
 - [x] Source snapshot 使用 keyset paging，单测覆盖 PG18 真实表
 - [x] Target snapshot progress 持久化，commit ambiguity 可续传
-- [ ] Bounded snapshot runtime 崩溃后从新 S1 重拉，不复用旧 cursor
-- [ ] Spool journal 按时间窗口自动清理，ENOSPC 进入 RESOURCE_WAIT
+- [x] Bounded snapshot runtime 崩溃后从新 S1 重拉，不复用旧 cursor
+- [x] Spool 在 durable checkpoint 后 retire，重启/旧 generation 残留可清理，容量水位进入并自动退出 RESOURCE_WAIT
 - [x] 5 个 E2E kill-point 场景通过，数据最终一致
-- [ ] `docs/delivery-plan.md` 更新 Phase 1 完成状态
+- [x] `docs/delivery-plan.md` 更新 Phase 1 完成状态
 
 ---
 

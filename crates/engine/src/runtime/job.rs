@@ -39,10 +39,10 @@ use cloudberry_etl_target_cloudberry::{
     },
     migration::{MigrationError, migrate_target_database},
     snapshot::{
-        QuarantineGcPolicy, SnapshotActivationRequest, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages,
-        cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables, plan_snapshot_target,
-        validate_active_snapshot_group,
+        QuarantineGcPolicy, SnapshotActivationRequest, SnapshotPageCommitObserver,
+        SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group, begin_snapshot_apply,
+        begin_snapshot_group, begin_snapshot_pages, cleanup_stale_snapshot_groups,
+        garbage_collect_quarantined_tables, plan_snapshot_target, validate_active_snapshot_group,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -191,6 +191,7 @@ pub struct PostgresCloudberryJobFactory {
     spool_root: PathBuf,
     source_ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
     target_commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
+    snapshot_page_commit_observer: Option<Arc<dyn SnapshotPageCommitObserver>>,
 }
 
 impl std::fmt::Debug for PostgresCloudberryJobFactory {
@@ -210,6 +211,7 @@ impl PostgresCloudberryJobFactory {
             spool_root: PathBuf::from("data/spool"),
             source_ingest_observer: None,
             target_commit_observer: None,
+            snapshot_page_commit_observer: None,
         }
     }
 
@@ -231,6 +233,15 @@ impl PostgresCloudberryJobFactory {
         observer: Arc<dyn LedgeredCommitObserver>,
     ) -> Self {
         self.target_commit_observer = Some(observer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_snapshot_page_commit_observer(
+        mut self,
+        observer: Arc<dyn SnapshotPageCommitObserver>,
+    ) -> Self {
+        self.snapshot_page_commit_observer = Some(observer);
         self
     }
 
@@ -299,6 +310,10 @@ impl PostgresCloudberryJobFactory {
             spool_root: self.spool_root.clone(),
             source_ingest_observer: self.source_ingest_observer.as_ref().map(Arc::clone),
             target_commit_observer: self.target_commit_observer.as_ref().map(Arc::clone),
+            snapshot_page_commit_observer: self
+                .snapshot_page_commit_observer
+                .as_ref()
+                .map(Arc::clone),
             telemetry,
         })
     }
@@ -334,6 +349,7 @@ struct PostgresCloudberryJob {
     spool_root: PathBuf,
     source_ingest_observer: Option<Arc<dyn SourceIngestObserver>>,
     target_commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
+    snapshot_page_commit_observer: Option<Arc<dyn SnapshotPageCommitObserver>>,
     telemetry: PipelineTelemetryHandle,
 }
 
@@ -967,10 +983,30 @@ impl PostgresCloudberryJob {
             let completed = !has_more;
 
             let stream = snapshot.copy_text_pk_range(schema, &range).await?;
+            let apply_page = async {
+                match &self.snapshot_page_commit_observer {
+                    Some(observer) => {
+                        loader
+                            .apply_page_observed(
+                                target,
+                                next_cursor,
+                                completed,
+                                stream,
+                                observer.as_ref(),
+                            )
+                            .await
+                    }
+                    None => {
+                        loader
+                            .apply_page(target, next_cursor, completed, stream)
+                            .await
+                    }
+                }
+            };
             let outcome = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Err(RuntimeJobError::Cancelled),
-                outcome = loader.apply_page(target, next_cursor, completed, stream) => outcome?,
+                outcome = apply_page => outcome?,
             };
             tracing::debug!(
                 pipeline_id = %self.pipeline_id,

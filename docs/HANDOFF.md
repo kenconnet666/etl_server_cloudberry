@@ -42,25 +42,21 @@ cargo test --workspace --lib
 - 版本校验：`source-postgres` `verify_pg18_version`、`target-cloudberry::version::verify_cloudberry_21_version`。
 - `tests/integration/docker-compose.yml`：PG18(55432) + Cloudberry 2.1(55433)，含 init 脚本与 healthcheck。
 
-### Phase 1 — Standalone 连续数据面 🔶 进行中
+### Phase 1 — Standalone 连续数据面 ✅ 完成
 已完成（构建块 + 单测）：
 - **1.1 Source keyset paging** ✅ `crates/source-postgres/src/snapshot.rs`：`read_canonical_pk_page`（`LIMIT+1` lookahead、typed `ROW(...)>ROW(...)`、`SnapshotKeyPage{has_more,next_key}`）、`read_canonical_row_page`、`copy_text_pk_range`。含真实 PG18 集成测试 `tests/snapshot_page_pg18.rs`（opt-in）。
 - **1.2 Target snapshot progress** ✅ `crates/target-cloudberry/src/snapshot/progress.rs`：`register_snapshot_table_progress`、`copy_snapshot_page`（COPY 与 cursor 同事务）、完整 CRUD SQL、V7 schema。
-- **1.4 Spool 自动清理** ✅ `crates/source-postgres/src/spool.rs`：`remove_superseded_generations` 在 `open` 时回收更低 generation 的目录，best-effort 非致命。
-- **故障注入边界** ✅ source adapter 已暴露 fatal `AfterSourceRead` / `AfterSpoolCommit` observer；target ledger apply 已暴露 final/non-final chunk 与空事务的 commit 前后 observer。生产 factory 默认不安装 observer，测试 factory 可将同一控制器贯穿完整 runtime 数据路径。
+- **1.4 Spool 自动清理** ✅ target checkpoint 持久后通过 `ChangeSource::cleanup` 立即幂等 retire；verified WAL replay 启动路径清理同 identity 中断残留；`remove_superseded_generations` 在 `open` 时 best-effort 回收更低 generation 目录。
+- **故障注入边界** ✅ source adapter 已暴露 fatal `AfterSourceRead` / `AfterSpoolCommit` observer；target ledger apply 已暴露 final/non-final chunk 与空事务的 commit 前后 observer；bounded snapshot 暴露 page commit 后 observer。生产 factory 默认不安装 observer，测试 factory 可将同一控制器贯穿完整 runtime 数据路径。
 - **1.5 完整 runtime 恢复矩阵** ✅ `crates/engine/tests/phase1_recovery_e2e.rs` 在真实 PG18 + Cloudberry 2.1 上覆盖 source read 后、spool commit 后、非 final target chunk commit 前/后、final chunk commit 后五个边界。每次故障均销毁 job、释放/重获 lease、重建 factory/source/sink，再验证源目标有序行完全相同且 target ledger 清空。该矩阵同时发现并修复 shadow 名误用 fencing token 的问题；shadow 现在按 topology/snapshot generation 规划，跨 lease 保持稳定，fencing 仍独立阻止旧 owner 写入。
 - **大事务内存水位** ✅ 同一真实矩阵用 32,768 行、约 32 MiB 的单事务压过 64 KiB memory high-water 512 倍，typed observer 证明事务走 durable spool；Linux `/proc/self/status` 实测 RSS 增量约 5.8 MiB，CI gate 上限 24 MiB（低于事务 payload），源目标最终逐行一致。
 - **磁盘 high-water 自动恢复** ✅ 两个已 spill 事务在 96 KiB high-water 下稳定进入 `RESOURCE_WAIT`；batch deadline 会先 apply/retire 已完成 spool，再以保留的同一 WAL message 继续，resource wait 自动清除、job 不重启、snapshot generation 不变且不产生 rebuild operation。
 - **长 target apply source 心跳** ✅ target apply 期间每 10 秒发送一次旧 durable LSN standby status，直到 apply 成功后才 cleanup/ACK；修复大事务 apply 超过 PostgreSQL `wal_sender_timeout` 时连接关闭的问题，暂停时间单测证明 25 秒 apply 中不提前 ACK。
+- **Bounded snapshot 崩溃恢复** ✅ 完整 runtime 在第一页 target COPY+cursor 提交后注入 fatal error，确认 S0 slot 被删除但旧 loading group/progress/shadow 保留；源端再插入位于旧 cursor 前的 `id=0`，重获 lease 后由新 fence 清理旧 group 与物理 OID，创建新 slot/S1 从表头重拉。测试验证新 group/LSN/checkpoint、无 loading 残留、无 rebuild operation，且源目标逐行完全一致。
 
 - **1.3 runtime 接入 bounded snapshot** ✅ `crates/engine/src/runtime/job.rs`：`load_table_snapshot` 按 PK page 循环（`read_canonical_pk_page` → `copy_range` → `copy_text_pk_range` → target `SnapshotPageLoader::apply_page` 同事务 cursor）；无 PK 表 fallback 整表 COPY。target 侧 `begin_snapshot_pages`/`SnapshotPageLoader`（`crates/target-cloudberry/src/snapshot.rs`）。含集成测试 `cloudberry21_snapshot_paging_with_resume`。**源侧 PK 分页已在真实 PG18 验证通过**。
 
-**未完成（下一位优先处理，按顺序）：**
-
-1. **Bounded snapshot 进程中断 E2E。** 在 snapshot page commit 后中止完整 job，验证旧 loading group/shadow 被 fencing cleanup，创建新 slot/S1 后从表头完整重拉，不复用旧 S0 cursor。
-2. **1.4 补充按时间的 spool 清理（可选增强）。** 现在只按 generation 回收。若要"checkpoint 后保留 N 小时再删当前 generation 内已 retire 的 journal"，需在 `SpoolLimits`/config 增加 `retention` 字段并在 checkpoint 推进后调用。
-
-**Phase 1 退出条件：** 最大测试事务显著大于进程内存预算且内存保持水位内；上述 5 个 kill 点均收敛；磁盘 high-water 进入 `RESOURCE_WAIT`，扩容后继续且不触发 rebuild。
+**Phase 1 关闭说明：** transaction spool 在 target checkpoint 持久后立即幂等 retire；重启时先证明 slot 可从 checkpoint 重放，再清理同 identity 的中断残留；新 topology generation 清理旧目录。spool 不承担审计留存，避免额外 retention 配置和无谓磁盘占用。最大测试事务约 32 MiB，相对 64 KiB memory high-water 超过 512 倍，RSS 增量约 5.7 MiB；snapshot post-commit 与 5 个 CDC kill 点全部收敛；磁盘 high-water 可自动退出 `RESOURCE_WAIT` 且不触发 rebuild。真实组合 E2E 最近耗时约 105 秒。
 
 ### Phase 2 — DDL 紧密跟随 🔶 进行中（本轮 2026-07-22 打下基础）
 已完成（构建块 + 单测，见 `docs/phase2-ddl-tight-follow-adr.md`）：

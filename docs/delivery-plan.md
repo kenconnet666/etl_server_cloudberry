@@ -60,7 +60,7 @@ ConsistencyRunner
 退出条件：默认分支 CI 全绿；容器可启动并通过 health smoke；所有 checked-in 配置能被严格验证；
 测试环境不依赖开发者机器路径。
 
-## Phase 1：Standalone 连续数据面
+## Phase 1：Standalone 连续数据面（已完成，2026-07-22）
 
 目标：在单节点上完成最终数据路径，而不是继续扩展旧 `Vec` assembler。
 
