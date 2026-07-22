@@ -403,6 +403,28 @@ pub async fn advance_table_transition_state(
     next: TableTransitionState,
     failure_reason: Option<&str>,
 ) -> Result<(), TableTransitionError> {
+    let transaction = client.transaction().await?;
+    advance_table_transition_state_in_transaction(
+        &transaction,
+        fence,
+        key,
+        expected,
+        next,
+        failure_reason,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn advance_table_transition_state_in_transaction(
+    transaction: &Transaction<'_>,
+    fence: PipelineFence,
+    key: TableTransitionKey,
+    expected: TableTransitionState,
+    next: TableTransitionState,
+    failure_reason: Option<&str>,
+) -> Result<(), TableTransitionError> {
     validate_failure_reason(next, failure_reason)?;
     validate_key(key)?;
     if key.pipeline_id != fence.pipeline_id {
@@ -411,9 +433,8 @@ pub async fn advance_table_transition_state(
             fence: fence.pipeline_id,
         });
     }
-    let transaction = client.transaction().await?;
-    lock_pipeline_fence(&transaction, fence).await?;
-    let current = load_locked(&transaction, key)
+    lock_pipeline_fence(transaction, fence).await?;
+    let current = load_locked(transaction, key)
         .await?
         .ok_or(TableTransitionError::NotFound)?;
     if current.fencing_token != fence.fencing_token {
@@ -448,7 +469,6 @@ pub async fn advance_table_transition_state(
         )
         .await?;
     ensure_one(written)?;
-    transaction.commit().await?;
     Ok(())
 }
 

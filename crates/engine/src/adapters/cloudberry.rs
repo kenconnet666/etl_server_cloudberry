@@ -19,14 +19,20 @@ use cloudberry_etl_target_cloudberry::{
     apply::{
         ApplyPlan, ApplyPlanError, ApplyRequest, DataChunkDisposition, LedgeredCommitObserver,
         LedgeredDataChunkOutcome, LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome,
-        TableApplyBatch, execute_ledgered_data_chunk, execute_ledgered_data_chunk_observed,
-        execute_ledgered_empty_transaction, execute_ledgered_empty_transaction_observed,
-        plan_apply_with_storage,
+        LedgeredTransactionFinalizer, TableApplyBatch, execute_ledgered_data_chunk,
+        execute_ledgered_data_chunk_finalized, execute_ledgered_data_chunk_observed,
+        execute_ledgered_data_chunk_observed_finalized, execute_ledgered_empty_transaction,
+        execute_ledgered_empty_transaction_finalized, execute_ledgered_empty_transaction_observed,
+        execute_ledgered_empty_transaction_observed_finalized, plan_apply_with_storage,
     },
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
     managed::TableApplyIdentity,
+    schema_event::{SchemaEventState, advance_schema_event_state_in_transaction},
     storage::TargetStorage,
+    table_transition::{
+        TableTransitionKey, TableTransitionState, advance_table_transition_state_in_transaction,
+    },
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -36,7 +42,7 @@ use crate::{
     batch::TransactionBatch,
     normalize::normalize_table_changes,
     pipeline::{PipelineError, SchemaEventKey, TransactionSink},
-    schema_transition::{plan_schema_transaction, prepare_schema_capability_event},
+    schema_transition::{SchemaAction, plan_schema_transaction, prepare_schema_capability_event},
 };
 
 // This versions the logical record digest consumed by the target ledger, not its memory or spool
@@ -543,6 +549,51 @@ struct SchemaSource {
     options: CatalogOptions,
 }
 
+enum PreparedSchemaBarrier {
+    Block(PipelineError),
+    CompleteNoop(NoopSchemaFinalizer),
+}
+
+struct NoopSchemaFinalizer {
+    fence: PipelineFence,
+    event: SchemaEventKey,
+    relation_ids: Vec<u32>,
+}
+
+#[async_trait]
+impl LedgeredTransactionFinalizer for NoopSchemaFinalizer {
+    async fn finalize(&self, transaction: &tokio_postgres::Transaction<'_>) -> Result<(), String> {
+        for relation_id in &self.relation_ids {
+            advance_table_transition_state_in_transaction(
+                transaction,
+                self.fence,
+                TableTransitionKey {
+                    pipeline_id: self.fence.pipeline_id,
+                    source_lsn: self.event.source_lsn,
+                    source_xid: self.event.source_xid,
+                    source_relation_id: *relation_id,
+                },
+                TableTransitionState::Pending,
+                TableTransitionState::Completed,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        advance_schema_event_state_in_transaction(
+            transaction,
+            self.fence,
+            self.event.source_lsn,
+            self.event.source_xid,
+            SchemaEventState::Pending,
+            SchemaEventState::Completed,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl CloudberryTransactionSink {
     pub fn new(
         client: Client,
@@ -668,7 +719,7 @@ impl CloudberryTransactionSink {
         &self,
         client: &mut Client,
         batch: &TransactionBatch,
-    ) -> Result<Option<PipelineError>, PipelineError> {
+    ) -> Result<Option<PreparedSchemaBarrier>, PipelineError> {
         if !batch.has_generation_barrier() {
             return Ok(None);
         }
@@ -701,11 +752,13 @@ impl CloudberryTransactionSink {
             plan.affected_schemas
         );
         let Some(source) = &self.schema_source else {
-            return Ok(Some(PipelineError::SchemaBarrier {
-                reason,
-                command_tag,
-                schema_event: None,
-            }));
+            return Ok(Some(PreparedSchemaBarrier::Block(
+                PipelineError::SchemaBarrier {
+                    reason,
+                    command_tag,
+                    schema_event: None,
+                },
+            )));
         };
         let before = self
             .registry
@@ -737,20 +790,40 @@ impl CloudberryTransactionSink {
             "{reason}; capability plan: {}",
             prepared.capability.action_summary()
         );
-        Ok(Some(PipelineError::SchemaBarrier {
-            reason,
-            command_tag,
-            schema_event: Some(SchemaEventKey {
-                source_lsn: prepared.event.plan.source_position.lsn,
-                source_xid: u64::from(prepared.event.plan.source_xid),
-            }),
-        }))
+        let event = SchemaEventKey {
+            source_lsn: prepared.event.plan.source_position.lsn,
+            source_xid: u64::from(prepared.event.plan.source_xid),
+        };
+        if prepared.capability.is_table_local()
+            && !prepared.capability.actions.is_empty()
+            && prepared
+                .capability
+                .actions
+                .values()
+                .all(|action| matches!(action, SchemaAction::Noop))
+        {
+            return Ok(Some(PreparedSchemaBarrier::CompleteNoop(
+                NoopSchemaFinalizer {
+                    fence: self.fence,
+                    event,
+                    relation_ids: prepared.capability.actions.keys().copied().collect(),
+                },
+            )));
+        }
+        Ok(Some(PreparedSchemaBarrier::Block(
+            PipelineError::SchemaBarrier {
+                reason,
+                command_tag,
+                schema_event: Some(event),
+            },
+        )))
     }
 
     async fn apply_transaction(
         &self,
         client: &mut Client,
         transaction: &CommittedTransaction,
+        finalizer: Option<&dyn LedgeredTransactionFinalizer>,
     ) -> Result<(), PipelineError> {
         let stats = transaction
             .change_source
@@ -758,8 +831,18 @@ impl CloudberryTransactionSink {
             .map_err(|error| PipelineError::Source(error.to_string()))?;
         let manifest = transaction_manifest(self.fence, &self.slot_name, transaction, stats);
         if manifest.record_count == 0 {
-            let outcome = match &self.commit_observer {
-                Some(observer) => {
+            let outcome = match (&self.commit_observer, finalizer) {
+                (Some(observer), Some(finalizer)) => {
+                    execute_ledgered_empty_transaction_observed_finalized(
+                        client,
+                        self.fence,
+                        &manifest,
+                        observer.as_ref(),
+                        finalizer,
+                    )
+                    .await
+                }
+                (Some(observer), None) => {
                     execute_ledgered_empty_transaction_observed(
                         client,
                         self.fence,
@@ -768,7 +851,15 @@ impl CloudberryTransactionSink {
                     )
                     .await
                 }
-                None => execute_ledgered_empty_transaction(client, self.fence, &manifest).await,
+                (None, Some(finalizer)) => {
+                    execute_ledgered_empty_transaction_finalized(
+                        client, self.fence, &manifest, finalizer,
+                    )
+                    .await
+                }
+                (None, None) => {
+                    execute_ledgered_empty_transaction(client, self.fence, &manifest).await
+                }
             }
             .map_err(|error| PipelineError::Target(error.to_string()))?;
             return match outcome {
@@ -812,11 +903,23 @@ impl CloudberryTransactionSink {
                 chunk: chunk_identity,
                 tables,
             };
-            let outcome = match &self.commit_observer {
-                Some(observer) => {
+            let outcome = match (&self.commit_observer, finalizer) {
+                (Some(observer), Some(finalizer)) => {
+                    execute_ledgered_data_chunk_observed_finalized(
+                        client,
+                        &request,
+                        observer.as_ref(),
+                        finalizer,
+                    )
+                    .await
+                }
+                (Some(observer), None) => {
                     execute_ledgered_data_chunk_observed(client, &request, observer.as_ref()).await
                 }
-                None => execute_ledgered_data_chunk(client, &request).await,
+                (None, Some(finalizer)) => {
+                    execute_ledgered_data_chunk_finalized(client, &request, finalizer).await
+                }
+                (None, None) => execute_ledgered_data_chunk(client, &request).await,
             }
             .map_err(|error| PipelineError::Target(error.to_string()))?;
             let (durable_next, disposition, completed) = match outcome {
@@ -897,11 +1000,21 @@ fn validate_resume_sequence(
 impl TransactionSink for CloudberryTransactionSink {
     async fn apply(&self, batch: &TransactionBatch) -> Result<(), PipelineError> {
         let mut client = self.client.lock().await;
-        if let Some(barrier) = self.prepare_schema_barrier(&mut client, batch).await? {
-            return Err(barrier);
-        }
+        let schema = self.prepare_schema_barrier(&mut client, batch).await?;
+        let finalizer = match schema {
+            Some(PreparedSchemaBarrier::Block(barrier)) => return Err(barrier),
+            Some(PreparedSchemaBarrier::CompleteNoop(finalizer)) => Some(finalizer),
+            None => None,
+        };
         for transaction in batch.transactions() {
-            self.apply_transaction(&mut client, transaction).await?;
+            self.apply_transaction(
+                &mut client,
+                transaction,
+                finalizer
+                    .as_ref()
+                    .map(|value| value as &dyn LedgeredTransactionFinalizer),
+            )
+            .await?;
         }
         Ok(())
     }

@@ -649,6 +649,44 @@ async fn run_capacity_wait(context: &mut TestContext) -> Result<(), Box<dyn Erro
 async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
     let mut active = context.start_job().await?;
     wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+    let initial_checkpoint = load_checkpoint_lsn(&context.target, context.pipeline.id).await?;
+
+    context
+        .source
+        .batch_execute(&format!(
+            "BEGIN;
+             CREATE TABLE {}.transient_noop (id bigint PRIMARY KEY);
+             DROP TABLE {}.transient_noop;
+             COMMIT;",
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    wait_for_checkpoint_after(
+        &context.target,
+        context.pipeline.id,
+        initial_checkpoint,
+        &active,
+    )
+    .await?;
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    let noop_states = context
+        .target
+        .query_one(
+            "SELECT
+                 count(*) FILTER (WHERE e.state='completed'),
+                 count(*) FILTER (WHERE t.state='completed')
+               FROM pg2cb_meta.schema_events e
+               JOIN pg2cb_meta.table_schema_transitions t
+                 ON t.pipeline_id=e.pipeline_id AND t.source_lsn=e.source_lsn
+                AND t.source_xid=e.source_xid
+              WHERE e.pipeline_id=$1 AND t.action='noop'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(noop_states.get::<_, i64>(0), 1);
+    assert_eq!(noop_states.get::<_, i64>(1), 1);
+
     let checkpoint_before = load_checkpoint_lsn(&context.target, context.pipeline.id).await?;
 
     context
@@ -671,7 +709,7 @@ async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Er
     let event = context
         .target
         .query_one(
-            "SELECT state, failure_reason, transitions FROM pg2cb_meta.schema_events WHERE pipeline_id=$1",
+            "SELECT state, failure_reason, transitions FROM pg2cb_meta.schema_events WHERE pipeline_id=$1 AND state='failed'",
             &[&context.pipeline.id.as_uuid()],
         )
         .await?;
@@ -1014,6 +1052,35 @@ async fn wait_for_target_count(
     }
 }
 
+async fn wait_for_checkpoint_after(
+    target: &Client,
+    pipeline_id: PipelineId,
+    previous: PgLsn,
+    active: &ActiveJob,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before checkpoint advanced: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        if load_checkpoint_lsn(target, pipeline_id).await? > previous {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "target checkpoint did not advance after schema no-op",
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_resource_wait(active: &ActiveJob) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + WAIT_TIMEOUT;
     loop {
@@ -1313,6 +1380,7 @@ async fn cleanup_target_metadata(target: &Client, pipeline_id: PipelineId) {
             .await;
     }
     for table in [
+        "table_schema_transitions",
         "schema_events",
         "transaction_committed_chunks",
         "transaction_chunk_progress",

@@ -6,6 +6,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 cloudberry-etl-core.workspace = true
 futures.workspace = true

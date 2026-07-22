@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use cloudberry_etl_core::{
     change::Cell,
@@ -71,6 +72,8 @@ pub enum ApplyError {
     NonEmptyManifest { record_count: u64 },
     #[error("target commit observer failed: {0}")]
     CommitObserver(String),
+    #[error("transaction finalizer failed: {0}")]
+    Finalizer(String),
 }
 
 /// Durable transaction boundary exposed for fault injection and commit-latency instrumentation.
@@ -92,6 +95,13 @@ pub enum LedgeredCommitKind {
 
 pub trait LedgeredCommitObserver: Send + Sync {
     fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String>;
+}
+
+/// Rare-path metadata work that must commit with the final source-transaction chunk and
+/// checkpoint. Implementations must be idempotent under WAL replay.
+#[async_trait]
+pub trait LedgeredTransactionFinalizer: Send + Sync {
+    async fn finalize(&self, transaction: &Transaction<'_>) -> Result<(), String>;
 }
 
 #[derive(Debug)]
@@ -286,7 +296,21 @@ pub async fn execute_ledgered_data_chunk(
     client: &mut Client,
     request: &LedgeredDataChunkRequest,
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
-    execute_ledgered_data_chunk_observed(client, request, &NOOP_LEDGERED_COMMIT_OBSERVER).await
+    execute_ledgered_data_chunk_inner(client, request, &NOOP_LEDGERED_COMMIT_OBSERVER, None).await
+}
+
+pub async fn execute_ledgered_data_chunk_finalized(
+    client: &mut Client,
+    request: &LedgeredDataChunkRequest,
+    finalizer: &dyn LedgeredTransactionFinalizer,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    execute_ledgered_data_chunk_inner(
+        client,
+        request,
+        &NOOP_LEDGERED_COMMIT_OBSERVER,
+        Some(finalizer),
+    )
+    .await
 }
 
 /// Applies one ledgered chunk while observing its target commit boundary.
@@ -297,6 +321,24 @@ pub async fn execute_ledgered_data_chunk_observed(
     client: &mut Client,
     request: &LedgeredDataChunkRequest,
     observer: &dyn LedgeredCommitObserver,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    execute_ledgered_data_chunk_inner(client, request, observer, None).await
+}
+
+pub async fn execute_ledgered_data_chunk_observed_finalized(
+    client: &mut Client,
+    request: &LedgeredDataChunkRequest,
+    observer: &dyn LedgeredCommitObserver,
+    finalizer: &dyn LedgeredTransactionFinalizer,
+) -> Result<LedgeredDataChunkOutcome, ApplyError> {
+    execute_ledgered_data_chunk_inner(client, request, observer, Some(finalizer)).await
+}
+
+async fn execute_ledgered_data_chunk_inner(
+    client: &mut Client,
+    request: &LedgeredDataChunkRequest,
+    observer: &dyn LedgeredCommitObserver,
+    finalizer: Option<&dyn LedgeredTransactionFinalizer>,
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
     validate_tables(&request.tables)?;
     let transaction = client.transaction().await?;
@@ -320,6 +362,7 @@ pub async fn execute_ledgered_data_chunk_observed(
                 next_seq,
                 DataChunkDisposition::Applied { stats },
                 observer,
+                finalizer,
             )
             .await
         }
@@ -330,6 +373,7 @@ pub async fn execute_ledgered_data_chunk_observed(
                 next_seq,
                 DataChunkDisposition::AlreadyCommitted,
                 observer,
+                finalizer,
             )
             .await
         }
@@ -340,6 +384,7 @@ pub async fn execute_ledgered_data_chunk_observed(
                 next_seq,
                 DataChunkDisposition::ResumeAt,
                 observer,
+                finalizer,
             )
             .await
         }
@@ -365,11 +410,48 @@ pub async fn execute_ledgered_empty_transaction(
     .await
 }
 
+pub async fn execute_ledgered_empty_transaction_finalized(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+    finalizer: &dyn LedgeredTransactionFinalizer,
+) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
+    execute_ledgered_empty_transaction_inner(
+        client,
+        fence,
+        manifest,
+        &NOOP_LEDGERED_COMMIT_OBSERVER,
+        Some(finalizer),
+    )
+    .await
+}
+
 pub async fn execute_ledgered_empty_transaction_observed(
     client: &mut Client,
     fence: PipelineFence,
     manifest: &TransactionChunkManifest,
     observer: &dyn LedgeredCommitObserver,
+) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
+    execute_ledgered_empty_transaction_inner(client, fence, manifest, observer, None).await
+}
+
+pub async fn execute_ledgered_empty_transaction_observed_finalized(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+    observer: &dyn LedgeredCommitObserver,
+    finalizer: &dyn LedgeredTransactionFinalizer,
+) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
+    execute_ledgered_empty_transaction_inner(client, fence, manifest, observer, Some(finalizer))
+        .await
+}
+
+async fn execute_ledgered_empty_transaction_inner(
+    client: &mut Client,
+    fence: PipelineFence,
+    manifest: &TransactionChunkManifest,
+    observer: &dyn LedgeredCommitObserver,
+    finalizer: Option<&dyn LedgeredTransactionFinalizer>,
 ) -> Result<LedgeredEmptyTransactionOutcome, ApplyError> {
     if manifest.record_count != 0 {
         return Err(ApplyError::NonEmptyManifest {
@@ -385,6 +467,12 @@ pub async fn execute_ledgered_empty_transaction_observed(
         }
         ProgressRegistration::Registered | ProgressRegistration::Existing { next_seq: 0 } => {
             let completion = prepare_transaction_completion(&transaction, fence, manifest).await?;
+            if let Some(finalizer) = finalizer {
+                finalizer
+                    .finalize(&transaction)
+                    .await
+                    .map_err(ApplyError::Finalizer)?;
+            }
             let checkpoint = manifest.node_checkpoint();
             let checkpoint =
                 complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;
@@ -406,6 +494,7 @@ async fn finish_ledgered_data_chunk(
     next_seq: u64,
     disposition: DataChunkDisposition,
     observer: &dyn LedgeredCommitObserver,
+    finalizer: Option<&dyn LedgeredTransactionFinalizer>,
 ) -> Result<LedgeredDataChunkOutcome, ApplyError> {
     if next_seq > request.manifest.record_count {
         return Err(ApplyError::ChunkLedger(
@@ -418,6 +507,12 @@ async fn finish_ledgered_data_chunk(
     if next_seq == request.manifest.record_count {
         let completion =
             prepare_transaction_completion(&transaction, request.fence, &request.manifest).await?;
+        if let Some(finalizer) = finalizer {
+            finalizer
+                .finalize(&transaction)
+                .await
+                .map_err(ApplyError::Finalizer)?;
+        }
         let checkpoint = request.manifest.node_checkpoint();
         let checkpoint =
             complete_transaction_checkpoint(&transaction, completion, &checkpoint).await?;

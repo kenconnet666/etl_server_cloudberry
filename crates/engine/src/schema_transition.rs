@@ -409,7 +409,13 @@ pub fn plan_schema_capabilities(
                             reason: ReloadReason::ExplicitFallback,
                         }
                     } else if transitions.is_empty() {
-                        SchemaAction::Noop
+                        // The full catalog model intentionally omits defaults, constraints and
+                        // relation options. A schema-sensitive event with no modeled diff is not
+                        // proof of no change for an already managed table.
+                        SchemaAction::Reload {
+                            after: after.clone(),
+                            reason: ReloadReason::UnsafeDiff,
+                        }
                     } else if transitions.iter().all(TransitionKind::is_online_safe) {
                         SchemaAction::Online {
                             transitions,
@@ -1198,14 +1204,20 @@ mod tests {
             Some(SchemaAction::Add { .. })
         ));
 
-        let noop = plan_schema_capabilities(
+        let unmodeled = plan_schema_capabilities(
             &plan,
             &validation,
             &BTreeMap::from([(42, after_schema.clone())]),
             &BTreeMap::from([(42, Some(after_schema.clone()))]),
         )
         .unwrap();
-        assert!(matches!(noop.actions.get(&42), Some(SchemaAction::Noop)));
+        assert!(matches!(
+            unmodeled.actions.get(&42),
+            Some(SchemaAction::Reload {
+                reason: ReloadReason::UnsafeDiff,
+                ..
+            })
+        ));
 
         plan.reload_relations.insert(42);
         let explicit = plan_schema_capabilities(&plan, &validation, &before, &after).unwrap();
@@ -1263,6 +1275,17 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(drop.actions.get(&42), Some(SchemaAction::Drop)));
+        let unmanaged_drop = plan_schema_capabilities(
+            &drop_plan,
+            &validation,
+            &BTreeMap::new(),
+            &BTreeMap::from([(42, None)]),
+        )
+        .unwrap();
+        assert!(matches!(
+            unmanaged_drop.actions.get(&42),
+            Some(SchemaAction::Noop)
+        ));
     }
 
     #[test]
