@@ -331,10 +331,9 @@ impl std::fmt::Debug for PostgresCloudberryJob {
 impl PipelineJob for PostgresCloudberryJob {
     async fn run(&self, cancellation: CancellationToken) -> Result<(), SupervisorError> {
         self.telemetry.set_phase(PipelinePhase::Validating);
-        let result = match self.source.topology {
-            SourceTopology::Standalone => self.run_standalone(cancellation).await,
-            SourceTopology::PhysicalHa => Err(RuntimeJobError::UnsupportedTopology("physical_ha")),
-            SourceTopology::Citus => Err(RuntimeJobError::UnsupportedTopology("citus")),
+        let result = match data_plane_for_topology(self.source.topology) {
+            DataPlane::Standalone => self.run_standalone(cancellation).await,
+            DataPlane::Gated(name) => Err(RuntimeJobError::UnsupportedTopology(name)),
         };
         match result {
             Ok(()) => Ok(()),
@@ -358,6 +357,35 @@ struct RuntimeTable {
 struct PreparedRun {
     tables: Vec<RuntimeTable>,
     checkpoint: NodeCheckpoint,
+}
+
+/// Which runtime data plane serves a given source topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataPlane {
+    /// The single-logical-node data plane (one primary endpoint, one slot, one
+    /// node checkpoint). Serves both `Standalone` and `PhysicalHa`.
+    Standalone,
+    /// Topology whose data plane is not implemented yet; carries the stable name
+    /// used in the fail-closed error.
+    Gated(&'static str),
+}
+
+/// Map a source topology to its data plane.
+///
+/// `PhysicalHa` shares the `Standalone` data plane: it is a single logical node
+/// with a physical standby, so ingest, slot, and checkpoint handling are
+/// identical. A failover changes the source timeline, which the resume path
+/// rejects through the checkpoint identity check, forcing a safe rebuild rather
+/// than continuing across a divergent history — no separate data plane needed.
+///
+/// `Citus` requires a genuinely different multi-node data plane (per-worker
+/// publications, slots, identities, and a per-node checkpoint vector) and stays
+/// gated until Phase 4.
+const fn data_plane_for_topology(topology: SourceTopology) -> DataPlane {
+    match topology {
+        SourceTopology::Standalone | SourceTopology::PhysicalHa => DataPlane::Standalone,
+        SourceTopology::Citus => DataPlane::Gated("citus"),
+    }
 }
 
 /// Bridge a source canonical PK key into the target's durable text cursor.
@@ -1338,6 +1366,22 @@ mod tests {
             rebuild_bytes: 200,
             minimum_safe_bytes: 50,
         }
+    }
+
+    #[test]
+    fn physical_ha_shares_the_standalone_data_plane_and_citus_stays_gated() {
+        assert_eq!(
+            data_plane_for_topology(SourceTopology::Standalone),
+            DataPlane::Standalone
+        );
+        assert_eq!(
+            data_plane_for_topology(SourceTopology::PhysicalHa),
+            DataPlane::Standalone
+        );
+        assert_eq!(
+            data_plane_for_topology(SourceTopology::Citus),
+            DataPlane::Gated("citus")
+        );
     }
 
     #[test]
