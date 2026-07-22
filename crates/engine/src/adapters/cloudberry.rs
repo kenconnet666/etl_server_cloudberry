@@ -427,13 +427,24 @@ fn reject_schema_barriers(
             match change {
                 TransactionChange::Ddl(message) => {
                     if ddl_scope.requires_barrier(&message) {
+                        // A v2 event whose transitions are all online-safe could be followed with
+                        // table transitions once that path is wired; until then it still rebuilds,
+                        // but we surface the classification so the reason and telemetry distinguish
+                        // "could be online" from "must rebuild".
+                        let followable = message.all_transitions_online_safe();
+                        let follow_note = if followable {
+                            " (all transitions online-safe; rebuild pending online-follow support)"
+                        } else {
+                            ""
+                        };
                         return Err(PipelineError::SchemaBarrier {
                             reason: format!(
-                                "DDL `{}` in transaction {} for relations {:?} and schemas {:?}",
+                                "DDL `{}` in transaction {} for relations {:?} and schemas {:?}{}",
                                 message.command_tag,
                                 transaction.xid,
                                 message.relation_ids,
-                                message.affected_schemas
+                                message.affected_schemas,
+                                follow_note
                             ),
                             command_tag: Some(message.command_tag.clone()),
                         });
@@ -1194,6 +1205,58 @@ mod tests {
             build_apply_request_scoped(fence(), "slot", &registry, &scope, &grant).unwrap();
         assert!(request.tables.is_empty());
         assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
+    }
+
+    #[test]
+    fn online_safe_v2_ddl_barrier_reason_notes_followability() {
+        use cloudberry_etl_core::change::{TableTransition, TransitionKind};
+        let registry = TableBindingRegistry::new([]).unwrap();
+        let add_column = batch(vec![TransactionChange::Ddl(DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![7],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "after".to_owned(),
+            transitions: vec![TableTransition {
+                relation_id: 7,
+                before_generation: Some(1),
+                after_generation: Some(2),
+                before_fingerprint: Some("before".to_owned()),
+                after_fingerprint: Some("after".to_owned()),
+                kind: TransitionKind::AddColumn {
+                    name: "note".to_owned(),
+                    nullable_or_defaulted: true,
+                },
+            }],
+        })]);
+        // Still a barrier today (online-follow path not wired), but the reason must flag it.
+        assert!(matches!(
+            build_apply_request(fence(), "slot", &registry, &add_column),
+            Err(PipelineError::SchemaBarrier { reason, .. })
+                if reason.contains("online-safe")
+        ));
+
+        // An unknown transition must NOT be flagged followable.
+        let unknown = batch(vec![TransactionChange::Ddl(DdlMessage {
+            version: 2,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![7],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "after".to_owned(),
+            transitions: vec![TableTransition {
+                relation_id: 7,
+                before_generation: Some(1),
+                after_generation: Some(2),
+                before_fingerprint: Some("before".to_owned()),
+                after_fingerprint: Some("after".to_owned()),
+                kind: TransitionKind::Unknown,
+            }],
+        })]);
+        assert!(matches!(
+            build_apply_request(fence(), "slot", &registry, &unknown),
+            Err(PipelineError::SchemaBarrier { reason, .. })
+                if !reason.contains("online-safe")
+        ));
     }
 
     #[test]
