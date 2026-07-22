@@ -311,6 +311,48 @@ CREATE INDEX IF NOT EXISTS schema_events_pending_idx
     WHERE state IN ('pending', 'in_transition');
 "#;
 
+/// Per-table execution state for one durable schema event.
+///
+/// The full bound capability plan is stored as JSON so crash recovery never has to reinterpret an
+/// older source catalog. Rows are colocated by pipeline with their parent schema event.
+pub const TARGET_V9_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS pg2cb_meta.table_schema_transitions (
+    event_id uuid NOT NULL,
+    pipeline_id uuid NOT NULL,
+    topology_generation bigint NOT NULL CHECK (topology_generation >= 0),
+    source_lsn pg_lsn NOT NULL,
+    source_xid bigint NOT NULL CHECK (source_xid >= 0),
+    source_relation_id bigint NOT NULL CHECK (source_relation_id > 0),
+    action text NOT NULL CHECK (action IN ('noop', 'online', 'reload', 'drop', 'add')),
+    plan jsonb NOT NULL,
+    barrier_lsn pg_lsn NOT NULL,
+    active_table_generation bigint CHECK (active_table_generation >= 0),
+    pending_table_generation bigint CHECK (pending_table_generation >= 0),
+    snapshot_group_id uuid,
+    state text NOT NULL DEFAULT 'pending'
+        CHECK (state IN (
+            'pending', 'applying', 'snapshotting', 'catching_up',
+            'cutover_pending', 'blocked', 'completed'
+        )),
+    failure_reason text,
+    fencing_token bigint NOT NULL CHECK (fencing_token > 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    completed_at timestamptz,
+    PRIMARY KEY (pipeline_id, source_lsn, source_xid, source_relation_id),
+    CHECK ((state = 'completed') = (completed_at IS NOT NULL)),
+    CHECK ((state = 'blocked') = (failure_reason IS NOT NULL))
+)
+USING heap
+DISTRIBUTED BY (pipeline_id);
+
+CREATE INDEX IF NOT EXISTS table_schema_transitions_unfinished_idx
+    ON pg2cb_meta.table_schema_transitions (
+        pipeline_id, topology_generation, source_lsn, source_xid
+    )
+    WHERE state <> 'completed';
+"#;
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -357,6 +399,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "schema_event_ledger",
         sql: TARGET_V8_SQL,
+    },
+    Migration {
+        version: 9,
+        name: "table_schema_transition_ledger",
+        sql: TARGET_V9_SQL,
     },
 ];
 
@@ -518,7 +565,7 @@ mod tests {
 
     #[test]
     fn migration_versions_and_checksums_are_stable() {
-        assert_eq!(MIGRATIONS.len(), 8);
+        assert_eq!(MIGRATIONS.len(), 9);
         assert_eq!(MIGRATIONS[0].version, 1);
         assert_eq!(MIGRATIONS[1].version, 2);
         assert_eq!(MIGRATIONS[2].version, 3);
@@ -527,6 +574,7 @@ mod tests {
         assert_eq!(MIGRATIONS[5].version, 6);
         assert_eq!(MIGRATIONS[6].version, 7);
         assert_eq!(MIGRATIONS[7].version, 8);
+        assert_eq!(MIGRATIONS[8].version, 9);
         assert_eq!(
             Sha256::digest(MIGRATIONS[0].sql),
             Sha256::digest(TARGET_V1_SQL)
@@ -559,6 +607,10 @@ mod tests {
             Sha256::digest(MIGRATIONS[7].sql),
             Sha256::digest(TARGET_V8_SQL)
         );
+        assert_eq!(
+            Sha256::digest(MIGRATIONS[8].sql),
+            Sha256::digest(TARGET_V9_SQL)
+        );
     }
 
     #[test]
@@ -575,5 +627,23 @@ mod tests {
         assert!(!TARGET_V8_SQL.contains("UNIQUE (event_id)"));
         assert!(TARGET_V8_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
         assert!(TARGET_V8_SQL.contains("schema_events_pending_idx"));
+    }
+
+    #[test]
+    fn v9_defines_the_table_transition_ledger() {
+        assert!(
+            TARGET_V9_SQL
+                .contains("CREATE TABLE IF NOT EXISTS pg2cb_meta.table_schema_transitions")
+        );
+        assert!(
+            TARGET_V9_SQL
+                .contains("PRIMARY KEY (pipeline_id, source_lsn, source_xid, source_relation_id)")
+        );
+        assert!(TARGET_V9_SQL.contains("action IN ('noop', 'online', 'reload', 'drop', 'add')"));
+        assert!(TARGET_V9_SQL.contains("'snapshotting', 'catching_up'"));
+        assert!(TARGET_V9_SQL.contains("plan jsonb NOT NULL"));
+        assert!(TARGET_V9_SQL.contains("barrier_lsn pg_lsn NOT NULL"));
+        assert!(TARGET_V9_SQL.contains("DISTRIBUTED BY (pipeline_id)"));
+        assert!(TARGET_V9_SQL.contains("table_schema_transitions_unfinished_idx"));
     }
 }

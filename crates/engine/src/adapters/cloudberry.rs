@@ -11,7 +11,7 @@ use cloudberry_etl_core::{
     schema::{QualifiedName, TableSchema},
 };
 use cloudberry_etl_source_postgres::{
-    catalog::{CatalogOptions, load_tables_by_relation_ids},
+    catalog::CatalogOptions,
     spool::{ChangeChunk, ChangeStats, ChunkLimits},
     wal::CommittedTransaction,
 };
@@ -30,13 +30,13 @@ use cloudberry_etl_target_cloudberry::{
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, IsolationLevel};
 
 use crate::{
     batch::TransactionBatch,
     normalize::normalize_table_changes,
     pipeline::{PipelineError, SchemaEventKey, TransactionSink},
-    schema_transition::{plan_schema_capabilities, plan_schema_transaction, prepare_schema_plan},
+    schema_transition::{plan_schema_transaction, prepare_schema_capability_event},
 };
 
 // This versions the logical record digest consumed by the target ledger, not its memory or spool
@@ -539,7 +539,7 @@ pub struct CloudberryTransactionSink {
 }
 
 struct SchemaSource {
-    client: Client,
+    client: Mutex<Client>,
     options: CatalogOptions,
 }
 
@@ -641,7 +641,10 @@ impl CloudberryTransactionSink {
         if options.metadata_schema.is_empty() || options.metadata_schema.contains('\0') {
             return Err(AdapterConfigError::InvalidMetadataSchema);
         }
-        self.schema_source = Some(SchemaSource { client, options });
+        self.schema_source = Some(SchemaSource {
+            client: Mutex::new(client),
+            options,
+        });
         Ok(self)
     }
 
@@ -704,59 +707,42 @@ impl CloudberryTransactionSink {
                 schema_event: None,
             }));
         };
-        let prepared = prepare_schema_plan(
-            &source.client,
+        let before = self
+            .registry
+            .active_schemas()
+            .map_err(|error| PipelineError::Target(error.to_string()))?;
+        let mut source_client = source.client.lock().await;
+        let source_transaction = source_client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|error| PipelineError::Source(error.to_string()))?;
+        let prepared = prepare_schema_capability_event(
+            &source_transaction,
             client,
-            &source.options.metadata_schema,
+            &source.options,
             self.fence,
             plan,
+            &before,
         )
         .await
         .map_err(|error| PipelineError::Target(error.to_string()))?;
-        let capability = if prepared.catalog_validation.unknown_scope
-            || !prepared.catalog_validation.mismatches.is_empty()
-        {
-            plan_schema_capabilities(
-                &prepared.plan,
-                &prepared.catalog_validation,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            )
-        } else {
-            let present_ids = prepared
-                .current_relations
-                .iter()
-                .filter_map(|(relation_id, current)| current.as_ref().map(|_| *relation_id))
-                .collect::<Vec<_>>();
-            let current =
-                load_tables_by_relation_ids(&source.client, &source.options, &present_ids)
-                    .await
-                    .map_err(|error| PipelineError::Source(error.to_string()))?;
-            let after = prepared
-                .plan
-                .relation_ids()
-                .into_iter()
-                .map(|relation_id| (relation_id, current.get(&relation_id).cloned()))
-                .collect();
-            let before = self
-                .registry
-                .active_schemas()
-                .map_err(|error| PipelineError::Target(error.to_string()))?;
-            plan_schema_capabilities(
-                &prepared.plan,
-                &prepared.catalog_validation,
-                &before,
-                &after,
-            )
-        }
-        .map_err(|error| PipelineError::Source(error.to_string()))?;
-        let reason = format!("{reason}; capability plan: {}", capability.action_summary());
+        source_transaction
+            .commit()
+            .await
+            .map_err(|error| PipelineError::Source(error.to_string()))?;
+        let reason = format!(
+            "{reason}; capability plan: {}",
+            prepared.capability.action_summary()
+        );
         Ok(Some(PipelineError::SchemaBarrier {
             reason,
             command_tag,
             schema_event: Some(SchemaEventKey {
-                source_lsn: prepared.plan.source_position.lsn,
-                source_xid: u64::from(prepared.plan.source_xid),
+                source_lsn: prepared.event.plan.source_position.lsn,
+                source_xid: u64::from(prepared.event.plan.source_xid),
             }),
         }))
     }

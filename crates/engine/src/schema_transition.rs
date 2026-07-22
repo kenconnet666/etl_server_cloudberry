@@ -16,12 +16,20 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_source_postgres::{
     SourceError,
+    catalog::{CatalogOptions, load_tables_by_relation_ids},
     ddl::{CurrentRelationSchema, load_current_relation_schemas},
     wal::CommittedTransaction,
 };
 use cloudberry_etl_target_cloudberry::{
     checkpoint::PipelineFence,
-    schema_event::{RecordOutcome, SchemaEventError, SchemaEventRecord, record_schema_event},
+    schema_event::{
+        RecordOutcome, SchemaEventError, SchemaEventRecord, record_schema_event,
+        record_schema_event_in_transaction,
+    },
+    table_transition::{
+        TableTransitionAction, TableTransitionError, TableTransitionRecord,
+        record_table_transition_in_transaction,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,6 +57,10 @@ pub enum SchemaCoordinatorError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Target(#[from] SchemaEventError),
+    #[error(transparent)]
+    TableTransition(#[from] TableTransitionError),
+    #[error("schema coordinator database operation failed: {0}")]
+    Database(#[from] tokio_postgres::Error),
 }
 
 /// One schema-sensitive source change and its zero-based ordinal among all transaction changes.
@@ -222,14 +234,15 @@ impl SchemaTransactionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CatalogMismatchKind {
     ExpectedPresent,
     ExpectedDropped,
     DifferentPresentState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogMismatch {
     pub relation_id: u32,
     pub kind: CatalogMismatchKind,
@@ -245,15 +258,23 @@ pub struct CatalogValidation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSchemaEvent {
+    pub event_id: Uuid,
     pub plan: SchemaTransactionPlan,
     pub catalog_validation: CatalogValidation,
     pub current_relations: BTreeMap<u32, Option<CurrentRelationSchema>>,
     pub record_outcome: RecordOutcome,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSchemaCapabilityEvent {
+    pub event: PreparedSchemaEvent,
+    pub capability: SchemaCapabilityPlan,
+}
+
 /// Deterministic table-local action selected from the bound schema and the authoritative
 /// post-commit source catalog. Execution remains a separate, fenced concern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum SchemaAction {
     Noop,
     Online {
@@ -270,20 +291,22 @@ pub enum SchemaAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReloadReason {
     ExplicitFallback,
     UnsafeDiff,
     UnverifiableEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "blocker", rename_all = "snake_case")]
 pub enum CapabilityBlocker {
     UnknownScope,
-    CatalogMismatch(CatalogMismatch),
+    CatalogMismatch { mismatch: CatalogMismatch },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaCapabilityPlan {
     pub actions: BTreeMap<u32, SchemaAction>,
     pub blockers: Vec<CapabilityBlocker>,
@@ -339,7 +362,7 @@ pub fn plan_schema_capabilities(
             .mismatches
             .iter()
             .cloned()
-            .map(CapabilityBlocker::CatalogMismatch),
+            .map(|mismatch| CapabilityBlocker::CatalogMismatch { mismatch }),
     );
     if !blockers.is_empty() {
         return Ok(SchemaCapabilityPlan {
@@ -458,11 +481,94 @@ where
     let record = plan.schema_event_record(fence)?;
     let record_outcome = record_schema_event(target, &record).await?;
     Ok(PreparedSchemaEvent {
+        event_id: record.event_id,
         plan,
         catalog_validation,
         current_relations: current,
         record_outcome,
     })
+}
+
+/// Read the compact terminal fingerprint and complete type-resolved schemas from one caller-owned
+/// source snapshot, bind them to active before-schemas, then persist the schema event. No target
+/// event is written if full capability planning fails.
+pub async fn prepare_schema_capability_event<C>(
+    source: &C,
+    target: &mut Client,
+    options: &CatalogOptions,
+    fence: PipelineFence,
+    plan: SchemaTransactionPlan,
+    before: &BTreeMap<u32, TableSchema>,
+) -> Result<PreparedSchemaCapabilityEvent, SchemaCoordinatorError>
+where
+    C: GenericClient + Sync,
+{
+    let current =
+        load_current_relation_schemas(source, &options.metadata_schema, &plan.relation_ids())
+            .await?;
+    let catalog_validation = plan.validate_catalog(&current)?;
+    let capability =
+        if catalog_validation.unknown_scope || !catalog_validation.mismatches.is_empty() {
+            plan_schema_capabilities(
+                &plan,
+                &catalog_validation,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )?
+        } else {
+            let present_ids = current
+                .iter()
+                .filter_map(|(relation_id, state)| state.as_ref().map(|_| *relation_id))
+                .collect::<Vec<_>>();
+            let full = load_tables_by_relation_ids(source, options, &present_ids).await?;
+            let after = plan
+                .relation_ids()
+                .into_iter()
+                .map(|relation_id| (relation_id, full.get(&relation_id).cloned()))
+                .collect();
+            plan_schema_capabilities(&plan, &catalog_validation, before, &after)?
+        };
+    let record = plan.schema_event_record(fence)?;
+    let target_transaction = target.transaction().await?;
+    let record_outcome = record_schema_event_in_transaction(&target_transaction, &record).await?;
+    for (relation_id, action) in &capability.actions {
+        let action_record = TableTransitionRecord {
+            event_id: record.event_id,
+            fence,
+            source_lsn: plan.source_position.lsn,
+            source_xid: u64::from(plan.source_xid),
+            source_relation_id: *relation_id,
+            action: table_transition_action(action),
+            plan: serde_json::to_value(action)
+                .map_err(|error| SchemaPlanError::Encode(error.to_string()))?,
+            barrier_lsn: plan.source_position.lsn,
+            active_table_generation: None,
+            pending_table_generation: None,
+            snapshot_group_id: None,
+        };
+        record_table_transition_in_transaction(&target_transaction, &action_record).await?;
+    }
+    target_transaction.commit().await?;
+    Ok(PreparedSchemaCapabilityEvent {
+        event: PreparedSchemaEvent {
+            event_id: record.event_id,
+            plan,
+            catalog_validation,
+            current_relations: current,
+            record_outcome,
+        },
+        capability,
+    })
+}
+
+const fn table_transition_action(action: &SchemaAction) -> TableTransitionAction {
+    match action {
+        SchemaAction::Noop => TableTransitionAction::Noop,
+        SchemaAction::Online { .. } => TableTransitionAction::Online,
+        SchemaAction::Reload { .. } => TableTransitionAction::Reload,
+        SchemaAction::Drop => TableTransitionAction::Drop,
+        SchemaAction::Add { .. } => TableTransitionAction::Add,
+    }
 }
 
 /// Scan one committed transaction without materializing row changes. Returns `None` when it has
@@ -1210,5 +1316,6 @@ mod tests {
         assert!(!blocked.is_table_local());
         assert!(blocked.actions.is_empty());
         assert_eq!(blocked.action_summary(), "blocked(2)");
+        assert!(serde_json::to_value(&blocked).is_ok());
     }
 }

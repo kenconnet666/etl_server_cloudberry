@@ -1,4 +1,4 @@
-//! Opt-in Apache Cloudberry 2.1 coverage for the schema-event ledger (migration V8).
+//! Opt-in Apache Cloudberry 2.1 coverage for schema-event and table-transition ledgers (V8/V9).
 //!
 //! Run explicitly with a disposable Cloudberry 2.1 instance:
 //! `PG2CB_TEST_TARGET_DSN=postgres://... cargo test -p cloudberry-etl-target-cloudberry --test schema_event_cloudberry21 -- --ignored --nocapture`
@@ -12,6 +12,11 @@ use cloudberry_etl_target_cloudberry::{
     schema_event::{
         RecordOutcome, SchemaEventRecord, SchemaEventState, advance_schema_event_state,
         list_unfinished_schema_events, load_schema_event, record_schema_event,
+    },
+    table_transition::{
+        TableTransitionAction, TableTransitionKey, TableTransitionRecord,
+        TableTransitionRecordOutcome, TableTransitionState, advance_table_transition_state,
+        list_unfinished_table_transitions, load_table_transition, record_table_transition,
     },
 };
 use tokio_postgres::{Client, NoTls};
@@ -105,6 +110,84 @@ async fn run_ledger_test(
     let adopted = list_unfinished_schema_events(client, newer_fence).await?;
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].fencing_token, newer_fence.fencing_token);
+
+    let table_key = TableTransitionKey {
+        pipeline_id,
+        source_lsn: PgLsn::new(0x1000),
+        source_xid: 4242,
+        source_relation_id: 100,
+    };
+    let table_record = TableTransitionRecord {
+        event_id,
+        fence: newer_fence,
+        source_lsn: table_key.source_lsn,
+        source_xid: table_key.source_xid,
+        source_relation_id: table_key.source_relation_id,
+        action: TableTransitionAction::Reload,
+        plan: serde_json::json!({"action": "reload", "after": {"relation_id": 100}}),
+        barrier_lsn: table_key.source_lsn,
+        active_table_generation: Some(1),
+        pending_table_generation: Some(2),
+        snapshot_group_id: Some(Uuid::now_v7()),
+    };
+    assert_eq!(
+        record_table_transition(client, &table_record).await?,
+        TableTransitionRecordOutcome::Inserted
+    );
+    assert_eq!(
+        record_table_transition(client, &table_record).await?,
+        TableTransitionRecordOutcome::AlreadyRecorded
+    );
+    let loaded_table = load_table_transition(client, table_key)
+        .await?
+        .expect("table transition exists");
+    assert_eq!(loaded_table.plan, table_record.plan);
+    assert_eq!(loaded_table.state, TableTransitionState::Pending);
+    let unfinished_tables = list_unfinished_table_transitions(client, newer_fence).await?;
+    assert_eq!(unfinished_tables.len(), 1);
+    assert_eq!(unfinished_tables[0].key, table_key);
+
+    advance_table_transition_state(
+        client,
+        newer_fence,
+        table_key,
+        TableTransitionState::Pending,
+        TableTransitionState::Snapshotting,
+        None,
+    )
+    .await?;
+    advance_table_transition_state(
+        client,
+        newer_fence,
+        table_key,
+        TableTransitionState::Snapshotting,
+        TableTransitionState::CatchingUp,
+        None,
+    )
+    .await?;
+    advance_table_transition_state(
+        client,
+        newer_fence,
+        table_key,
+        TableTransitionState::CatchingUp,
+        TableTransitionState::CutoverPending,
+        None,
+    )
+    .await?;
+    advance_table_transition_state(
+        client,
+        newer_fence,
+        table_key,
+        TableTransitionState::CutoverPending,
+        TableTransitionState::Completed,
+        None,
+    )
+    .await?;
+    assert!(
+        list_unfinished_table_transitions(client, newer_fence)
+            .await?
+            .is_empty()
+    );
 
     // Drive the state machine: pending -> in_transition -> completed.
     assert!(
@@ -207,6 +290,12 @@ async fn run_ledger_test(
 
 async fn cleanup(client: &Client, pipeline_id: PipelineId) {
     let id = pipeline_id.as_uuid();
+    let _ = client
+        .execute(
+            "DELETE FROM pg2cb_meta.table_schema_transitions WHERE pipeline_id = $1",
+            &[&id],
+        )
+        .await;
     let _ = client
         .execute(
             "DELETE FROM pg2cb_meta.schema_events WHERE pipeline_id = $1",

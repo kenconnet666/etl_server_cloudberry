@@ -1,6 +1,6 @@
 //! Real PG18 -> Cloudberry 2.1 coverage for transaction-scoped schema event preparation.
 
-use std::{error::Error, panic::AssertUnwindSafe};
+use std::{collections::HashSet, error::Error, panic::AssertUnwindSafe};
 
 use cloudberry_etl_core::{
     change::{
@@ -10,8 +10,12 @@ use cloudberry_etl_core::{
     id::PipelineId,
     lsn::PgLsn,
 };
-use cloudberry_etl_engine::schema_transition::{CatalogMismatchKind, prepare_schema_event};
+use cloudberry_etl_engine::schema_transition::{
+    CatalogMismatchKind, SchemaAction, plan_schema_transaction, prepare_schema_capability_event,
+    prepare_schema_event,
+};
 use cloudberry_etl_source_postgres::{
+    catalog::CatalogOptions,
     ddl::{DdlInstallSpec, ensure_ddl_capture, load_current_relation_schemas},
     wal::CommittedTransaction,
 };
@@ -19,6 +23,7 @@ use cloudberry_etl_target_cloudberry::{
     checkpoint::{PipelineFence, activate_pipeline_fence},
     migration::migrate_target_database,
     schema_event::{RecordOutcome, load_schema_event},
+    table_transition::{TableTransitionAction, TableTransitionKey, load_table_transition},
 };
 use futures::FutureExt;
 use tokio_postgres::{Client, NoTls};
@@ -124,31 +129,55 @@ async fn run_test(
         PgLsn::new(0x1000),
     );
 
-    let prepared = prepare_schema_event(
+    let plan = plan_schema_transaction(&transaction)?.expect("CREATE TABLE has a schema plan");
+    let catalog_options = CatalogOptions {
+        metadata_schema: install.metadata_schema.clone(),
+        include_schemas: Some(HashSet::from([schema.to_owned()])),
+        exclude_schemas: HashSet::new(),
+        include_partitions: false,
+    };
+    let prepared = prepare_schema_capability_event(
         source,
         target,
-        &install.metadata_schema,
+        &catalog_options,
         fence,
-        &transaction,
+        plan.clone(),
+        &Default::default(),
     )
-    .await?
-    .expect("CREATE TABLE produces a schema event");
-    assert!(prepared.catalog_validation.is_exact_match());
-    assert_eq!(prepared.record_outcome, RecordOutcome::Inserted);
+    .await?;
+    assert!(prepared.event.catalog_validation.is_exact_match());
+    assert_eq!(prepared.event.record_outcome, RecordOutcome::Inserted);
+    assert!(matches!(
+        prepared.capability.actions.get(&relation_id),
+        Some(SchemaAction::Add { .. })
+    ));
+    let table_key = TableTransitionKey {
+        pipeline_id,
+        source_lsn: PgLsn::new(0x1010),
+        source_xid: 77,
+        source_relation_id: relation_id,
+    };
+    let table_transition = load_table_transition(target, table_key)
+        .await?
+        .expect("bound table action is persisted with the event");
+    assert_eq!(table_transition.event_id, prepared.event.event_id);
+    assert_eq!(table_transition.action, TableTransitionAction::Add);
+    let persisted_action: SchemaAction = serde_json::from_value(table_transition.plan)?;
+    assert!(matches!(persisted_action, SchemaAction::Add { .. }));
 
-    let replay = prepare_schema_event(
+    let replay = prepare_schema_capability_event(
         source,
         target,
-        &install.metadata_schema,
+        &catalog_options,
         fence,
-        &transaction,
+        plan,
+        &Default::default(),
     )
-    .await?
-    .expect("replayed CREATE TABLE produces the same event");
-    assert_eq!(replay.record_outcome, RecordOutcome::AlreadyRecorded);
+    .await?;
+    assert_eq!(replay.event.record_outcome, RecordOutcome::AlreadyRecorded);
     assert_eq!(
-        replay.plan.payload_fingerprint,
-        prepared.plan.payload_fingerprint
+        replay.event.plan.payload_fingerprint,
+        prepared.event.plan.payload_fingerprint
     );
 
     source
@@ -203,6 +232,12 @@ async fn cleanup(source: &Client, target: &Client, pipeline_id: PipelineId, sche
         ))
         .await;
     let id = pipeline_id.as_uuid();
+    let _ = target
+        .execute(
+            "DELETE FROM pg2cb_meta.table_schema_transitions WHERE pipeline_id = $1",
+            &[&id],
+        )
+        .await;
     let _ = target
         .execute(
             "DELETE FROM pg2cb_meta.schema_events WHERE pipeline_id = $1",

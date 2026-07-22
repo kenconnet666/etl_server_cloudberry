@@ -29,7 +29,7 @@ cargo test --workspace --lib
 - **Spool:** 固定目录（`engine.spool_directory`，默认 `data/spool`），不设硬容量上限；按 topology generation 自动清理被取代的旧目录；磁盘水位到达时进入 `RESOURCE_WAIT` 背压，不提前 ACK、不丢数据。
 - **Reconciliation:** Phase 1-2 差异一律触发 shadow rebuild；原地 repair 保持 capability-gated，直到 replay-compatible 协议对 PK move/delete/reuse/swap 的证明与故障矩阵成立。见 [reconciliation.md](reconciliation.md)。
 - **Citus:** 真实数据面推到 Phase 4（per-worker slot/checkpoint/topology generation），当前 fail-closed（`DataPlane::Gated`）。**`PhysicalHa` 已启用**，复用 Standalone 数据面（`data_plane_for_topology`）：failover 改 timeline 由 checkpoint identity 校验捕获并安全 rebuild。
-- **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 **target V8**（V8 = `schema_events` DDL transition ledger）。
+- **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 **target V9**（V8 = `schema_events`，V9 = per-table schema transition ledger）。
 - **Web UI:** **已重建为 Vue 3 + Naive UI + Pinia + Vue Router**（`9e48e29`），5 视图 + API 层 + 认证 store，构建通过。JWT/CSRF 认证待后端对接。
 - **Cloudberry 镜像:** Apache Cloudberry 2.1 无官方即用 server 镜像（Docker Hub 只有 build/test 环境镜像）。**已解决**：`tests/integration/cloudberry/build-local-image.sh` 把官方 2.1.0 RPM 装进 rockylinux9 + `gpinitsystem` 起单节点 demo cluster（`init-singlenode.sh`），可复现地提供可运行 Cloudberry。CI 的 `integration-cloudberry` job 用它跑 target + E2E 测试。
 - **CI 验证矩阵:** 4 个 job——rust-checks（fmt/clippy/build/单测）、integration-pg18（真实 PG18 source + control-store）、integration-cloudberry（真实 Cloudberry target + 跨库 E2E）、web-checks（Vue 构建）。真实两端集成测试均已进 PR 门禁并本地验证通过。
@@ -38,7 +38,7 @@ cargo test --workspace --lib
 
 ### Phase 0 — 工程门禁与基础设施 ✅ 完成
 - `.github/workflows/ci.yml`：fmt / clippy / build / lib+bins 测试。
-- control migration（`crates/metadata/src/migration.rs`，到 V2）与 target metadata migration（`crates/target-cloudberry/src/migration.rs`，到 V8，含 `snapshot_table_progress`、`transaction_chunk_progress`、`transaction_committed_chunks`、`schema_events`）。
+- control migration（`crates/metadata/src/migration.rs`，到 V2）与 target metadata migration（`crates/target-cloudberry/src/migration.rs`，到 V9，含 `snapshot_table_progress`、transaction chunk ledger、`schema_events`、`table_schema_transitions`）。
 - 版本校验：`source-postgres` `verify_pg18_version`、`target-cloudberry::version::verify_cloudberry_21_version`。
 - `tests/integration/docker-compose.yml`：PG18(55432) + Cloudberry 2.1(55433)，含 init 脚本与 healthcheck。
 
@@ -71,10 +71,11 @@ cargo test --workspace --lib
 - **事务级 schema planner** ✅ `engine/src/schema_transition.rs` 对 memory/spool change source 统一流式扫描，保留 transaction ordinal，只以每 relation terminal captured state 对齐一次提交后 source catalog；v1/TRUNCATE/unknown scope 和 rapid-advance/catalog drift 均 fail closed，不推进 checkpoint。
 - **fenced schema-event 持久化** ✅ 一个 source transaction 对应一个确定性 UUIDv8/JSON payload；写入、exact replay、unfinished adoption 和状态推进均锁 active target pipeline fence。真实 PG18 -> Cloudberry 2.1 E2E 覆盖 catalog exact match、后续 DDL mismatch、重复 WAL 和新 lease 接管。
 - **runtime durable schema barrier** ✅ batcher 在 DDL 前后都切 batch，schema transaction 不再与后续 DML 混批；standalone sink 使用独立 source SQL 连接在任何 target data/checkpoint 写入前校验 terminal catalog 并落 ledger。当前 table handler 尚未接入时，runtime 先原子推进 event 为 `failed`，再调用旧 pipeline rebuild fallback；真实完整 runtime E2E 证明 checkpoint 不越过 DDL、目标无半应用 schema、且只创建一次 rebuild operation。
-- **bound capability plan** ✅ barrier 在事件持久化后按 relation OID 读取完整 `TableSchema`，以 active binding 为 before-schema，确定性生成 `Noop / Online / Reload / Drop / Add`；v1/TRUNCATE 保持表级 reload，未知范围和 rapid-DDL/catalog mismatch 继续 pipeline fail-closed。schema diff 已补齐 table identity、kind、replica identity、distribution/partition、nullability、generated/identity/collation 的保守判定，避免把未覆盖 shape 误当 `Noop`。
+- **bound capability plan** ✅ barrier 在同一个 source repeatable-read snapshot 内校验 terminal fingerprint 并按 relation OID 读取完整 `TableSchema`，以 active binding 为 before-schema，确定性生成 `Noop / Online / Reload / Drop / Add`；v1/TRUNCATE 保持表级 reload，未知范围和 rapid-DDL/catalog mismatch 继续 pipeline fail-closed。schema diff 已补齐 table identity、kind、replica identity、distribution/partition、nullability、generated/identity/collation 的保守判定，避免把未覆盖 shape 误当 `Noop`。
+- **table transition ledger** ✅ target V9 `table_schema_transitions` 按 event/relation 持久化完整 capability action、barrier LSN 和 fenced 恢复状态，并为执行期 generation/shadow group 提供持久字段；动作特定状态机拒绝跳步。compact fingerprint 与完整 `TableSchema` 在同一个 source repeatable-read snapshot 中读取，schema event 与全部表 action 在同一个 target transaction 中提交。
 
 **未完成（下一位优先处理，按顺序）：**
-1. **table handler + dependency closure。** capability plan 已完成；下一步补持久 table transition 状态与依赖 closure，并把当前 `failed -> pipeline rebuild` fallback 替换为 table-local handler。未完成事件不得越过 checkpoint/ACK。
+1. **table handler + dependency closure。** capability plan 与 V9 持久状态已完成；下一步实现 table-local executor 与依赖 closure，并把当前 `failed -> pipeline rebuild` fallback 替换为局部处理。未完成事件不得越过 checkpoint/ACK。
 2. **table barrier + shadow reload / catch-up / cutover。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 barrier 后 spool 回放该表 CDC → reconciliation → 原子 quarantine/activation + `registry.swap`。`schema_events` 状态随 target 变更同事务推进。
 3. **在线白名单 handler 接入。** 逐项验证 ADD/DROP/RENAME/default/nullability/widening 的 Cloudberry 2.1 capability；任一前置条件失败自动转受影响 table/dependency closure reload，不升级整 pipeline。
 4. **rapid DDL、DROP quarantine + 新表自动准入。** catalog 比 event 超前时合并连续 committed schema transactions 后重算 terminal plan；无法证明完整范围则局部 quarantine/reload 并阻断 checkpoint。
