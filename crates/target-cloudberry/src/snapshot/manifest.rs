@@ -60,12 +60,22 @@ pub async fn begin_snapshot_group(
     client: &mut Client,
     request: &SnapshotActivationRequest,
 ) -> Result<SnapshotGroupRegistrationDisposition, SnapshotTargetError> {
-    let canonical = canonical_request(request)?;
     let transaction = client.transaction().await?;
-    lock_pipeline_fence(&transaction, canonical.fence).await?;
+    let disposition = begin_snapshot_group_in_transaction(&transaction, request).await?;
+    transaction.commit().await?;
+    Ok(disposition)
+}
+
+/// Caller-owned transaction form used to register a reload group with its table transitions.
+pub async fn begin_snapshot_group_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &SnapshotActivationRequest,
+) -> Result<SnapshotGroupRegistrationDisposition, SnapshotTargetError> {
+    let canonical = canonical_request(request)?;
+    lock_pipeline_fence(transaction, canonical.fence).await?;
 
     if let Some(stored) =
-        load_snapshot_group_optional(&transaction, canonical.snapshot_group_id).await?
+        load_snapshot_group_optional(transaction, canonical.snapshot_group_id).await?
     {
         if stored.request != canonical {
             return Err(manifest_mismatch(&stored.request, &canonical));
@@ -74,12 +84,10 @@ pub async fn begin_snapshot_group(
             SnapshotGroupState::Loading => SnapshotGroupRegistrationDisposition::AlreadyRegistered,
             SnapshotGroupState::Active => SnapshotGroupRegistrationDisposition::AlreadyActive,
         };
-        transaction.commit().await?;
         return Ok(disposition);
     }
 
-    insert_snapshot_group(&transaction, &canonical).await?;
-    transaction.commit().await?;
+    insert_snapshot_group(transaction, &canonical).await?;
     Ok(SnapshotGroupRegistrationDisposition::Registered)
 }
 

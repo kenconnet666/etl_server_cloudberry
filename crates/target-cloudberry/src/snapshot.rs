@@ -42,7 +42,9 @@ pub use cleanup::{
     cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
     garbage_collect_quarantined_tables, reset_interrupted_table_snapshot_group,
 };
-pub use manifest::{SnapshotGroupRegistrationDisposition, begin_snapshot_group};
+pub use manifest::{
+    SnapshotGroupRegistrationDisposition, begin_snapshot_group, begin_snapshot_group_in_transaction,
+};
 pub use progress::{
     SNAPSHOT_CURSOR_FORMAT_VERSION, SnapshotPageApplyOutcome, SnapshotTableProgress,
     copy_snapshot_page, register_snapshot_table_progress,

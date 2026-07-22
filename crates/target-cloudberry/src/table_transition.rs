@@ -489,6 +489,27 @@ pub async fn begin_table_snapshot_transition(
     expected: TableTransitionState,
     snapshot_group_id: Uuid,
 ) -> Result<TableTransition, TableTransitionError> {
+    let transaction = client.transaction().await?;
+    let transition = begin_table_snapshot_transition_in_transaction(
+        &transaction,
+        fence,
+        key,
+        expected,
+        snapshot_group_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(transition)
+}
+
+/// Caller-owned transaction form used to bind every table in a newly registered reload group.
+pub async fn begin_table_snapshot_transition_in_transaction(
+    transaction: &Transaction<'_>,
+    fence: PipelineFence,
+    key: TableTransitionKey,
+    expected: TableTransitionState,
+    snapshot_group_id: Uuid,
+) -> Result<TableTransition, TableTransitionError> {
     if snapshot_group_id.is_nil() {
         return Err(TableTransitionError::InvalidSnapshotGroupId);
     }
@@ -499,9 +520,8 @@ pub async fn begin_table_snapshot_transition(
             fence: fence.pipeline_id,
         });
     }
-    let transaction = client.transaction().await?;
-    lock_pipeline_fence(&transaction, fence).await?;
-    let mut current = load_locked(&transaction, key)
+    lock_pipeline_fence(transaction, fence).await?;
+    let mut current = load_locked(transaction, key)
         .await?
         .ok_or(TableTransitionError::NotFound)?;
     if current.fencing_token != fence.fencing_token {
@@ -530,7 +550,6 @@ pub async fn begin_table_snapshot_transition(
     if current.state == TableTransitionState::Snapshotting
         && current.snapshot_group_id == Some(snapshot_group_id)
     {
-        transaction.commit().await?;
         return Ok(current);
     }
     if current.state != expected {
@@ -562,7 +581,6 @@ pub async fn begin_table_snapshot_transition(
     current.snapshot_group_id = Some(snapshot_group_id);
     current.state = TableTransitionState::Snapshotting;
     current.failure_reason = None;
-    transaction.commit().await?;
     Ok(current)
 }
 
