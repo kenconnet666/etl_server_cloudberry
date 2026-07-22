@@ -56,23 +56,6 @@ jobs:
   integration-pg18:
     name: PG18 Integration Tests
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_PASSWORD: pg2cb_test
-          POSTGRES_DB: source
-          POSTGRES_USER: postgres
-        ports:
-          - 5432:5432
-        # wal_level=logical and generous slots/senders are required by the source
-        # snapshot/slot contract tests; health-check gates the test step.
-        options: >-
-          --health-cmd "pg_isready -U postgres -d source"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 12
-          --name pg18
     steps:
       - uses: actions/checkout@v4
 
@@ -89,36 +72,43 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
 
-      - name: Configure PostgreSQL for logical replication
+      - name: Start PostgreSQL 18 with logical replication
+        # Plain docker run (not a service container) so the postgres -c flags for
+        # logical replication are applied at startup, matching tests/integration.
         run: |
-          psql "postgresql://postgres:pg2cb_test@127.0.0.1:5432/source" -v ON_ERROR_STOP=1 <<'SQL'
-          ALTER SYSTEM SET wal_level = 'logical';
-          ALTER SYSTEM SET max_replication_slots = 32;
-          ALTER SYSTEM SET max_wal_senders = 32;
-          SQL
-          docker restart pg18
-        env:
-          PGPASSWORD: pg2cb_test
-
-      - name: Wait for PostgreSQL to accept connections
-        run: |
+          docker run -d --name pg18 \
+            -e POSTGRES_PASSWORD=pg2cb_test \
+            -e POSTGRES_DB=source \
+            -e POSTGRES_USER=postgres \
+            -p 5432:5432 \
+            postgres:18-alpine \
+            -c wal_level=logical \
+            -c max_replication_slots=32 \
+            -c max_wal_senders=32
           for i in $(seq 1 30); do
-            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d source; then exit 0; fi
+            if docker exec pg18 pg_isready -U postgres -d source; then exit 0; fi
             sleep 2
           done
           echo "PostgreSQL did not become ready" >&2
+          docker logs pg18
           exit 1
-        env:
-          PGPASSWORD: pg2cb_test
 
       - name: Run source-postgres integration tests
-        run: cargo test -p cloudberry-etl-source-postgres --tests -- --ignored --nocapture
+        # Only the single-node PG18 suites; citus14_pg18 needs a Citus cluster
+        # (PG2CB_TEST_CITUS_COORDINATOR_DSN) that this service does not provide.
+        run: |
+          cargo test -p cloudberry-etl-source-postgres \
+            --test postgres18 \
+            --test snapshot_page_pg18 \
+            --test snapshot_copy_pg18 \
+            --test snapshot_slot_pg18 \
+            -- --ignored --nocapture
         env:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           RUST_LOG: info
 
       - name: Run control-store integration tests
-        run: cargo test -p cloudberry-etl-metadata --tests -- --ignored --nocapture
+        run: cargo test -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored --nocapture
         env:
           PG2CB_TEST_CONTROL_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           RUST_LOG: info
