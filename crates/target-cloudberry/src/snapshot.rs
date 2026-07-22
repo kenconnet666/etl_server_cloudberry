@@ -140,6 +140,8 @@ pub enum SnapshotTargetError {
     SnapshotGroupAlreadyActive(Uuid),
     #[error("snapshot group `{0}` is not in the loading state")]
     SnapshotGroupNotLoading(Uuid),
+    #[error("snapshot group `{0}` is owned by a table schema transition")]
+    SnapshotGroupOwnedByTableTransition(Uuid),
     #[error("snapshot group cleanup authority and group fence do not match")]
     InvalidSnapshotCleanupFence,
     #[error(

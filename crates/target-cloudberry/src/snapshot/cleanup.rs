@@ -25,6 +25,18 @@ use super::{
     progress, relation_oid,
 };
 
+const LIST_TRANSITION_SNAPSHOT_GROUPS_SQL: &str = r#"
+SELECT DISTINCT snapshot_group_id
+  FROM pg2cb_meta.table_schema_transitions
+ WHERE pipeline_id = $1 AND snapshot_group_id IS NOT NULL
+"#;
+
+const FIND_SNAPSHOT_GROUP_TRANSITION_SQL: &str = r#"
+SELECT 1 FROM pg2cb_meta.table_schema_transitions
+ WHERE pipeline_id = $1 AND snapshot_group_id = $2
+ LIMIT 1
+"#;
+
 /// Authority and immutable ownership information required to remove one interrupted load.
 ///
 /// `current_fence` is the lease currently held by the caller. `group_fence` is copied from the
@@ -147,6 +159,13 @@ pub async fn cleanup_stale_snapshot_groups(
     let transaction = client.transaction().await?;
     lock_pipeline_fence(&transaction, current_fence).await?;
 
+    let referenced_groups = transaction
+        .query(LIST_TRANSITION_SNAPSHOT_GROUPS_SQL, &[&pipeline_id])
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<_, Uuid>("snapshot_group_id"))
+        .collect::<Result<HashSet<_>, _>>()?;
+
     let stale_sql = format!(
         "SELECT snapshot_group_id, topology_generation, fencing_token FROM {}.snapshot_groups WHERE pipeline_id = $1 AND state = 'loading' AND (topology_generation < $2 OR (topology_generation = $2 AND fencing_token < $3)) ORDER BY topology_generation, fencing_token, snapshot_group_id FOR UPDATE",
         quote_identifier(TARGET_METADATA_SCHEMA)?
@@ -160,6 +179,9 @@ pub async fn cleanup_stale_snapshot_groups(
     let mut outcomes = Vec::with_capacity(rows.len());
     for row in rows {
         let snapshot_group_id: Uuid = row.try_get("snapshot_group_id")?;
+        if referenced_groups.contains(&snapshot_group_id) {
+            continue;
+        }
         let topology_raw: i64 = row.try_get("topology_generation")?;
         let topology_generation = u64::try_from(topology_raw)
             .map_err(|_| SnapshotTargetError::CorruptSnapshotGroupManifest(snapshot_group_id))?;
@@ -185,6 +207,21 @@ async fn cleanup_loading_snapshot_group_locked(
     request: SnapshotGroupCleanupRequest,
 ) -> Result<SnapshotCleanupOutcome, SnapshotTargetError> {
     let stored = manifest::load_snapshot_group(transaction, request.snapshot_group_id).await?;
+
+    let transition_owner = transaction
+        .query_opt(
+            FIND_SNAPSHOT_GROUP_TRANSITION_SQL,
+            &[
+                &request.current_fence.pipeline_id.as_uuid(),
+                &request.snapshot_group_id,
+            ],
+        )
+        .await?;
+    if transition_owner.is_some() {
+        return Err(SnapshotTargetError::SnapshotGroupOwnedByTableTransition(
+            request.snapshot_group_id,
+        ));
+    }
 
     validate_group_fence(&stored.request.fence, request)?;
     if stored.state != SnapshotGroupState::Loading {
@@ -733,5 +770,11 @@ mod tests {
             validate_group_fence(&fence(2, 7), request),
             Err(SnapshotTargetError::SnapshotGroupFenceMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn transition_owned_groups_are_excluded_from_cleanup() {
+        assert!(LIST_TRANSITION_SNAPSHOT_GROUPS_SQL.contains("snapshot_group_id IS NOT NULL"));
+        assert!(FIND_SNAPSHOT_GROUP_TRANSITION_SQL.contains("snapshot_group_id = $2"));
     }
 }
