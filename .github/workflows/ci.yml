@@ -53,9 +53,89 @@ jobs:
         env:
           RUST_LOG: info
 
+  integration-pg18:
+    name: PG18 Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: pg2cb_test
+          POSTGRES_DB: source
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        # wal_level=logical and generous slots/senders are required by the source
+        # snapshot/slot contract tests; health-check gates the test step.
+        options: >-
+          --health-cmd "pg_isready -U postgres -d source"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+          --name pg18
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Configure PostgreSQL for logical replication
+        run: |
+          psql "postgresql://postgres:pg2cb_test@127.0.0.1:5432/source" -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET wal_level = 'logical';
+          ALTER SYSTEM SET max_replication_slots = 32;
+          ALTER SYSTEM SET max_wal_senders = 32;
+          SQL
+          docker restart pg18
+        env:
+          PGPASSWORD: pg2cb_test
+
+      - name: Wait for PostgreSQL to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d source; then exit 0; fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+        env:
+          PGPASSWORD: pg2cb_test
+
+      - name: Run source-postgres integration tests
+        run: cargo test -p cloudberry-etl-source-postgres --tests -- --ignored --nocapture
+        env:
+          PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
+          RUST_LOG: info
+
+      - name: Run control-store integration tests
+        run: cargo test -p cloudberry-etl-metadata --tests -- --ignored --nocapture
+        env:
+          PG2CB_TEST_CONTROL_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
+          RUST_LOG: info
+
   web-checks:
-    name: Web Checks (Placeholder)
+    name: Web Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "Web UI will be rebuilt in Phase 0.4"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install and build web
+        working-directory: web
+        run: |
+          npm install
+          npm run build
