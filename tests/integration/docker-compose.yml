@@ -27,6 +27,13 @@ services:
       - test-network
 
   cloudberry-target:
+    # NOTE: Apache Cloudberry 2.1 has no official ready-to-run server image on
+    # Docker Hub yet — apache/incubator-cloudberry publishes only build/test
+    # environment images (cbdb-build-*/cbdb-test-*), and the runnable dev image
+    # is still in development (see cloudberry.apache.org build-based-on-docker).
+    # This tag is a placeholder: target integration tests require a Cloudberry
+    # built from source or the sandbox run.sh, or a CI job that provisions one.
+    # PG18 source tests run fully against postgres:18-alpine above.
     image: apache/cloudberry:2.1.0-incubating
     container_name: pg2cb-it-cb21
     environment:
