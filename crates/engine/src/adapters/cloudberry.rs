@@ -373,20 +373,26 @@ fn reject_schema_barriers(
             match change {
                 TransactionChange::Ddl(message) => {
                     if ddl_scope.requires_barrier(&message) {
-                        return Err(PipelineError::SchemaBarrier(format!(
-                            "DDL `{}` in transaction {} for relations {:?} and schemas {:?}",
-                            message.command_tag,
-                            transaction.xid,
-                            message.relation_ids,
-                            message.affected_schemas
-                        )));
+                        return Err(PipelineError::SchemaBarrier {
+                            reason: format!(
+                                "DDL `{}` in transaction {} for relations {:?} and schemas {:?}",
+                                message.command_tag,
+                                transaction.xid,
+                                message.relation_ids,
+                                message.affected_schemas
+                            ),
+                            command_tag: Some(message.command_tag.clone()),
+                        });
                     }
                 }
                 TransactionChange::Truncate { relation_ids, .. } => {
-                    return Err(PipelineError::SchemaBarrier(format!(
-                        "TRUNCATE in transaction {} for relations {relation_ids:?}",
-                        transaction.xid
-                    )));
+                    return Err(PipelineError::SchemaBarrier {
+                        reason: format!(
+                            "TRUNCATE in transaction {} for relations {relation_ids:?}",
+                            transaction.xid
+                        ),
+                        command_tag: None,
+                    });
                 }
                 TransactionChange::Row(_) => {}
             }
@@ -957,7 +963,7 @@ mod tests {
         assert_eq!(batch.transactions().len(), 2);
         assert!(matches!(
             reject_schema_barriers(&batch, &DdlScope::default()),
-            Err(PipelineError::SchemaBarrier(message)) if message.contains("ALTER TABLE")
+            Err(PipelineError::SchemaBarrier { reason, .. }) if reason.contains("ALTER TABLE")
         ));
         assert_eq!(committed.change_source.stats().unwrap().change_count, 2);
 
@@ -1014,7 +1020,7 @@ mod tests {
         })]);
         assert!(matches!(
             build_apply_request(fence(), "slot", &registry, &ddl),
-            Err(PipelineError::SchemaBarrier(message)) if message.contains("ALTER TABLE")
+            Err(PipelineError::SchemaBarrier { reason, .. }) if reason.contains("ALTER TABLE")
         ));
         let external_publication_ddl = batch(vec![TransactionChange::Ddl(DdlMessage {
             version: 1,
@@ -1025,7 +1031,7 @@ mod tests {
         })]);
         assert!(matches!(
             build_apply_request(fence(), "slot", &registry, &external_publication_ddl),
-            Err(PipelineError::SchemaBarrier(message)) if message.contains("ALTER PUBLICATION")
+            Err(PipelineError::SchemaBarrier { reason, .. }) if reason.contains("ALTER PUBLICATION")
         ));
 
         let truncate = batch(vec![TransactionChange::Truncate {
@@ -1035,7 +1041,7 @@ mod tests {
         }]);
         assert!(matches!(
             build_apply_request(fence(), "slot", &registry, &truncate),
-            Err(PipelineError::SchemaBarrier(message)) if message.contains("TRUNCATE")
+            Err(PipelineError::SchemaBarrier { reason, .. }) if reason.contains("TRUNCATE")
         ));
     }
 
@@ -1073,7 +1079,7 @@ mod tests {
                 &DdlScope::new(Some(HashSet::from(["included".to_owned()])), HashSet::new()),
                 &unknown,
             ),
-            Err(PipelineError::SchemaBarrier(_))
+            Err(PipelineError::SchemaBarrier { .. })
         ));
 
         let known = batch(vec![TransactionChange::Ddl(DdlMessage {

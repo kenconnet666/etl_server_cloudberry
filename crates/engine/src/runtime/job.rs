@@ -587,7 +587,17 @@ impl PostgresCloudberryJob {
         drop(sink);
         drop(replication_client);
         match outcome {
-            Ok(Err(PipelineError::SchemaBarrier(reason))) => {
+            Ok(Err(PipelineError::SchemaBarrier {
+                reason,
+                command_tag,
+            })) => {
+                if let Some(tag) = &command_tag {
+                    tracing::info!(
+                        pipeline_id = %self.pipeline_id,
+                        command_tag = %tag,
+                        "schema barrier raised by DDL; requesting rebuild"
+                    );
+                }
                 self.telemetry.mark_degraded(reason.clone());
                 self.request_rebuild(&reason).await?;
                 Ok(())

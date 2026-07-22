@@ -18,8 +18,14 @@ pub enum PipelineError {
     Source(String),
     #[error("target apply failed: {0}")]
     Target(String),
-    #[error("schema orchestration is required before replication can continue: {0}")]
-    SchemaBarrier(String),
+    #[error("schema orchestration is required before replication can continue: {reason}")]
+    SchemaBarrier {
+        reason: String,
+        /// The source command tag that raised the barrier, when it originated
+        /// from a DDL event (as opposed to TRUNCATE). Lets the runtime record a
+        /// structured schema event before requesting a rebuild.
+        command_tag: Option<String>,
+    },
     #[error(transparent)]
     Normalize(#[from] crate::normalize::NormalizeError),
     #[error("source acknowledgement failed: {0}")]
