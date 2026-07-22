@@ -267,6 +267,26 @@ impl TableBindingRegistry {
         self.bindings.get(&(relation_id, generation))
     }
 
+    /// Classify a DDL against the currently bound schema for `(relation_id,
+    /// generation)`, comparing the binding's mirrored (before) schema to the
+    /// supplied post-DDL (after) schema. Returns `None` when no binding exists
+    /// for the key (an unmanaged or already-superseded relation); otherwise the
+    /// per-column transitions from [`classify_table_diff`], which the caller can
+    /// check with `TransitionKind::is_online_safe` to decide follow vs rebuild.
+    #[must_use]
+    pub fn classify_relation_diff(
+        &self,
+        relation_id: u32,
+        generation: u64,
+        after: &TableSchema,
+    ) -> Option<Vec<cloudberry_etl_core::change::TransitionKind>> {
+        let binding = self.get(relation_id, generation)?;
+        Some(cloudberry_etl_core::schema_diff::classify_table_diff(
+            binding.schema(),
+            after,
+        ))
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.bindings.len()
@@ -1373,6 +1393,32 @@ mod tests {
         ));
         assert_eq!(registry.get(7, 3).unwrap().key(), (7, 3));
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn classify_relation_diff_uses_the_bound_before_schema() {
+        use cloudberry_etl_core::change::TransitionKind;
+        let registry =
+            TableBindingRegistry::new([binding(7, 3, "items", "items", "stage_items")]).unwrap();
+
+        // Unmanaged key -> None.
+        assert!(registry.classify_relation_diff(99, 1, &schema(99, 1, "x")).is_none());
+
+        // Add a nullable column to the bound schema (id pk + payload) -> online-safe AddColumn.
+        let mut after = schema(7, 3, "items");
+        after.columns.push(column(3, "note", None));
+        let diff = registry
+            .classify_relation_diff(7, 3, &after)
+            .expect("managed relation");
+        assert_eq!(diff.len(), 1);
+        assert!(matches!(&diff[0], TransitionKind::AddColumn { name, .. } if name == "note"));
+        assert!(diff[0].is_online_safe());
+
+        // Identical schema -> no transitions.
+        assert!(registry
+            .classify_relation_diff(7, 3, &schema(7, 3, "items"))
+            .expect("managed relation")
+            .is_empty());
     }
 
     #[test]
