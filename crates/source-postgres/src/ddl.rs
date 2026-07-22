@@ -4,7 +4,7 @@
 //! command-end trigger covers ordinary DDL, while the sql-drop trigger covers objects that no
 //! longer exist by the time the command completes.
 
-use cloudberry_etl_core::change::DdlMessage;
+use cloudberry_etl_core::change::{DdlMessage, TableTransition, TransitionKind};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
@@ -15,8 +15,9 @@ use crate::{
 
 pub const DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v1";
 pub const DDL_MESSAGE_VERSION: u16 = 1;
-/// Marker stored on both event triggers and their functions.
-pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v4";
+/// Marker stored on both event triggers and their functions. Bumped to v5 when
+/// the command-end trigger began emitting per-relation `relation_fingerprints`.
+pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v5";
 pub const CANONICAL_DDL_TRIGGER_NAME: &str = "pg2cb_ddl_command_end";
 
 #[derive(Debug, Clone)]
@@ -126,6 +127,7 @@ DECLARE
     relation_ids oid[];
     affected_schemas text[];
     fingerprint text;
+    relation_fingerprints jsonb;
     payload jsonb;
 BEGIN
     -- DROP is emitted by the sql_drop trigger below. This prevents one logical DDL event from
@@ -169,12 +171,23 @@ BEGIN
            FROM pg_event_trigger_ddl_commands()
           WHERE classid = 'pg_class'::regclass),
         '[]')) INTO fingerprint;
+    -- Per-relation after-DDL fingerprints so a consumer can tell exactly which managed
+    -- relations changed and to what shape, without re-reading the source catalog. Distinct
+    -- relation oids only; the engine pairs each with its own before-schema to classify.
+    SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
+        'relation_id', objid::text,
+        'fingerprint', {schema}.{fingerprint}(objid)
+    )), '[]'::jsonb)
+      INTO relation_fingerprints
+      FROM pg_event_trigger_ddl_commands()
+     WHERE classid = 'pg_class'::regclass;
     payload := jsonb_build_object(
         'version', {version},
         'command_tag', TG_TAG,
         'relation_ids', to_jsonb(ARRAY(SELECT value::text FROM unnest(relation_ids) AS value)),
         'affected_schemas', to_jsonb(affected_schemas),
         'schema_fingerprint', fingerprint,
+        'relation_fingerprints', relation_fingerprints,
         'commands', commands
     );
 
@@ -659,6 +672,17 @@ struct DdlEnvelope {
     #[serde(default)]
     affected_schemas: Vec<String>,
     schema_fingerprint: String,
+    /// Per-relation after-DDL fingerprints (v5 capture). Absent for an older
+    /// message, in which case the engine has no per-relation hint and treats the
+    /// event conservatively.
+    #[serde(default)]
+    relation_fingerprints: Vec<RelationFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelationFingerprint {
+    relation_id: String,
+    fingerprint: String,
 }
 
 pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessage> {
@@ -698,15 +722,37 @@ pub fn decode_ddl_message(prefix: &str, payload: &[u8]) -> SourceResult<DdlMessa
         ));
     }
     let affected_schemas = canonicalize_schemas(envelope.affected_schemas)?;
+    // Turn each per-relation after-fingerprint into a transition carrying only the
+    // after side. The source event trigger fires at command-end and cannot observe
+    // the pre-DDL shape, so `kind` stays Unknown here; the engine refines it by
+    // diffing against the relation's bound before-schema (classify_relation_diff).
+    let transitions = envelope
+        .relation_fingerprints
+        .into_iter()
+        .map(|relation| {
+            let relation_id = relation.relation_id.parse::<u32>().map_err(|_| {
+                SourceError::Ddl(format!(
+                    "invalid relation OID `{}` in DDL relation_fingerprints",
+                    relation.relation_id
+                ))
+            })?;
+            Ok(TableTransition {
+                relation_id,
+                before_generation: None,
+                after_generation: None,
+                before_fingerprint: None,
+                after_fingerprint: Some(relation.fingerprint),
+                kind: TransitionKind::Unknown,
+            })
+        })
+        .collect::<SourceResult<Vec<_>>>()?;
     Ok(DdlMessage {
         version: envelope.version,
         command_tag: envelope.command_tag,
         relation_ids,
         affected_schemas,
         schema_fingerprint: envelope.schema_fingerprint,
-        // v1 source envelope carries no structured transitions yet; the v2
-        // capture that populates these lands with the online-follow path.
-        transitions: Vec::new(),
+        transitions,
     })
 }
 
