@@ -44,11 +44,11 @@ use cloudberry_etl_target_cloudberry::{
         load_schema_event,
     },
     snapshot::{
-        QuarantineGcPolicy, SnapshotActivationRequest, SnapshotPageCommitObserver,
-        SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group, begin_snapshot_apply,
-        begin_snapshot_group, begin_snapshot_pages, cleanup_stale_snapshot_groups,
-        garbage_collect_quarantined_tables, plan_snapshot_target_with_storage,
-        validate_active_snapshot_group,
+        ActiveTableRequirement, QuarantineGcPolicy, SnapshotActivationRequest,
+        SnapshotPageCommitObserver, SnapshotTargetError, SnapshotTargetPlan,
+        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages,
+        cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables,
+        plan_snapshot_target_with_storage, validate_active_tables,
     },
     storage::{StorageCapabilityError, load_relation_storage, verify_storage_available},
 };
@@ -412,6 +412,7 @@ impl PipelineJob for PostgresCloudberryJob {
 struct RuntimeTable {
     planned: PlannedTable,
     snapshot_plan: SnapshotTargetPlan,
+    table_generation: u64,
 }
 
 struct PreparedRun {
@@ -639,7 +640,7 @@ impl PostgresCloudberryJob {
                         table.planned.target.clone(),
                         table.planned.staging_name.clone(),
                         table.planned.storage,
-                        self.topology_generation,
+                        table.table_generation,
                         table.planned.schema_fingerprint.clone(),
                     )
                 })
@@ -978,6 +979,7 @@ impl PostgresCloudberryJob {
             accepted.push(RuntimeTable {
                 planned,
                 snapshot_plan,
+                table_generation: self.topology_generation,
             });
         }
         if accepted.is_empty() {
@@ -1396,7 +1398,7 @@ impl PostgresCloudberryJob {
             &self.catalog_options(),
         )
         .await?;
-        let tables = self.plan_inventory(inventory)?;
+        let mut tables = self.plan_inventory(inventory)?;
         for table in &tables {
             if let Some(actual) = load_relation_storage(target, &table.planned.target).await?
                 && actual != table.planned.storage.access_method()
@@ -1418,15 +1420,22 @@ impl PostgresCloudberryJob {
         validate_publication(source, &publication, None)
             .await
             .map_err(|error| RuntimeJobError::PublicationDrift(error.to_string()))?;
-        let activation_tables = tables
+        let active_requirements = tables
             .iter()
-            .map(|table| {
-                table
-                    .snapshot_plan
-                    .activation_table(&table.planned.schema_fingerprint)
+            .map(|table| ActiveTableRequirement {
+                target: table.planned.target.clone(),
+                source_relation_id: table.planned.source.relation_id,
+                schema_fingerprint: table.planned.schema_fingerprint.clone(),
             })
             .collect::<Vec<_>>();
-        validate_active_snapshot_group(target, self.fence, &activation_tables).await?;
+        let active = validate_active_tables(target, self.fence, &active_requirements).await?;
+        for table in &mut tables {
+            table.table_generation = active
+                .iter()
+                .find(|metadata| metadata.target == table.planned.target)
+                .ok_or(RuntimeJobError::NoEligibleTables)?
+                .table_generation;
+        }
         Ok(PreparedRun { tables, checkpoint })
     }
 }

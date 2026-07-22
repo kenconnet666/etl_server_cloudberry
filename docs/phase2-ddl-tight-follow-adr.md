@@ -86,6 +86,7 @@ PK/distribution/collation 改变、不兼容类型、generated/partition/table k
 - [x] target V9 per-table transition ledger；source catalog 双层读取共享 repeatable-read snapshot，event + table actions 原子持久化
 - [x] 可证明 Noop 的 event 在 final chunk 中原子完成 table/event/checkpoint，不触发 pipeline rebuild
 - [x] 持久 active/pending table generation 分配，以及 reload/add snapshot group 的 fenced 幂等绑定
+- [x] 不推进 checkpoint、不处理无关表的 table-local target activation，以及多 snapshot group 的 runtime resume 身份恢复
 - [ ] rapid-DDL coalesce/replan 和依赖 closure
 - [ ] table completion barrier 与 online/reload handler，替换普通 DDL 的 pipeline rebuild 分支
 

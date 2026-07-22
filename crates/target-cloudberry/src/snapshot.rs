@@ -32,7 +32,11 @@ mod cleanup;
 mod manifest;
 mod progress;
 
-pub use activation::{activate_snapshot_group, validate_active_snapshot_group};
+pub use activation::{
+    activate_snapshot_group, activate_table_snapshot_group,
+    activate_table_snapshot_group_in_transaction, validate_active_snapshot_group,
+    validate_active_tables,
+};
 pub use cleanup::{
     QuarantineGcOutcome, QuarantineGcPolicy, SnapshotCleanupOutcome, SnapshotGroupCleanupRequest,
     cleanup_loading_snapshot_group, cleanup_stale_snapshot_groups,
@@ -216,6 +220,10 @@ pub enum SnapshotTargetError {
     },
     #[error("snapshot activation contains a mixture of pending and already-active tables")]
     MixedActivationState,
+    #[error("active managed-table set does not exactly match the requested source inventory")]
+    ActiveTableSetMismatch,
+    #[error("active managed table `{0}` has a different schema fingerprint")]
+    ActiveTableFingerprintMismatch(String),
     #[error("snapshot shadow `{0}` is missing or is not completely owned by this activation")]
     IncompleteShadow(String),
     #[error("active snapshot retry has not reached the required checkpoint for node {0}")]
@@ -315,6 +323,25 @@ pub enum SnapshotActivationDisposition {
 pub struct SnapshotActivationOutcome {
     pub disposition: SnapshotActivationDisposition,
     pub quarantined: Vec<QualifiedName>,
+}
+
+/// Source/target identity required when resuming a pipeline. The persistent table generation is
+/// intentionally omitted because target metadata is authoritative for table-local reloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTableRequirement {
+    pub target: QualifiedName,
+    pub source_relation_id: u32,
+    pub schema_fingerprint: String,
+}
+
+/// Validated persistent identity used to rebuild the runtime apply binding after restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTableMetadata {
+    pub target: QualifiedName,
+    pub source_relation_id: u32,
+    pub table_generation: u64,
+    pub schema_fingerprint: String,
+    pub snapshot_group_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

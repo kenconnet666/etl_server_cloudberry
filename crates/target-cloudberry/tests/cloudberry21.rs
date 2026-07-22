@@ -27,11 +27,12 @@ use cloudberry_etl_target_cloudberry::{
     migration::migrate_target_database,
     schema::plan_create_table_with_storage,
     snapshot::{
-        SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyMode,
-        SnapshotApplyOutcome, SnapshotGroupRegistrationDisposition, SnapshotOwnership,
-        SnapshotPageApplyOutcome, SnapshotTargetError, SnapshotTargetPlan, activate_snapshot_group,
-        begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages, plan_snapshot_target,
-        validate_active_snapshot_group,
+        ActiveTableRequirement, SnapshotActivationDisposition, SnapshotActivationRequest,
+        SnapshotApplyMode, SnapshotApplyOutcome, SnapshotGroupRegistrationDisposition,
+        SnapshotOwnership, SnapshotPageApplyOutcome, SnapshotTargetError, SnapshotTargetPlan,
+        activate_snapshot_group, activate_table_snapshot_group, begin_snapshot_apply,
+        begin_snapshot_group, begin_snapshot_pages, plan_snapshot_target,
+        validate_active_snapshot_group, validate_active_tables,
     },
     storage::{TargetStorage, load_relation_storage},
 };
@@ -367,6 +368,65 @@ async fn run_snapshot_paging_test(
         outcome.disposition,
         SnapshotActivationDisposition::Activated
     );
+
+    // A table-local reload uses its own completed group but must not advance the node checkpoint.
+    let mut reload_schema = source_schema.clone();
+    reload_schema.generation = 2;
+    let reload_plan = plan_snapshot_target(
+        &reload_schema,
+        QualifiedName::new(target_schema, "paged_items")?,
+        QualifiedName::new(target_schema, "shadow_paged_items_reload")?,
+    )?;
+    let reload_group_id = Uuid::now_v7();
+    let reload_fingerprint = "sha256:paging-test-reload";
+    let mut reload_checkpoint = request.initial_checkpoints[0].clone();
+    reload_checkpoint.applied_lsn = PgLsn::new(200);
+    let reload_request = SnapshotActivationRequest {
+        snapshot_group_id: reload_group_id,
+        fence,
+        tables: vec![reload_plan.activation_table(reload_fingerprint)],
+        initial_checkpoints: vec![reload_checkpoint],
+    };
+    begin_snapshot_group(client, &reload_request).await?;
+    let reload_ownership = SnapshotOwnership {
+        fence,
+        snapshot_group_id: reload_group_id,
+        schema_fingerprint: reload_fingerprint.to_owned(),
+    };
+    let mut reload = begin_snapshot_apply(client, reload_plan, &reload_ownership).await?;
+    let reload_stream = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(
+        "tenant-z\t99\treloaded\n",
+    ))]);
+    assert_eq!(reload.copy_from_stream(reload_stream).await?, 1);
+    reload.commit().await?;
+    let reload_outcome = activate_table_snapshot_group(client, &reload_request).await?;
+    assert_eq!(
+        reload_outcome.disposition,
+        SnapshotActivationDisposition::Activated
+    );
+    assert_eq!(reload_outcome.quarantined.len(), 1);
+    assert_eq!(
+        activate_table_snapshot_group(client, &reload_request)
+            .await?
+            .disposition,
+        SnapshotActivationDisposition::AlreadyActive
+    );
+    let stored_checkpoint = load_node_checkpoint(client, request.initial_checkpoints[0].key)
+        .await?
+        .expect("initial activation checkpoint exists");
+    assert_eq!(stored_checkpoint.checkpoint.applied_lsn, PgLsn::new(100));
+    let active = validate_active_tables(
+        client,
+        fence,
+        &[ActiveTableRequirement {
+            target: QualifiedName::new(target_schema, "paged_items")?,
+            source_relation_id: source_schema.relation_id,
+            schema_fingerprint: reload_fingerprint.to_owned(),
+        }],
+    )
+    .await?;
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].table_generation, 2);
 
     Ok(())
 }

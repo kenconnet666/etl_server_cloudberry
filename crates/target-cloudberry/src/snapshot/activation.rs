@@ -17,10 +17,11 @@ use crate::{
 };
 
 use super::{
-    ManagedTableRecord, ManagedTableState, RelationState, SnapshotActivationDisposition,
-    SnapshotActivationOutcome, SnapshotActivationRequest, SnapshotActivationTable,
-    SnapshotTargetError, database_generation, ensure_one_metadata_row, load_relation_state,
-    manifest, matches_activation, progress, validate_managed_fence, validate_managed_identity,
+    ActiveTableMetadata, ActiveTableRequirement, ManagedTableRecord, ManagedTableState,
+    RelationState, SnapshotActivationDisposition, SnapshotActivationOutcome,
+    SnapshotActivationRequest, SnapshotActivationTable, SnapshotTargetError, database_generation,
+    ensure_one_metadata_row, load_relation_state, manifest, matches_activation, progress,
+    relation_oid, validate_managed_fence, validate_managed_identity,
 };
 
 #[derive(Debug)]
@@ -258,6 +259,142 @@ pub async fn activate_snapshot_group(
     })
 }
 
+/// Atomically promotes only the shadows named by `request`.
+///
+/// Unlike initial pipeline activation, this does not reconcile unrelated active tables and does
+/// not read or advance node checkpoints. The caller must first finish table-local WAL catch-up and
+/// reconciliation. The registered checkpoint vector remains immutable snapshot provenance only.
+pub async fn activate_table_snapshot_group(
+    client: &mut Client,
+    request: &SnapshotActivationRequest,
+) -> Result<SnapshotActivationOutcome, SnapshotTargetError> {
+    let transaction = client.transaction().await?;
+    let outcome = activate_table_snapshot_group_in_transaction(&transaction, request).await?;
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+/// Caller-owned transaction form used to commit cutover with the table-transition ledger.
+pub async fn activate_table_snapshot_group_in_transaction(
+    transaction: &Transaction<'_>,
+    request: &SnapshotActivationRequest,
+) -> Result<SnapshotActivationOutcome, SnapshotTargetError> {
+    let canonical = manifest::canonical_request(request)?;
+    lock_pipeline_fence(transaction, canonical.fence).await?;
+    let stored = manifest::load_snapshot_group(transaction, canonical.snapshot_group_id).await?;
+    let request = manifest::validate_exact_request(&stored, &canonical)?;
+
+    let mut states = Vec::with_capacity(request.tables.len());
+    for table in &request.tables {
+        let target = load_relation_state(transaction, &table.target).await?;
+        let shadow = load_relation_state(transaction, &table.shadow).await?;
+        states.push(classify_table(&request, table, target, shadow)?);
+    }
+    let already_active = group_is_active(&states)?;
+    if stored.snapshot_progress_version == progress::SNAPSHOT_PROGRESS_VERSION {
+        let progress_identities = activation_progress_identities(&request.tables, &states)?;
+        progress::lock_completed_snapshot_tables(transaction, &request, &progress_identities)
+            .await?;
+    }
+    if already_active {
+        if stored.state != manifest::SnapshotGroupState::Active {
+            return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
+                request.snapshot_group_id,
+            ));
+        }
+        return Ok(SnapshotActivationOutcome {
+            disposition: SnapshotActivationDisposition::AlreadyActive,
+            quarantined: Vec::new(),
+        });
+    }
+    if stored.state != manifest::SnapshotGroupState::Loading {
+        return Err(SnapshotTargetError::CorruptSnapshotGroupManifest(
+            request.snapshot_group_id,
+        ));
+    }
+
+    let mut reserved_names = request
+        .tables
+        .iter()
+        .flat_map(|table| [table.target.clone(), table.shadow.clone()])
+        .collect::<HashSet<_>>();
+    let mut quarantine_names = Vec::with_capacity(states.len());
+    for (table, state) in request.tables.iter().zip(&states) {
+        let TableActivationState::Pending {
+            previous_active, ..
+        } = state
+        else {
+            unreachable!("mixed activation states were rejected")
+        };
+        let quarantine = previous_active
+            .as_ref()
+            .map(|record| quarantine_name(&table.target, record))
+            .transpose()?;
+        if let Some(quarantine) = &quarantine
+            && (!reserved_names.insert(quarantine.clone())
+                || !matches!(
+                    load_relation_state(transaction, quarantine).await?,
+                    RelationState::Vacant
+                ))
+        {
+            return Err(SnapshotTargetError::QuarantineNameConflict(
+                quarantine.to_string(),
+            ));
+        }
+        quarantine_names.push(quarantine);
+    }
+
+    let mut quarantined = Vec::new();
+    for ((table, state), quarantine) in request.tables.iter().zip(&states).zip(&quarantine_names) {
+        let TableActivationState::Pending {
+            shadow,
+            previous_active,
+        } = state
+        else {
+            unreachable!("mixed activation states were rejected")
+        };
+        if let (Some(previous), Some(quarantine)) = (previous_active, quarantine) {
+            transaction
+                .batch_execute(&rename_table_sql(&table.target, &quarantine.name)?)
+                .await?;
+            relocate_metadata(
+                transaction,
+                &table.target,
+                quarantine,
+                previous,
+                ManagedTableState::Quarantined,
+                request.fence.fencing_token,
+            )
+            .await?;
+            record_reconciliation(
+                transaction,
+                &request,
+                &table.target,
+                quarantine,
+                previous,
+                ReconciliationReason::Replaced,
+            )
+            .await?;
+            quarantined.push(quarantine.clone());
+        }
+        promote_shadow(transaction, table).await?;
+        relocate_metadata(
+            transaction,
+            &table.shadow,
+            &table.target,
+            shadow,
+            ManagedTableState::Active,
+            request.fence.fencing_token,
+        )
+        .await?;
+    }
+    manifest::mark_snapshot_group_active(transaction, request.snapshot_group_id).await?;
+    Ok(SnapshotActivationOutcome {
+        disposition: SnapshotActivationDisposition::Activated,
+        quarantined,
+    })
+}
+
 async fn load_stale_active_tables(
     transaction: &Transaction<'_>,
     request: &SnapshotActivationRequest,
@@ -484,6 +621,89 @@ pub async fn validate_active_snapshot_group(
     }
     transaction.commit().await?;
     Ok(snapshot_group_id)
+}
+
+/// Validates the exact active managed-table set without requiring every table to originate from
+/// one snapshot group. This is the resume authority after table-local reloads.
+pub async fn validate_active_tables(
+    client: &mut Client,
+    fence: crate::checkpoint::PipelineFence,
+    requirements: &[ActiveTableRequirement],
+) -> Result<Vec<ActiveTableMetadata>, SnapshotTargetError> {
+    let mut requirements = requirements.to_vec();
+    requirements.sort_by(|left, right| {
+        (&left.target.schema, &left.target.name).cmp(&(&right.target.schema, &right.target.name))
+    });
+    if requirements.is_empty()
+        || requirements.iter().any(|requirement| {
+            requirement.source_relation_id == 0 || requirement.schema_fingerprint.is_empty()
+        })
+        || requirements
+            .windows(2)
+            .any(|pair| pair[0].target == pair[1].target)
+    {
+        return Err(SnapshotTargetError::ActiveTableSetMismatch);
+    }
+
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let sql = format!(
+        "SELECT target_schema, target_table, pipeline_id, snapshot_group_id, relation_oid, source_relation_id, table_generation, schema_fingerprint, state, fencing_token FROM {}.managed_tables WHERE pipeline_id = $1 AND state = 'active' ORDER BY target_schema, target_table FOR UPDATE",
+        quote_identifier(TARGET_METADATA_SCHEMA)?
+    );
+    let rows = transaction
+        .query(&sql, &[&fence.pipeline_id.as_uuid()])
+        .await?;
+    if rows.len() != requirements.len() {
+        return Err(SnapshotTargetError::ActiveTableSetMismatch);
+    }
+    let mut active = Vec::with_capacity(rows.len());
+    for (requirement, row) in requirements.iter().zip(rows) {
+        let target = QualifiedName::new(
+            row.try_get::<_, String>("target_schema")?,
+            row.try_get::<_, String>("target_table")?,
+        )
+        .map_err(crate::schema::SchemaError::from)?;
+        if target != requirement.target {
+            return Err(SnapshotTargetError::ActiveTableSetMismatch);
+        }
+        let record = super::managed_table_record_from_row(&target, &row)?;
+        validate_managed_identity(
+            &target,
+            &record,
+            fence.pipeline_id,
+            requirement.source_relation_id,
+        )?;
+        validate_managed_fence(&target, &record, fence.fencing_token)?;
+        require_state(&target, &record, ManagedTableState::Active)?;
+        if record.schema_fingerprint != requirement.schema_fingerprint {
+            return Err(SnapshotTargetError::ActiveTableFingerprintMismatch(
+                target.to_string(),
+            ));
+        }
+        let expected_oid = record
+            .relation_oid
+            .ok_or_else(|| SnapshotTargetError::MissingRelationIdentity(target.to_string()))?;
+        let actual_oid = relation_oid(&transaction, &target)
+            .await?
+            .ok_or_else(|| SnapshotTargetError::ManagedRelationMissing(target.to_string()))?;
+        if actual_oid != expected_oid {
+            return Err(SnapshotTargetError::RelationIdentityMismatch {
+                table: target.to_string(),
+                expected: expected_oid,
+                actual: actual_oid,
+            });
+        }
+        active.push(ActiveTableMetadata {
+            target,
+            source_relation_id: record.source_relation_id,
+            table_generation: record.table_generation,
+            schema_fingerprint: record.schema_fingerprint,
+            snapshot_group_id: record.snapshot_group_id,
+        });
+    }
+    transaction.commit().await?;
+    Ok(active)
 }
 
 fn classify_table(
