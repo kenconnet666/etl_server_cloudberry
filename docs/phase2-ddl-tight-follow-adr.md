@@ -82,7 +82,8 @@ PK/distribution/collation 改变、不兼容类型、generated/partition/table k
 - [x] memory/spool 统一流式 planner、terminal-state catalog validation、确定性事务 payload/event identity
 - [x] 事务级 `schema_events` exact replay、active fence 校验、未完成事件新 lease 接管
 - [x] DDL transaction 独占 batch，runtime 在 checkpoint 前持久化 event；handler 未接入期间先标记 failed 再走兼容 rebuild
-- [ ] rapid-DDL coalesce/replan、bound before/after diff 和依赖 closure
+- [x] bound before/after capability plan：完整 catalog `TableSchema` + active binding，输出 `Noop / Online / Reload / Drop / Add`
+- [ ] rapid-DDL coalesce/replan 和依赖 closure
 - [ ] table completion barrier 与 online/reload handler，替换普通 DDL 的 pipeline rebuild 分支
 
 ### M3：shadow reload 和 cutover

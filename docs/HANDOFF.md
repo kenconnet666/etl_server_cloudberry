@@ -71,9 +71,10 @@ cargo test --workspace --lib
 - **事务级 schema planner** ✅ `engine/src/schema_transition.rs` 对 memory/spool change source 统一流式扫描，保留 transaction ordinal，只以每 relation terminal captured state 对齐一次提交后 source catalog；v1/TRUNCATE/unknown scope 和 rapid-advance/catalog drift 均 fail closed，不推进 checkpoint。
 - **fenced schema-event 持久化** ✅ 一个 source transaction 对应一个确定性 UUIDv8/JSON payload；写入、exact replay、unfinished adoption 和状态推进均锁 active target pipeline fence。真实 PG18 -> Cloudberry 2.1 E2E 覆盖 catalog exact match、后续 DDL mismatch、重复 WAL 和新 lease 接管。
 - **runtime durable schema barrier** ✅ batcher 在 DDL 前后都切 batch，schema transaction 不再与后续 DML 混批；standalone sink 使用独立 source SQL 连接在任何 target data/checkpoint 写入前校验 terminal catalog 并落 ledger。当前 table handler 尚未接入时，runtime 先原子推进 event 为 `failed`，再调用旧 pipeline rebuild fallback；真实完整 runtime E2E 证明 checkpoint 不越过 DDL、目标无半应用 schema、且只创建一次 rebuild operation。
+- **bound capability plan** ✅ barrier 在事件持久化后按 relation OID 读取完整 `TableSchema`，以 active binding 为 before-schema，确定性生成 `Noop / Online / Reload / Drop / Add`；v1/TRUNCATE 保持表级 reload，未知范围和 rapid-DDL/catalog mismatch 继续 pipeline fail-closed。schema diff 已补齐 table identity、kind、replica identity、distribution/partition、nullability、generated/identity/collation 的保守判定，避免把未覆盖 shape 误当 `Noop`。
 
 **未完成（下一位优先处理，按顺序）：**
-1. **runtime capability plan + table handler。** durable coordinator 已在旧 fallback 前接管含 DDL 的 committed transaction；下一步以 bound before-schema 分类 terminal diff、计算 dependency closure，并把当前 `failed -> pipeline rebuild` fallback 替换为 online apply、table/closure reload、quarantine 或 bounded retry。未完成事件不得越过 checkpoint/ACK。
+1. **table handler + dependency closure。** capability plan 已完成；下一步补持久 table transition 状态与依赖 closure，并把当前 `failed -> pipeline rebuild` fallback 替换为 table-local handler。未完成事件不得越过 checkpoint/ACK。
 2. **table barrier + shadow reload / catch-up / cutover。** 用 `begin_snapshot_pages` 重载单表 shadow → 从 barrier 后 spool 回放该表 CDC → reconciliation → 原子 quarantine/activation + `registry.swap`。`schema_events` 状态随 target 变更同事务推进。
 3. **在线白名单 handler 接入。** 逐项验证 ADD/DROP/RENAME/default/nullability/widening 的 Cloudberry 2.1 capability；任一前置条件失败自动转受影响 table/dependency closure reload，不升级整 pipeline。
 4. **rapid DDL、DROP quarantine + 新表自动准入。** catalog 比 event 超前时合并连续 committed schema transactions 后重算 terminal plan；无法证明完整范围则局部 quarantine/reload 并阻断 checkpoint。

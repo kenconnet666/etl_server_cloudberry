@@ -672,7 +672,7 @@ impl PostgresCloudberryJob {
                 chunk_limits,
             )?,
         }
-        .with_schema_source(source_setup, self.source_settings.metadata_schema.clone())?;
+        .with_schema_source(source_setup, self.catalog_options())?;
         let batcher = Batcher::new(BatchLimits {
             max_rows: self.pipeline_settings.batch.max_rows,
             max_bytes: self.pipeline_settings.batch.max_bytes,

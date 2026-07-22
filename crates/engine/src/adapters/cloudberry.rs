@@ -11,6 +11,7 @@ use cloudberry_etl_core::{
     schema::{QualifiedName, TableSchema},
 };
 use cloudberry_etl_source_postgres::{
+    catalog::{CatalogOptions, load_tables_by_relation_ids},
     spool::{ChangeChunk, ChangeStats, ChunkLimits},
     wal::CommittedTransaction,
 };
@@ -35,7 +36,7 @@ use crate::{
     batch::TransactionBatch,
     normalize::normalize_table_changes,
     pipeline::{PipelineError, SchemaEventKey, TransactionSink},
-    schema_transition::{plan_schema_transaction, prepare_schema_plan},
+    schema_transition::{plan_schema_capabilities, plan_schema_transaction, prepare_schema_plan},
 };
 
 // This versions the logical record digest consumed by the target ledger, not its memory or spool
@@ -65,6 +66,8 @@ pub enum AdapterConfigError {
     InvalidSchemaFingerprint,
     #[error("source metadata schema cannot be empty or contain NUL")]
     InvalidMetadataSchema,
+    #[error("relation {0} has more than one active schema binding")]
+    AmbiguousActiveRelation(u32),
 }
 
 /// Source schema selection used to decide whether a transactional DDL event requires a rebuild.
@@ -282,6 +285,24 @@ impl TableBindingRegistry {
         self.bindings
             .keys()
             .any(|(bound_relation, _)| *bound_relation == relation_id)
+    }
+
+    /// Snapshot the one active before-schema for each managed relation at a schema barrier.
+    /// Multiple generations for one relation are valid only while a future transition executor
+    /// explicitly selects the active generation; until then capability planning fails closed.
+    pub fn active_schemas(&self) -> Result<BTreeMap<u32, TableSchema>, AdapterConfigError> {
+        let mut schemas = BTreeMap::new();
+        for binding in self.bindings.values() {
+            if schemas
+                .insert(binding.schema.relation_id, binding.schema.clone())
+                .is_some()
+            {
+                return Err(AdapterConfigError::AmbiguousActiveRelation(
+                    binding.schema.relation_id,
+                ));
+            }
+        }
+        Ok(schemas)
     }
 
     /// Classify a DDL against the currently bound schema for `(relation_id,
@@ -519,7 +540,7 @@ pub struct CloudberryTransactionSink {
 
 struct SchemaSource {
     client: Client,
-    metadata_schema: String,
+    options: CatalogOptions,
 }
 
 impl CloudberryTransactionSink {
@@ -615,16 +636,12 @@ impl CloudberryTransactionSink {
     pub fn with_schema_source(
         mut self,
         client: Client,
-        metadata_schema: impl Into<String>,
+        options: CatalogOptions,
     ) -> Result<Self, AdapterConfigError> {
-        let metadata_schema = metadata_schema.into();
-        if metadata_schema.is_empty() || metadata_schema.contains('\0') {
+        if options.metadata_schema.is_empty() || options.metadata_schema.contains('\0') {
             return Err(AdapterConfigError::InvalidMetadataSchema);
         }
-        self.schema_source = Some(SchemaSource {
-            client,
-            metadata_schema,
-        });
+        self.schema_source = Some(SchemaSource { client, options });
         Ok(self)
     }
 
@@ -690,12 +707,50 @@ impl CloudberryTransactionSink {
         let prepared = prepare_schema_plan(
             &source.client,
             client,
-            &source.metadata_schema,
+            &source.options.metadata_schema,
             self.fence,
             plan,
         )
         .await
         .map_err(|error| PipelineError::Target(error.to_string()))?;
+        let capability = if prepared.catalog_validation.unknown_scope
+            || !prepared.catalog_validation.mismatches.is_empty()
+        {
+            plan_schema_capabilities(
+                &prepared.plan,
+                &prepared.catalog_validation,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+        } else {
+            let present_ids = prepared
+                .current_relations
+                .iter()
+                .filter_map(|(relation_id, current)| current.as_ref().map(|_| *relation_id))
+                .collect::<Vec<_>>();
+            let current =
+                load_tables_by_relation_ids(&source.client, &source.options, &present_ids)
+                    .await
+                    .map_err(|error| PipelineError::Source(error.to_string()))?;
+            let after = prepared
+                .plan
+                .relation_ids()
+                .into_iter()
+                .map(|relation_id| (relation_id, current.get(&relation_id).cloned()))
+                .collect();
+            let before = self
+                .registry
+                .active_schemas()
+                .map_err(|error| PipelineError::Target(error.to_string()))?;
+            plan_schema_capabilities(
+                &prepared.plan,
+                &prepared.catalog_validation,
+                &before,
+                &after,
+            )
+        }
+        .map_err(|error| PipelineError::Source(error.to_string()))?;
+        let reason = format!("{reason}; capability plan: {}", capability.action_summary());
         Ok(Some(PipelineError::SchemaBarrier {
             reason,
             command_tag,

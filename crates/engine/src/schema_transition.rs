@@ -11,6 +11,8 @@ use cloudberry_etl_core::{
         TransactionChange, TransitionKind,
     },
     lsn::PgLsn,
+    schema::TableSchema,
+    schema_diff::classify_table_diff,
 };
 use cloudberry_etl_source_postgres::{
     SourceError,
@@ -245,7 +247,165 @@ pub struct CatalogValidation {
 pub struct PreparedSchemaEvent {
     pub plan: SchemaTransactionPlan,
     pub catalog_validation: CatalogValidation,
+    pub current_relations: BTreeMap<u32, Option<CurrentRelationSchema>>,
     pub record_outcome: RecordOutcome,
+}
+
+/// Deterministic table-local action selected from the bound schema and the authoritative
+/// post-commit source catalog. Execution remains a separate, fenced concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaAction {
+    Noop,
+    Online {
+        transitions: Vec<TransitionKind>,
+        after: TableSchema,
+    },
+    Reload {
+        after: TableSchema,
+        reason: ReloadReason,
+    },
+    Drop,
+    Add {
+        after: TableSchema,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadReason {
+    ExplicitFallback,
+    UnsafeDiff,
+    UnverifiableEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityBlocker {
+    UnknownScope,
+    CatalogMismatch(CatalogMismatch),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaCapabilityPlan {
+    pub actions: BTreeMap<u32, SchemaAction>,
+    pub blockers: Vec<CapabilityBlocker>,
+}
+
+impl SchemaCapabilityPlan {
+    #[must_use]
+    pub fn is_table_local(&self) -> bool {
+        self.blockers.is_empty()
+    }
+
+    #[must_use]
+    pub fn action_summary(&self) -> String {
+        if !self.blockers.is_empty() {
+            return format!("blocked({})", self.blockers.len());
+        }
+        let mut counts = BTreeMap::<&'static str, usize>::new();
+        for action in self.actions.values() {
+            let name = match action {
+                SchemaAction::Noop => "noop",
+                SchemaAction::Online { .. } => "online",
+                SchemaAction::Reload { .. } => "reload",
+                SchemaAction::Drop => "drop",
+                SchemaAction::Add { .. } => "add",
+            };
+            *counts.entry(name).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Bind a persisted schema event to complete before/after schemas.
+///
+/// `before` contains active managed relations. `after` must contain one entry for every relation
+/// in the event; `None` means the OID no longer exists. Catalog mismatch and unknown scope are
+/// pipeline-level correctness failures, so no table-local actions are emitted in those cases.
+pub fn plan_schema_capabilities(
+    plan: &SchemaTransactionPlan,
+    validation: &CatalogValidation,
+    before: &BTreeMap<u32, TableSchema>,
+    after: &BTreeMap<u32, Option<TableSchema>>,
+) -> Result<SchemaCapabilityPlan, SchemaPlanError> {
+    let mut blockers = Vec::new();
+    if validation.unknown_scope {
+        blockers.push(CapabilityBlocker::UnknownScope);
+    }
+    blockers.extend(
+        validation
+            .mismatches
+            .iter()
+            .cloned()
+            .map(CapabilityBlocker::CatalogMismatch),
+    );
+    if !blockers.is_empty() {
+        return Ok(SchemaCapabilityPlan {
+            actions: BTreeMap::new(),
+            blockers,
+        });
+    }
+
+    let unverifiable = validation
+        .unverifiable_relations
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut actions = BTreeMap::new();
+    for (relation_id, captured) in &plan.terminal_relations {
+        let current = after
+            .get(relation_id)
+            .ok_or(SchemaPlanError::MissingCatalogRelation(*relation_id))?;
+        let bound = before.get(relation_id);
+        let action = if unverifiable.contains(relation_id) {
+            match (bound, current) {
+                (Some(_), Some(after)) => SchemaAction::Reload {
+                    after: after.clone(),
+                    reason: ReloadReason::UnverifiableEvent,
+                },
+                (Some(_), None) => SchemaAction::Drop,
+                (None, Some(after)) => SchemaAction::Add {
+                    after: after.clone(),
+                },
+                (None, None) => SchemaAction::Noop,
+            }
+        } else {
+            match (captured, bound, current) {
+                (CapturedRelationState::Dropped { .. }, Some(_), None) => SchemaAction::Drop,
+                (CapturedRelationState::Dropped { .. }, None, None) => SchemaAction::Noop,
+                (CapturedRelationState::Present { .. }, None, Some(after)) => SchemaAction::Add {
+                    after: after.clone(),
+                },
+                (CapturedRelationState::Present { .. }, Some(before), Some(after)) => {
+                    let transitions = classify_table_diff(before, after);
+                    if plan.reload_relations.contains(relation_id) {
+                        SchemaAction::Reload {
+                            after: after.clone(),
+                            reason: ReloadReason::ExplicitFallback,
+                        }
+                    } else if transitions.is_empty() {
+                        SchemaAction::Noop
+                    } else if transitions.iter().all(TransitionKind::is_online_safe) {
+                        SchemaAction::Online {
+                            transitions,
+                            after: after.clone(),
+                        }
+                    } else {
+                        SchemaAction::Reload {
+                            after: after.clone(),
+                            reason: ReloadReason::UnsafeDiff,
+                        }
+                    }
+                }
+                // These shapes contradict an otherwise mismatch-free terminal validation.
+                _ => return Err(SchemaPlanError::MissingCatalogRelation(*relation_id)),
+            }
+        };
+        actions.insert(*relation_id, action);
+    }
+    Ok(SchemaCapabilityPlan { actions, blockers })
 }
 
 impl CatalogValidation {
@@ -300,6 +460,7 @@ where
     Ok(PreparedSchemaEvent {
         plan,
         catalog_validation,
+        current_relations: current,
         record_outcome,
     })
 }
@@ -532,7 +693,10 @@ mod tests {
     use cloudberry_etl_core::{
         change::{RelationColumnSnapshot, SourceTransaction, TableChange, Tuple},
         id::PipelineId,
-        schema::QualifiedName,
+        schema::{
+            ColumnSchema, GeneratedColumn, IdentityColumn, PgType, PgTypeKind, QualifiedName,
+            ReplicaIdentity, TableKind,
+        },
     };
     use cloudberry_etl_source_postgres::spool::{
         ChangeSource, SpoolIdentity, SpoolJournal, SpoolLimits,
@@ -561,6 +725,36 @@ mod tests {
                 default_expression: None,
             }],
             primary_key: vec![1],
+            partition_key: Vec::new(),
+        }
+    }
+
+    fn table(relation_id: u32, columns: &[(&str, bool)]) -> TableSchema {
+        TableSchema {
+            relation_id,
+            generation: 1,
+            name: QualifiedName::new("public", "items").unwrap(),
+            kind: TableKind::Ordinary,
+            replica_identity: ReplicaIdentity::Default,
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(index, (name, nullable))| ColumnSchema {
+                    attnum: i16::try_from(index + 1).unwrap(),
+                    name: (*name).to_owned(),
+                    data_type: PgType {
+                        oid: 23,
+                        name: QualifiedName::new("pg_catalog", "int4").unwrap(),
+                        kind: PgTypeKind::Int4,
+                    },
+                    nullable: *nullable,
+                    primary_key_ordinal: (index == 0).then_some(1),
+                    generated: GeneratedColumn::None,
+                    identity: IdentityColumn::None,
+                    collation: None,
+                })
+                .collect(),
+            distribution_key: Vec::new(),
             partition_key: Vec::new(),
         }
     }
@@ -855,5 +1049,166 @@ mod tests {
         .schema_event_record(fence)
         .unwrap();
         assert_ne!(changed.event_id, first.event_id);
+    }
+
+    #[test]
+    fn capability_plan_selects_online_reload_drop_add_and_noop() {
+        let mut add_column = ddl(42, "after", snapshot(42, "description"));
+        add_column.transitions[0].kind = TransitionKind::AddColumn {
+            name: "note".to_owned(),
+            nullable_or_defaulted: true,
+        };
+        let mut plan =
+            plan_schema_transaction(&committed(vec![TransactionChange::Ddl(add_column)]))
+                .unwrap()
+                .unwrap();
+        let validation = CatalogValidation {
+            matched_relations: vec![42],
+            unverifiable_relations: Vec::new(),
+            mismatches: Vec::new(),
+            unknown_scope: false,
+        };
+        let before = BTreeMap::from([(42, table(42, &[("id", false)]))]);
+        let after_schema = table(42, &[("id", false), ("note", true)]);
+        let after = BTreeMap::from([(42, Some(after_schema.clone()))]);
+        let capability = plan_schema_capabilities(&plan, &validation, &before, &after).unwrap();
+        assert!(capability.is_table_local());
+        assert_eq!(capability.action_summary(), "online=1");
+        assert!(matches!(
+            capability.actions.get(&42),
+            Some(SchemaAction::Online { transitions, after })
+                if transitions.len() == 1 && after == &after_schema
+        ));
+
+        let add = plan_schema_capabilities(
+            &plan,
+            &validation,
+            &BTreeMap::new(),
+            &BTreeMap::from([(42, Some(after_schema.clone()))]),
+        )
+        .unwrap();
+        assert!(matches!(
+            add.actions.get(&42),
+            Some(SchemaAction::Add { .. })
+        ));
+
+        let noop = plan_schema_capabilities(
+            &plan,
+            &validation,
+            &BTreeMap::from([(42, after_schema.clone())]),
+            &BTreeMap::from([(42, Some(after_schema.clone()))]),
+        )
+        .unwrap();
+        assert!(matches!(noop.actions.get(&42), Some(SchemaAction::Noop)));
+
+        plan.reload_relations.insert(42);
+        let explicit = plan_schema_capabilities(&plan, &validation, &before, &after).unwrap();
+        assert!(matches!(
+            explicit.actions.get(&42),
+            Some(SchemaAction::Reload {
+                reason: ReloadReason::ExplicitFallback,
+                ..
+            })
+        ));
+        plan.reload_relations.clear();
+
+        let mut unsafe_after = after_schema;
+        unsafe_after.columns[1].nullable = false;
+        let capability = plan_schema_capabilities(
+            &plan,
+            &validation,
+            &before,
+            &BTreeMap::from([(42, Some(unsafe_after))]),
+        )
+        .unwrap();
+        assert!(matches!(
+            capability.actions.get(&42),
+            Some(SchemaAction::Reload {
+                reason: ReloadReason::UnsafeDiff,
+                ..
+            })
+        ));
+
+        let drop_message = DdlMessage {
+            version: 2,
+            command_tag: "DROP TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "drop".to_owned(),
+            transitions: vec![TableTransition {
+                relation_id: 42,
+                before_generation: None,
+                after_generation: None,
+                before_fingerprint: None,
+                after_fingerprint: None,
+                after_schema: None,
+                kind: TransitionKind::DropTable,
+            }],
+        };
+        let drop_plan =
+            plan_schema_transaction(&committed(vec![TransactionChange::Ddl(drop_message)]))
+                .unwrap()
+                .unwrap();
+        let drop = plan_schema_capabilities(
+            &drop_plan,
+            &validation,
+            &before,
+            &BTreeMap::from([(42, None)]),
+        )
+        .unwrap();
+        assert!(matches!(drop.actions.get(&42), Some(SchemaAction::Drop)));
+    }
+
+    #[test]
+    fn capability_plan_keeps_unknown_relations_local_but_blocks_unknown_scope_and_drift() {
+        let legacy = DdlMessage {
+            version: 1,
+            command_tag: "ALTER TABLE".to_owned(),
+            relation_ids: vec![42],
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "legacy".to_owned(),
+            transitions: Vec::new(),
+        };
+        let plan = plan_schema_transaction(&committed(vec![TransactionChange::Ddl(legacy)]))
+            .unwrap()
+            .unwrap();
+        let local = plan_schema_capabilities(
+            &plan,
+            &CatalogValidation {
+                matched_relations: Vec::new(),
+                unverifiable_relations: vec![42],
+                mismatches: Vec::new(),
+                unknown_scope: false,
+            },
+            &BTreeMap::from([(42, table(42, &[("id", false)]))]),
+            &BTreeMap::from([(42, Some(table(42, &[("id", false)])))]),
+        )
+        .unwrap();
+        assert!(matches!(
+            local.actions.get(&42),
+            Some(SchemaAction::Reload {
+                reason: ReloadReason::UnverifiableEvent,
+                ..
+            })
+        ));
+
+        let blocked = plan_schema_capabilities(
+            &plan,
+            &CatalogValidation {
+                matched_relations: Vec::new(),
+                unverifiable_relations: vec![42],
+                mismatches: vec![CatalogMismatch {
+                    relation_id: 42,
+                    kind: CatalogMismatchKind::DifferentPresentState,
+                }],
+                unknown_scope: true,
+            },
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(!blocked.is_table_local());
+        assert!(blocked.actions.is_empty());
+        assert_eq!(blocked.action_summary(), "blocked(2)");
     }
 }

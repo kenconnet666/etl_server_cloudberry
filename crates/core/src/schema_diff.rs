@@ -23,8 +23,15 @@ use crate::{
 /// widening). An empty vector means the schemas are structurally equivalent.
 #[must_use]
 pub fn classify_table_diff(before: &TableSchema, after: &TableSchema) -> Vec<TransitionKind> {
-    // A primary-key change alters row identity and is never an online transition.
-    if !primary_key_matches(before, after) {
+    // Relation-level identity and routing changes are not column-local online transitions.
+    if before.relation_id != after.relation_id
+        || before.name != after.name
+        || before.kind != after.kind
+        || before.replica_identity != after.replica_identity
+        || before.distribution_key != after.distribution_key
+        || before.partition_key != after.partition_key
+        || !primary_key_matches(before, after)
+    {
         return vec![TransitionKind::Unknown];
     }
 
@@ -62,6 +69,13 @@ pub fn classify_table_diff(before: &TableSchema, after: &TableSchema) -> Vec<Tra
                 name: after_col.name.clone(),
                 widening: is_widening(&before_col.data_type.kind, &after_col.data_type.kind),
             });
+        }
+        if before_col.nullable != after_col.nullable
+            || before_col.generated != after_col.generated
+            || before_col.identity != after_col.identity
+            || before_col.collation != after_col.collation
+        {
+            return vec![TransitionKind::Unknown];
         }
     }
     transitions
@@ -280,5 +294,38 @@ mod tests {
             &PgTypeKind::VarChar { length: None },
             &PgTypeKind::VarChar { length: Some(10) }
         ));
+    }
+
+    #[test]
+    fn relation_and_non_column_shape_changes_fail_closed() {
+        let before = base();
+
+        let mut renamed_table = before.clone();
+        renamed_table.name = QualifiedName::new("public", "renamed").unwrap();
+        assert_eq!(
+            classify_table_diff(&before, &renamed_table),
+            [TransitionKind::Unknown]
+        );
+
+        let mut nullable = before.clone();
+        nullable.columns[1].nullable = false;
+        assert_eq!(
+            classify_table_diff(&before, &nullable),
+            [TransitionKind::Unknown]
+        );
+
+        let mut collated = before.clone();
+        collated.columns[1].collation = Some(QualifiedName::new("pg_catalog", "C").unwrap());
+        assert_eq!(
+            classify_table_diff(&before, &collated),
+            [TransitionKind::Unknown]
+        );
+
+        let mut partitioned = before.clone();
+        partitioned.partition_key = vec![1];
+        assert_eq!(
+            classify_table_diff(&before, &partitioned),
+            [TransitionKind::Unknown]
+        );
     }
 }
