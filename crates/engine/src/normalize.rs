@@ -353,6 +353,7 @@ impl<'a> Normalizer<'a> {
     }
 
     fn finish(mut self) -> Result<Vec<StagingRow>, NormalizeError> {
+        let baseline_keys = self.origin_by_key.keys().cloned().collect::<HashSet<_>>();
         let moved_destinations = self
             .lineages
             .iter()
@@ -369,7 +370,14 @@ impl<'a> Normalizer<'a> {
             .into_iter()
             .filter_map(|lineage| match (lineage.origin_key, lineage.current_key) {
                 (None, None) => None,
-                (None, Some(_)) => Some(self.inserted_staging_row(lineage.cells)),
+                (None, Some(current)) => Some(self.inserted_staging_row(
+                    lineage.cells,
+                    if baseline_keys.contains(&current) {
+                        StageOperation::Upsert
+                    } else {
+                        StageOperation::Insert
+                    },
+                )),
                 (Some(origin), Some(current)) if origin == current => Some(Ok(StagingRow {
                     operation: StageOperation::Upsert,
                     cells: lineage.cells,
@@ -399,7 +407,11 @@ impl<'a> Normalizer<'a> {
             .collect()
     }
 
-    fn inserted_staging_row(&self, cells: Vec<Cell>) -> Result<StagingRow, NormalizeError> {
+    fn inserted_staging_row(
+        &self,
+        cells: Vec<Cell>,
+        operation: StageOperation,
+    ) -> Result<StagingRow, NormalizeError> {
         if let Some((index, _)) = cells
             .iter()
             .enumerate()
@@ -410,7 +422,7 @@ impl<'a> Normalizer<'a> {
             });
         }
         Ok(StagingRow {
-            operation: StageOperation::Upsert,
+            operation,
             cells,
             old_key: None,
         })
@@ -645,6 +657,14 @@ mod tests {
         }
     }
 
+    fn insertion(id: &str, payload: Cell) -> StagingRow {
+        StagingRow {
+            operation: StageOperation::Insert,
+            cells: vec![text(id), payload],
+            old_key: None,
+        }
+    }
+
     fn deletion(id: &str) -> StagingRow {
         StagingRow {
             operation: StageOperation::Delete,
@@ -692,16 +712,18 @@ mod tests {
                 StageOperation::Move => {
                     target.remove(&text_value(&row.old_key.as_ref().unwrap()[0]));
                 }
-                StageOperation::Upsert => {}
+                StageOperation::Insert | StageOperation::Upsert => {}
             }
         }
         for (_, new, payload) in materialized_moves {
             target.insert(new, payload);
         }
-        for row in rows
-            .iter()
-            .filter(|row| row.operation == StageOperation::Upsert)
-        {
+        for row in rows.iter().filter(|row| {
+            matches!(
+                row.operation,
+                StageOperation::Insert | StageOperation::Upsert
+            )
+        }) {
             let key = text_value(&row.cells[0]);
             if !matches!(row.cells[1], Cell::UnchangedToast) {
                 target.insert(key, text_value(&row.cells[1]));
@@ -712,11 +734,11 @@ mod tests {
     #[test]
     fn folds_same_key_sequences_to_the_final_state() {
         let cases = vec![
-            ("I", vec![insert("1", "a")], vec![upsert("1", text("a"))]),
+            ("I", vec![insert("1", "a")], vec![insertion("1", text("a"))]),
             (
                 "I-U",
                 vec![insert("1", "a"), update("1", text("b"))],
-                vec![upsert("1", text("b"))],
+                vec![insertion("1", text("b"))],
             ),
             ("I-D", vec![insert("1", "a"), delete("1")], vec![]),
             (
@@ -727,7 +749,7 @@ mod tests {
             (
                 "I-D-I",
                 vec![insert("1", "a"), delete("1"), insert("1", "c")],
-                vec![upsert("1", text("c"))],
+                vec![insertion("1", text("c"))],
             ),
             (
                 "U",
@@ -1080,7 +1102,7 @@ mod tests {
         let batch = batcher.flush().unwrap();
         assert_eq!(
             normalize_table_batch(&schema(), &batch).unwrap(),
-            [upsert("1", text("kept"))]
+            [insertion("1", text("kept"))]
         );
     }
 }

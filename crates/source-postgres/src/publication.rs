@@ -19,11 +19,6 @@ impl PublicationSpec {
     pub fn new(name: impl Into<String>, tables: Vec<QualifiedName>) -> SourceResult<Self> {
         let name = name.into();
         validate_name(&name)?;
-        if tables.is_empty() {
-            return Err(SourceError::contract(
-                "a publication must contain at least one allow-listed table",
-            ));
-        }
         let mut seen = std::collections::HashSet::with_capacity(tables.len());
         for table in &tables {
             let key = format!("{}\0{}", table.schema, table.name);
@@ -49,8 +44,13 @@ impl PublicationSpec {
             .collect::<SourceResult<Vec<_>>>()?
             .join(", ");
         let name = quote_identifier(&self.name)?;
+        let membership = if tables.is_empty() {
+            String::new()
+        } else {
+            format!(" FOR TABLE {tables}")
+        };
         Ok(format!(
-            "CREATE PUBLICATION {name} FOR TABLE {tables} WITH (publish = 'insert, update, delete, truncate', publish_via_partition_root = {}, publish_generated_columns = 'stored')",
+            "CREATE PUBLICATION {name}{membership} WITH (publish = 'insert, update, delete, truncate', publish_via_partition_root = {}, publish_generated_columns = 'stored')",
             if self.publish_via_partition_root {
                 "true"
             } else {
@@ -60,6 +60,11 @@ impl PublicationSpec {
     }
 
     pub fn alter_tables_sql(&self) -> SourceResult<String> {
+        if self.tables.is_empty() {
+            return Err(SourceError::contract(
+                "empty publication membership must be applied by dropping the current tables",
+            ));
+        }
         let tables = self
             .tables
             .iter()
@@ -70,6 +75,23 @@ impl PublicationSpec {
             "ALTER PUBLICATION {} SET TABLE {}",
             quote_identifier(&self.name)?,
             tables
+        ))
+    }
+
+    fn drop_tables_sql(&self, tables: &[QualifiedName]) -> SourceResult<String> {
+        if tables.is_empty() {
+            return Err(SourceError::contract(
+                "publication DROP TABLE requires at least one current table",
+            ));
+        }
+        let tables = tables
+            .iter()
+            .map(|table| quote_qualified(&table.schema, &table.name))
+            .collect::<SourceResult<Vec<_>>>()?
+            .join(", ");
+        Ok(format!(
+            "ALTER PUBLICATION {} DROP TABLE {tables}",
+            quote_identifier(&self.name)?
         ))
     }
 }
@@ -205,7 +227,12 @@ pub async fn ensure_publication(
         // Avoid producing catalog WAL and DDL-capture noise on every reconnect. Reconcile only
         // when membership actually changed; this still removes stale tables explicitly.
         if !membership_matches(&state.tables, &spec.tables) {
-            execute_internal_ddl(client, &spec.alter_tables_sql()?).await?;
+            let ddl = if spec.tables.is_empty() {
+                spec.drop_tables_sql(&state.tables)?
+            } else {
+                spec.alter_tables_sql()?
+            };
+            execute_internal_ddl(client, &ddl).await?;
         }
     } else {
         execute_internal_ddl(client, &spec.create_sql()?).await?;
@@ -516,6 +543,19 @@ mod tests {
         assert!(sql.contains("\"pub\"\"x\""));
         assert!(sql.contains("\"t\"\"x\""));
         assert!(sql.contains("publish_generated_columns = 'stored'"));
+    }
+
+    #[test]
+    fn empty_publication_keeps_ddl_messages_available_after_the_last_table_drop() {
+        let spec = PublicationSpec::new("managed", Vec::new()).unwrap();
+        let sql = spec.create_sql().unwrap();
+        assert!(!sql.contains("FOR TABLE"));
+        assert!(sql.contains("CREATE PUBLICATION \"managed\" WITH"));
+        let drop_sql = spec.drop_tables_sql(&[table("public", "items")]).unwrap();
+        assert_eq!(
+            drop_sql,
+            "ALTER PUBLICATION \"managed\" DROP TABLE \"public\".\"items\""
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Opt-in Apache Cloudberry 2.1 integration coverage.
 
-use std::{error::Error, sync::Arc};
+use std::{collections::BTreeMap, error::Error, io, sync::Arc};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -14,9 +14,11 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyError, ApplyRequest, DataChunkDisposition, LedgeredDataChunkOutcome,
+        ApplyError, ApplyRequest, AtomicApplyOutcome, DataChunkDisposition, LedgeredCommitKind,
+        LedgeredCommitObserver, LedgeredCommitPhase, LedgeredDataChunkOutcome,
         LedgeredDataChunkRequest, StageOperation, StagingRow, TableApplyBatch, execute_apply,
-        execute_ledgered_data_chunk, plan_apply_with_storage,
+        execute_atomic_apply, execute_atomic_apply_observed, execute_ledgered_data_chunk,
+        plan_apply_with_storage,
     },
     checkpoint::{
         AdvanceOutcome, CheckpointKey, NodeCheckpoint, PipelineFence, activate_pipeline_fence,
@@ -39,10 +41,203 @@ use cloudberry_etl_target_cloudberry::{
     },
     storage::{TargetStorage, load_relation_storage},
 };
+use futures::{SinkExt, future::try_join_all};
+use serde_json::json;
+use tokio::time::Instant;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
 const APPLY_SCHEMA_FINGERPRINT: &str = "sha256:cloudberry21-typed-apply-v1";
+
+#[tokio::test]
+#[ignore = "benchmark: requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_parallel_aoco_copy_benchmark() -> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let rows_per_table = benchmark_usize("PG2CB_PARALLEL_COPY_ROWS", 100_000)?;
+    let table_count = benchmark_usize("PG2CB_PARALLEL_COPY_TABLES", 4)?;
+    let samples = benchmark_usize("PG2CB_PARALLEL_COPY_SAMPLES", 3)?;
+    if rows_per_table == 0 || !(2..=16).contains(&table_count) || samples == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "parallel COPY requires positive rows/samples and between 2 and 16 tables",
+        )
+        .into());
+    }
+
+    let (coordinator, coordinator_connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let coordinator_task = tokio::spawn(log_connection(coordinator_connection));
+    let mut workers = Vec::with_capacity(table_count);
+    let mut worker_tasks = Vec::with_capacity(table_count);
+    for _ in 0..table_count {
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+        workers.push(client);
+        worker_tasks.push(tokio::spawn(log_connection(connection)));
+    }
+
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_schema = format!("pg2cb_parallel_{}", &suffix[..12]);
+    let result = async {
+        coordinator
+            .batch_execute(&format!(
+                "CREATE SCHEMA {}",
+                quote_identifier(&target_schema)
+            ))
+            .await?;
+        for table_index in 0..table_count {
+            coordinator
+                .batch_execute(&format!(
+                    "CREATE TABLE {}.{} (id bigint, payload text) \
+                     USING ao_column WITH (compresstype='zstd', compresslevel=1) \
+                     DISTRIBUTED BY (id)",
+                    quote_identifier(&target_schema),
+                    quote_identifier(&format!("items_{table_index}")),
+                ))
+                .await?;
+        }
+        let rows = (0..rows_per_table)
+            .map(|index| Bytes::from(format!("{}\t{}\n", index + 1, "x".repeat(64))))
+            .collect::<Vec<_>>();
+        let total_rows = rows_per_table
+            .checked_mul(table_count)
+            .ok_or_else(|| io::Error::other("parallel COPY row count overflowed"))?;
+
+        let parallelism_levels = [1, 2, 4]
+            .into_iter()
+            .filter(|parallelism| *parallelism <= table_count)
+            .collect::<Vec<_>>();
+        let mut measurements = parallelism_levels
+            .iter()
+            .map(|parallelism| (*parallelism, Vec::with_capacity(samples)))
+            .collect::<BTreeMap<_, _>>();
+        for sample in 0..samples {
+            let levels = if sample.is_multiple_of(2) {
+                parallelism_levels.to_vec()
+            } else {
+                parallelism_levels.iter().rev().copied().collect::<Vec<_>>()
+            };
+            for parallelism in levels {
+                truncate_parallel_tables(&coordinator, &target_schema, table_count).await?;
+                let started = Instant::now();
+                for first_table in (0..table_count).step_by(parallelism) {
+                    let last_table = (first_table + parallelism).min(table_count);
+                    let copies = (first_table..last_table).map(|table_index| {
+                        copy_parallel_table(
+                            &workers[table_index - first_table],
+                            &target_schema,
+                            table_index,
+                            &rows,
+                        )
+                    });
+                    try_join_all(copies).await?;
+                }
+                measurements
+                    .get_mut(&parallelism)
+                    .expect("the level was initialized")
+                    .push(started.elapsed().as_secs_f64());
+            }
+        }
+        for (parallelism, mut measured) in measurements {
+            measured.sort_by(f64::total_cmp);
+            let median_seconds = measured[measured.len() / 2];
+            println!(
+                "PG2CB_PARALLEL_COPY_BENCH_RESULT {}",
+                json!({
+                    "access_method": "ao_column",
+                    "tables": table_count,
+                    "rows_per_table": rows_per_table,
+                    "total_rows": total_rows,
+                    "connections": parallelism,
+                    "samples": samples,
+                    "median_seconds": median_seconds,
+                    "rows_per_second": total_rows as f64 / median_seconds,
+                })
+            );
+        }
+        Ok::<_, Box<dyn Error>>(())
+    }
+    .await;
+
+    let _ = coordinator
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            quote_identifier(&target_schema)
+        ))
+        .await;
+    coordinator_task.abort();
+    for task in worker_tasks {
+        task.abort();
+    }
+    result
+}
+
+async fn log_connection<S, T>(connection: tokio_postgres::Connection<S, T>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    T: tokio_postgres::tls::TlsStream + Unpin,
+{
+    if let Err(error) = connection.await {
+        eprintln!("parallel COPY benchmark connection ended: {error}");
+    }
+}
+
+fn benchmark_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn truncate_parallel_tables(
+    client: &Client,
+    target_schema: &str,
+    table_count: usize,
+) -> Result<(), tokio_postgres::Error> {
+    let tables = (0..table_count)
+        .map(|table_index| {
+            format!(
+                "{}.{}",
+                quote_identifier(target_schema),
+                quote_identifier(&format!("items_{table_index}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    client.batch_execute(&format!("TRUNCATE {tables}")).await
+}
+
+async fn copy_parallel_table(
+    client: &Client,
+    target_schema: &str,
+    table_index: usize,
+    rows: &[Bytes],
+) -> Result<(), tokio_postgres::Error> {
+    let sink = client
+        .copy_in(&format!(
+            "COPY {}.{} (id, payload) FROM STDIN",
+            quote_identifier(target_schema),
+            quote_identifier(&format!("items_{table_index}"))
+        ))
+        .await?;
+    let mut sink = std::pin::pin!(sink);
+    for row in rows {
+        sink.send(row.clone()).await?;
+    }
+    sink.finish().await?;
+    Ok(())
+}
+
+struct FailAfterAtomicCommit;
+
+impl LedgeredCommitObserver for FailAfterAtomicCommit {
+    fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String> {
+        if phase == LedgeredCommitPhase::AfterCommit && kind == LedgeredCommitKind::AtomicBatch {
+            Err("injected lost atomic batch commit response".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
@@ -405,7 +600,7 @@ async fn run_interrupted_table_snapshot_reset_test(
     assert_eq!(outcome.dropped_shadows, vec![plan.shadow.target.clone()]);
     let shadow_exists: bool = client
         .query_one(
-            "SELECT to_regclass(format('%I.%I', $1, $2)) IS NOT NULL",
+            "SELECT to_regclass(format('%I.%I', $1::text, $2::text)) IS NOT NULL",
             &[&plan.shadow.target.schema, &plan.shadow.target.name],
         )
         .await?
@@ -1230,6 +1425,32 @@ async fn run_test(
         Some(("before".into(), 10))
     );
 
+    let atomic_insert = request(
+        fence,
+        &plan,
+        105,
+        StagingRow {
+            operation: StageOperation::Insert,
+            cells: vec![text("9999"), text("atomic"), text("20")],
+            old_key: None,
+        },
+    );
+    assert!(matches!(
+        execute_atomic_apply_observed(client, &atomic_insert, &FailAfterAtomicCommit).await,
+        Err(ApplyError::CommitObserver(message))
+            if message.contains("lost atomic batch commit response")
+    ));
+    assert!(matches!(
+        execute_atomic_apply(client, &atomic_insert).await?,
+        AtomicApplyOutcome::AlreadyCheckpointed {
+            applied_lsn
+        } if applied_lsn == PgLsn::new(105)
+    ));
+    assert_eq!(
+        row(client, target_schema, 9999).await?,
+        Some(("atomic".into(), 20))
+    );
+
     let chunk = request(
         fence,
         &plan,
@@ -1288,7 +1509,7 @@ async fn run_test(
             .expect("failed identity guard must preserve the previous checkpoint")
             .checkpoint
             .applied_lsn,
-        PgLsn::new(100)
+        PgLsn::new(105)
     );
     client
         .execute(
@@ -1302,7 +1523,7 @@ async fn run_test(
             next_seq: 1,
             disposition: DataChunkDisposition::Applied { .. },
             checkpoint: AdvanceOutcome::Advanced { previous_lsn }
-        } if previous_lsn == PgLsn::new(100)
+        } if previous_lsn == PgLsn::new(105)
     ));
     assert_eq!(
         row(client, target_schema, 1).await?,

@@ -34,8 +34,8 @@ mod progress;
 
 pub use activation::{
     activate_snapshot_group, activate_table_snapshot_group,
-    activate_table_snapshot_group_in_transaction, validate_active_snapshot_group,
-    validate_active_tables,
+    activate_table_snapshot_group_in_transaction, quarantine_active_table_in_transaction,
+    validate_active_snapshot_group, validate_active_tables,
 };
 pub use cleanup::{
     QuarantineGcOutcome, QuarantineGcPolicy, SnapshotCleanupOutcome, SnapshotGroupCleanupRequest,
@@ -98,6 +98,12 @@ pub enum SnapshotTargetError {
     },
     #[error("shadow table `{table}` has generation {actual}, expected {expected}")]
     ShadowGenerationMismatch {
+        table: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("active table `{table}` has generation {actual}, expected {expected}")]
+    ActiveTableGenerationMismatch {
         table: String,
         expected: u64,
         actual: u64,
@@ -232,6 +238,10 @@ pub enum SnapshotTargetError {
     MixedActivationState,
     #[error("active managed-table set does not exactly match the requested source inventory")]
     ActiveTableSetMismatch,
+    #[error("active managed-table count is {actual}, expected {expected}")]
+    ActiveTableCountMismatch { expected: usize, actual: usize },
+    #[error("active managed table `{actual}` does not match expected target `{expected}`")]
+    ActiveTableTargetMismatch { expected: String, actual: String },
     #[error("active managed table `{0}` has a different schema fingerprint")]
     ActiveTableFingerprintMismatch(String),
     #[error("snapshot shadow `{0}` is missing or is not completely owned by this activation")]

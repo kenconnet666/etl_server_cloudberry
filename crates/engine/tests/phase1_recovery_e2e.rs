@@ -26,7 +26,9 @@ use cloudberry_etl_core::{
 use cloudberry_etl_engine::{
     adapters::{SourceIngestObserver, SourceIngestPoint},
     runtime::{
-        PostgresCloudberryJobFactory, reconciler::PipelineJobFactory, settings::replication_names,
+        PostgresCloudberryJobFactory,
+        reconciler::PipelineJobFactory,
+        settings::{TargetStorage, replication_names},
     },
     supervisor::SupervisorError,
     telemetry::{PipelineRuntimeState, PipelineTelemetryHandle},
@@ -74,6 +76,7 @@ struct FixtureSpec<'a> {
     target_schema: &'a str,
     suffix: &'a str,
     profile: RuntimeProfile,
+    target_storage: TargetStorage,
 }
 
 const RECOVERY_PROFILE: RuntimeProfile = RuntimeProfile {
@@ -96,6 +99,16 @@ const LARGE_TRANSACTION_PROFILE: RuntimeProfile = RuntimeProfile {
     batch_max_delay_ms: 10,
 };
 
+const ATOMIC_GROUP_PROFILE: RuntimeProfile = RuntimeProfile {
+    memory_high_water_changes: 100,
+    memory_high_water_bytes: 1024 * 1024,
+    segment_target_bytes: 1024 * 1024,
+    disk_high_water_bytes: 16 * 1024 * 1024,
+    batch_max_rows: 15,
+    batch_max_bytes: 1024 * 1024,
+    batch_max_delay_ms: 1_000,
+};
+
 const CAPACITY_PROFILE: RuntimeProfile = RuntimeProfile {
     memory_high_water_changes: 1,
     memory_high_water_bytes: 1,
@@ -104,6 +117,21 @@ const CAPACITY_PROFILE: RuntimeProfile = RuntimeProfile {
     batch_max_rows: 10_000,
     batch_max_bytes: 32 * 1024 * 1024,
     batch_max_delay_ms: 2_000,
+};
+
+const BENCHMARK_PROFILE: RuntimeProfile = RuntimeProfile {
+    memory_high_water_changes: 100_000,
+    memory_high_water_bytes: 64 * 1024 * 1024,
+    segment_target_bytes: 64 * 1024 * 1024,
+    disk_high_water_bytes: 8 * 1024 * 1024 * 1024,
+    batch_max_rows: 100_000,
+    batch_max_bytes: 64 * 1024 * 1024,
+    batch_max_delay_ms: 250,
+};
+
+const COALESCING_BENCHMARK_PROFILE: RuntimeProfile = RuntimeProfile {
+    batch_max_delay_ms: 2_000,
+    ..BENCHMARK_PROFILE
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +149,7 @@ struct FaultController {
     armed: Mutex<Option<RecoveryFault>>,
     fired: tokio::sync::Notify,
     spool_commits: AtomicUsize,
+    atomic_commits: AtomicUsize,
 }
 
 impl FaultController {
@@ -158,6 +187,9 @@ impl SourceIngestObserver for FaultController {
 
 impl LedgeredCommitObserver for FaultController {
     fn observe(&self, phase: LedgeredCommitPhase, kind: LedgeredCommitKind) -> Result<(), String> {
+        if phase == LedgeredCommitPhase::AfterCommit && kind == LedgeredCommitKind::AtomicBatch {
+            self.atomic_commits.fetch_add(1, Ordering::Relaxed);
+        }
         self.trigger(RecoveryFault::Target { phase, kind })
     }
 }
@@ -262,9 +294,471 @@ async fn full_runtime_proves_phase1_recovery_and_capacity_boundaries() -> Result
 
     run_snapshot_restart_case(&source_dsn, &target_dsn).await?;
     run_recovery_case(&source_dsn, &target_dsn).await?;
+    run_atomic_group_recovery_case(&source_dsn, &target_dsn).await?;
     run_large_transaction_case(&source_dsn, &target_dsn).await?;
     run_capacity_wait_case(&source_dsn, &target_dsn).await?;
-    run_schema_fallback_case(&source_dsn, &target_dsn).await
+    run_schema_reload_case(&source_dsn, &target_dsn).await
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_ddl_uses_table_local_aoco_reload() -> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    run_schema_reload_case(&source_dsn, &target_dsn).await
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_schema_scoped_enum_ddl_reloads_managed_closure() -> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let mut context = TestContext::setup(&source_dsn, &target_dsn, RECOVERY_PROFILE).await?;
+    let result = run_schema_scoped_enum_reload(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_ddl_snapshot_page_failure_restarts_from_fresh_boundary()
+-> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let mut context = TestContext::setup(&source_dsn, &target_dsn, RECOVERY_PROFILE).await?;
+    let result = run_ddl_snapshot_restart(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_aoco_throughput_benchmark() -> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let mut context = TestContext::setup(&source_dsn, &target_dsn, BENCHMARK_PROFILE).await?;
+    let result = run_storage_benchmark(&mut context, true).await;
+    context.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "experimental: requires real PG18, PAX-enabled Cloudberry 2.1, and test DSNs"]
+async fn standalone_pax_experimental_throughput_benchmark() -> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let mut context = TestContext::setup_with_storage(
+        &source_dsn,
+        &target_dsn,
+        BENCHMARK_PROFILE,
+        TargetStorage::PaxExperimental,
+    )
+    .await?;
+    let result = run_storage_benchmark(&mut context, false).await;
+    context.cleanup().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires real PG18, Cloudberry 2.1, and PG2CB_TEST_SOURCE_DSN/PG2CB_TEST_TARGET_DSN"]
+async fn standalone_aoco_operation_coalescing_benchmark() -> Result<(), Box<dyn Error>> {
+    let source_dsn = std::env::var("PG2CB_TEST_SOURCE_DSN")?;
+    let target_dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let batch_max_rows = usize::try_from(benchmark_i64(
+        "PG2CB_COALESCE_BATCH_MAX_ROWS",
+        i64::try_from(COALESCING_BENCHMARK_PROFILE.batch_max_rows)?,
+    )?)?;
+    let mut profile = COALESCING_BENCHMARK_PROFILE;
+    profile.batch_max_rows = batch_max_rows;
+    let mut context = TestContext::setup(&source_dsn, &target_dsn, profile).await?;
+    let result = run_operation_coalescing_benchmark(&mut context, batch_max_rows).await;
+    context.cleanup().await;
+    result
+}
+
+async fn run_operation_coalescing_benchmark(
+    context: &mut TestContext,
+    batch_max_rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    let keys = benchmark_i64("PG2CB_COALESCE_KEYS", 25_000)?;
+    let passes = benchmark_i64("PG2CB_COALESCE_PASSES", 4)?;
+    let transaction_rows = benchmark_i64("PG2CB_COALESCE_TRANSACTION_ROWS", 1_000)?;
+    if keys <= 0 || passes < 2 || transaction_rows <= 0 || transaction_rows > keys {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coalescing benchmark requires positive keys/transaction rows and at least two passes",
+        )
+        .into());
+    }
+    let input_operations = keys.checked_mul(passes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coalescing benchmark operation count overflowed",
+        )
+    })?;
+    if batch_max_rows == 0 || !batch_max_rows.is_multiple_of(usize::try_from(transaction_rows)?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch max rows must be a positive multiple of source transaction rows",
+        )
+        .into());
+    }
+
+    let first_id = 2_i64;
+    insert_bulk_source_transaction(&context.source, &context.source_schema, first_id, keys, 64)
+        .await?;
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, keys + 1, &active).await?;
+    active.stop(context.store.as_ref()).await?;
+
+    let source_started = Instant::now();
+    for pass in 1..=passes {
+        update_bulk_source_transactions(
+            &context.source,
+            &context.source_schema,
+            first_id,
+            keys,
+            transaction_rows,
+            pass,
+        )
+        .await?;
+    }
+    let source_seconds = source_started.elapsed().as_secs_f64();
+    let commits_before = context.controller.atomic_commits.load(Ordering::Relaxed);
+    let drain_started = Instant::now();
+    active = context.start_job().await?;
+    wait_for_target_condition(
+        &context.target,
+        &context.target_schema,
+        &format!("payload LIKE 'coalesced-{passes}-%'"),
+        keys,
+        &active,
+    )
+    .await?;
+    let drain_seconds = drain_started.elapsed().as_secs_f64();
+    let target_commits = context
+        .controller
+        .atomic_commits
+        .load(Ordering::Relaxed)
+        .saturating_sub(commits_before);
+
+    let batch_max_rows = i64::try_from(batch_max_rows)?;
+    let expected_target_commits =
+        input_operations.saturating_add(batch_max_rows - 1) / batch_max_rows;
+    let mut remaining_operations = input_operations;
+    let mut estimated_target_row_applications = 0_i64;
+    while remaining_operations > 0 {
+        let batch_operations = batch_max_rows.min(remaining_operations);
+        estimated_target_row_applications =
+            estimated_target_row_applications.saturating_add(keys.min(batch_operations));
+        remaining_operations -= batch_operations;
+    }
+    assert_eq!(
+        i64::try_from(target_commits)?,
+        expected_target_commits,
+        "target commit count must match the configured bounded batches"
+    );
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    println!(
+        "PG2CB_COALESCE_BENCH_RESULT {}",
+        json!({
+            "keys": keys,
+            "passes": passes,
+            "input_operations": input_operations,
+            "rows_per_source_transaction": transaction_rows,
+            "batch_max_rows": batch_max_rows,
+            "source_transactions":
+                keys.saturating_add(transaction_rows - 1) / transaction_rows * passes,
+            "target_commits": target_commits,
+            "expected_target_commits": expected_target_commits,
+            "final_distinct_target_rows": keys,
+            "estimated_target_row_applications": estimated_target_row_applications,
+            "source_update_seconds": source_seconds,
+            "source_operations_per_second": input_operations as f64 / source_seconds,
+            "backlog_drain_seconds": drain_seconds,
+            "input_operations_per_second": input_operations as f64 / drain_seconds,
+            "final_keys_per_second": keys as f64 / drain_seconds,
+            "estimated_target_row_applications_per_second":
+                estimated_target_row_applications as f64 / drain_seconds,
+            "operation_reduction_ratio": input_operations as f64 / keys as f64,
+        })
+    );
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+fn benchmark_i64(name: &str, default: i64) -> Result<i64, Box<dyn Error>> {
+    match std::env::var(name) {
+        Ok(value) => value.parse::<i64>().map_err(Into::into),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn run_storage_benchmark(
+    context: &mut TestContext,
+    include_current_state_mutations: bool,
+) -> Result<(), Box<dyn Error>> {
+    let rows = std::env::var("PG2CB_BENCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(100_000);
+    if rows < 1_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PG2CB_BENCH_ROWS must be at least 1000",
+        )
+        .into());
+    }
+    let transaction_rows = std::env::var("PG2CB_BENCH_TRANSACTION_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(rows);
+    if transaction_rows <= 0 || transaction_rows > rows {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PG2CB_BENCH_TRANSACTION_ROWS must be between 1 and PG2CB_BENCH_ROWS",
+        )
+        .into());
+    }
+
+    let snapshot_first_id = 2_i64;
+    let source_snapshot_started = Instant::now();
+    insert_bulk_source_transaction(
+        &context.source,
+        &context.source_schema,
+        snapshot_first_id,
+        rows,
+        64,
+    )
+    .await?;
+    let source_snapshot_load = source_snapshot_started.elapsed();
+    let snapshot_started = Instant::now();
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, rows + 1, &active).await?;
+    let snapshot_drain = snapshot_started.elapsed();
+
+    active.stop(context.store.as_ref()).await?;
+    let backlog_first_id = snapshot_first_id + rows;
+    let source_backlog_started = Instant::now();
+    insert_bulk_source_transactions(
+        &context.source,
+        &context.source_schema,
+        backlog_first_id,
+        rows,
+        64,
+        transaction_rows,
+    )
+    .await?;
+    let source_backlog_load = source_backlog_started.elapsed();
+    let backlog_started = Instant::now();
+    active = context.start_job().await?;
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        rows * 2 + 1,
+        &active,
+    )
+    .await?;
+    let backlog_drain = backlog_started.elapsed();
+
+    let streaming_first_id = backlog_first_id + rows;
+    let streaming_started = Instant::now();
+    let source_streaming_started = Instant::now();
+    insert_bulk_source_transactions(
+        &context.source,
+        &context.source_schema,
+        streaming_first_id,
+        rows,
+        64,
+        transaction_rows,
+    )
+    .await?;
+    let source_streaming_load = source_streaming_started.elapsed();
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        rows * 3 + 1,
+        &active,
+    )
+    .await?;
+    let streaming_total = streaming_started.elapsed();
+
+    let insert_storage = context
+        .target
+        .query_one(
+            "SELECT am.amname, pg_total_relation_size(c.oid)::bigint
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+               JOIN pg_catalog.pg_am am ON am.oid=c.relam
+              WHERE n.nspname=$1 AND c.relname='items'",
+            &[&context.target_schema],
+        )
+        .await?;
+    let insert_access_method: String = insert_storage.get(0);
+    let insert_target_bytes: i64 = insert_storage.get(1);
+    println!(
+        "PG2CB_INSERT_BENCH_RESULT {}",
+        json!({
+            "rows_per_phase": rows,
+            "rows_per_source_transaction": transaction_rows,
+            "source_transactions_per_insert_phase":
+                rows.saturating_add(transaction_rows - 1) / transaction_rows,
+            "payload_bytes": 64,
+            "access_method": insert_access_method,
+            "source_snapshot_insert_seconds": source_snapshot_load.as_secs_f64(),
+            "snapshot_seconds": snapshot_drain.as_secs_f64(),
+            "snapshot_rows_per_second": rows as f64 / snapshot_drain.as_secs_f64(),
+            "source_backlog_insert_seconds": source_backlog_load.as_secs_f64(),
+            "backlog_drain_seconds": backlog_drain.as_secs_f64(),
+            "backlog_rows_per_second": rows as f64 / backlog_drain.as_secs_f64(),
+            "source_streaming_insert_seconds": source_streaming_load.as_secs_f64(),
+            "streaming_total_seconds": streaming_total.as_secs_f64(),
+            "streaming_rows_per_second": rows as f64 / streaming_total.as_secs_f64(),
+            "target_relation_bytes": insert_target_bytes,
+            "process_rss_bytes": resident_set_bytes()?.unwrap_or_default(),
+        })
+    );
+    if !include_current_state_mutations {
+        assert_source_target_equal(
+            &context.source,
+            &context.target,
+            &context.source_schema,
+            &context.target_schema,
+        )
+        .await?;
+        active.stop(context.store.as_ref()).await?;
+        return Ok(());
+    }
+
+    let update_started = Instant::now();
+    context
+        .source
+        .execute(
+            &format!(
+                "UPDATE {}.items SET payload='updated-' || id::text WHERE id >= $1 AND id < $2",
+                quote_identifier(&context.source_schema)
+            ),
+            &[&streaming_first_id, &(streaming_first_id + rows)],
+        )
+        .await?;
+    let source_update = update_started.elapsed();
+    wait_for_target_condition(
+        &context.target,
+        &context.target_schema,
+        "payload LIKE 'updated-%'",
+        rows,
+        &active,
+    )
+    .await?;
+    let update_total = update_started.elapsed();
+
+    let delete_rows = rows / 2;
+    let delete_started = Instant::now();
+    context
+        .source
+        .execute(
+            &format!(
+                "DELETE FROM {}.items WHERE id >= $1 AND id < $2",
+                quote_identifier(&context.source_schema)
+            ),
+            &[&backlog_first_id, &(backlog_first_id + delete_rows)],
+        )
+        .await?;
+    let source_delete = delete_started.elapsed();
+    wait_for_target_count(
+        &context.target,
+        &context.target_schema,
+        rows * 3 + 1 - delete_rows,
+        &active,
+    )
+    .await?;
+    let delete_total = delete_started.elapsed();
+
+    let latency_samples = 30_i64;
+    let latency_first_id = streaming_first_id + rows;
+    let mut latency_ms = Vec::with_capacity(usize::try_from(latency_samples)?);
+    for offset in 0..latency_samples {
+        let id = latency_first_id + offset;
+        let started = Instant::now();
+        context
+            .source
+            .execute(
+                &format!(
+                    "INSERT INTO {}.items (id, payload) VALUES ($1, 'latency')",
+                    quote_identifier(&context.source_schema)
+                ),
+                &[&id],
+            )
+            .await?;
+        wait_for_target_id(&context.target, &context.target_schema, id, &active).await?;
+        latency_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    latency_ms.sort_by(f64::total_cmp);
+
+    let storage = context
+        .target
+        .query_one(
+            "SELECT am.amname, pg_total_relation_size(c.oid)::bigint
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+               JOIN pg_catalog.pg_am am ON am.oid=c.relam
+              WHERE n.nspname=$1 AND c.relname='items'",
+            &[&context.target_schema],
+        )
+        .await?;
+    let access_method: String = storage.get(0);
+    let target_bytes: i64 = storage.get(1);
+    let p50_ms = percentile(&latency_ms, 0.50);
+    let p95_ms = percentile(&latency_ms, 0.95);
+    let rss_bytes = resident_set_bytes()?.unwrap_or_default();
+
+    println!(
+        "PG2CB_BENCH_RESULT {}",
+        json!({
+            "rows_per_phase": rows,
+            "rows_per_source_transaction": transaction_rows,
+            "source_transactions_per_insert_phase":
+                rows.saturating_add(transaction_rows - 1) / transaction_rows,
+            "payload_bytes": 64,
+            "access_method": access_method,
+            "source_snapshot_insert_seconds": source_snapshot_load.as_secs_f64(),
+            "snapshot_seconds": snapshot_drain.as_secs_f64(),
+            "snapshot_rows_per_second": rows as f64 / snapshot_drain.as_secs_f64(),
+            "source_backlog_insert_seconds": source_backlog_load.as_secs_f64(),
+            "backlog_drain_seconds": backlog_drain.as_secs_f64(),
+            "backlog_rows_per_second": rows as f64 / backlog_drain.as_secs_f64(),
+            "source_streaming_insert_seconds": source_streaming_load.as_secs_f64(),
+            "streaming_total_seconds": streaming_total.as_secs_f64(),
+            "streaming_rows_per_second": rows as f64 / streaming_total.as_secs_f64(),
+            "source_update_seconds": source_update.as_secs_f64(),
+            "update_total_seconds": update_total.as_secs_f64(),
+            "update_rows_per_second": rows as f64 / update_total.as_secs_f64(),
+            "source_delete_seconds": source_delete.as_secs_f64(),
+            "delete_total_seconds": delete_total.as_secs_f64(),
+            "delete_rows_per_second": delete_rows as f64 / delete_total.as_secs_f64(),
+            "idle_single_row_latency_p50_ms": p50_ms,
+            "idle_single_row_latency_p95_ms": p95_ms,
+            "latency_samples": latency_samples,
+            "target_relation_bytes": target_bytes,
+            "process_rss_bytes": rss_bytes,
+        })
+    );
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+    let position = ((sorted.len() as f64 * quantile).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len().saturating_sub(1));
+    sorted[position]
 }
 
 async fn run_snapshot_restart_case(
@@ -295,6 +789,16 @@ async fn run_large_transaction_case(
     result
 }
 
+async fn run_atomic_group_recovery_case(
+    source_dsn: &str,
+    target_dsn: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut context = TestContext::setup(source_dsn, target_dsn, ATOMIC_GROUP_PROFILE).await?;
+    let result = run_atomic_group_commit_response_loss(&mut context).await;
+    context.cleanup().await;
+    result
+}
+
 async fn run_capacity_wait_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
     let mut context = TestContext::setup(source_dsn, target_dsn, CAPACITY_PROFILE).await?;
     let result = run_capacity_wait(&mut context).await;
@@ -302,12 +806,9 @@ async fn run_capacity_wait_case(source_dsn: &str, target_dsn: &str) -> Result<()
     result
 }
 
-async fn run_schema_fallback_case(
-    source_dsn: &str,
-    target_dsn: &str,
-) -> Result<(), Box<dyn Error>> {
+async fn run_schema_reload_case(source_dsn: &str, target_dsn: &str) -> Result<(), Box<dyn Error>> {
     let mut context = TestContext::setup(source_dsn, target_dsn, RECOVERY_PROFILE).await?;
-    let result = run_schema_fallback(&mut context).await;
+    let result = run_schema_reload(&mut context).await;
     context.cleanup().await;
     result
 }
@@ -383,6 +884,68 @@ async fn run_recovery_matrix(context: &mut TestContext) -> Result<(), Box<dyn Er
         );
     }
 
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+async fn run_atomic_group_commit_response_loss(
+    context: &mut TestContext,
+) -> Result<(), Box<dyn Error>> {
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+
+    context.controller.arm(RecoveryFault::Target {
+        phase: LedgeredCommitPhase::AfterCommit,
+        kind: LedgeredCommitKind::AtomicBatch,
+    });
+    insert_source_transaction(&mut context.source, &context.source_schema, 10, 1).await?;
+    insert_source_transaction(&mut context.source, &context.source_schema, 20, 2).await?;
+    context.controller.wait_until_fired().await?;
+    active.expect_fault(context.store.as_ref()).await?;
+
+    wait_for_target_count(&context.target, &context.target_schema, 11, &active).await?;
+    assert_eq!(
+        target_ledger_rows(&context.target, context.pipeline.id).await?,
+        0,
+        "bounded atomic groups do not leave chunk-ledger state"
+    );
+
+    active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 11, &active).await?;
+    let commits_before_coalescing = context.controller.atomic_commits.load(Ordering::Relaxed);
+    for pass in 1..=3 {
+        let payload = format!("coalesced-{pass}");
+        context
+            .source
+            .execute(
+                &format!(
+                    "UPDATE {}.items SET payload=$1 WHERE id >= 10 AND id < 15",
+                    quote_identifier(&context.source_schema)
+                ),
+                &[&payload],
+            )
+            .await?;
+    }
+    wait_for_target_condition(
+        &context.target,
+        &context.target_schema,
+        "id >= 10 AND id < 15 AND payload='coalesced-3'",
+        5,
+        &active,
+    )
+    .await?;
+    assert_eq!(
+        context.controller.atomic_commits.load(Ordering::Relaxed),
+        commits_before_coalescing + 1,
+        "three source transactions must share one bounded target commit"
+    );
     assert_source_target_equal(
         &context.source,
         &context.target,
@@ -646,7 +1209,7 @@ async fn run_capacity_wait(context: &mut TestContext) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+async fn run_schema_reload(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
     let mut active = context.start_job().await?;
     wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
     let initial_checkpoint = load_checkpoint_lsn(&context.target, context.pipeline.id).await?;
@@ -692,7 +1255,11 @@ async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Er
     context
         .source
         .batch_execute(&format!(
-            "ALTER TABLE {}.items ADD COLUMN note text",
+            "ALTER TABLE {}.items ADD COLUMN note text;
+             ALTER TABLE {}.items RENAME COLUMN note TO note2;
+             UPDATE {}.items SET note2='from snapshot' WHERE id=1",
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
             quote_identifier(&context.source_schema)
         ))
         .await?;
@@ -700,27 +1267,36 @@ async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Er
         .expect_successful_exit(context.store.as_ref())
         .await?;
 
-    assert_eq!(rebuild_operation_count(context).await?, 1);
+    assert_eq!(rebuild_operation_count(context).await?, 0);
     assert_eq!(
         load_checkpoint_lsn(&context.target, context.pipeline.id).await?,
         checkpoint_before,
-        "schema fallback must not advance the target checkpoint across the DDL"
+        "table reload must not advance the target checkpoint before main-slot replay"
     );
     let event = context
         .target
         .query_one(
-            "SELECT state, failure_reason, transitions FROM pg2cb_meta.schema_events WHERE pipeline_id=$1 AND state='failed'",
+            "SELECT state, failure_reason, transitions FROM pg2cb_meta.schema_events WHERE pipeline_id=$1 AND state='completed' ORDER BY processed_at DESC LIMIT 1",
             &[&context.pipeline.id.as_uuid()],
         )
         .await?;
-    assert_eq!(event.get::<_, String>("state"), "failed");
-    assert!(
-        event
-            .get::<_, Option<String>>("failure_reason")
-            .is_some_and(|reason| reason.contains("requires table transition"))
-    );
+    assert_eq!(event.get::<_, String>("state"), "completed");
+    assert!(event.get::<_, Option<String>>("failure_reason").is_none());
     let transitions: serde_json::Value = event.try_get("transitions")?;
     assert!(transitions["source_xid"].as_u64().is_some());
+    let transition = context
+        .target
+        .query_one(
+            "SELECT action, state, snapshot_group_id IS NOT NULL AS has_group
+               FROM pg2cb_meta.table_schema_transitions
+              WHERE pipeline_id=$1 AND action='reload'
+              ORDER BY completed_at DESC LIMIT 1",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(transition.get::<_, String>("action"), "reload");
+    assert_eq!(transition.get::<_, String>("state"), "completed");
+    assert!(transition.get::<_, bool>("has_group"));
     let target_has_note: bool = context
         .target
         .query_one(
@@ -730,16 +1306,474 @@ async fn run_schema_fallback(context: &mut TestContext) -> Result<(), Box<dyn Er
                    JOIN pg_catalog.pg_class AS c ON c.oid=a.attrelid
                    JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
                   WHERE n.nspname=$1 AND c.relname='items'
-                    AND a.attname='note' AND a.attnum>0 AND NOT a.attisdropped
+                    AND a.attname='note2' AND a.attnum>0 AND NOT a.attisdropped
              )",
             &[&context.target_schema],
         )
         .await?
         .get(0);
     assert!(
-        !target_has_note,
-        "the fallback must not leave a partially applied target DDL"
+        target_has_note,
+        "the reloaded AOCO table must expose the new column"
     );
+    let snapshotted_note: Option<String> = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT note2 FROM {}.items WHERE id=1",
+                quote_identifier(&context.target_schema)
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(snapshotted_note.as_deref(), Some("from snapshot"));
+
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload, note2) VALUES (2, 'after', 'from replay')",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+    active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 2, &active).await?;
+    let replayed_note: String = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT note2 FROM {}.items WHERE id=2",
+                quote_identifier(&context.target_schema)
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(replayed_note, "from replay");
+    assert!(load_checkpoint_lsn(&context.target, context.pipeline.id).await? > checkpoint_before);
+
+    context
+        .source
+        .batch_execute(&format!(
+            "BEGIN;
+             CREATE TABLE {}.added (id bigint PRIMARY KEY, payload text NOT NULL);
+             INSERT INTO {}.added VALUES (1, 'created with table');
+             COMMIT;",
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    let added_relation_id: i64 = context
+        .source
+        .query_one(
+            "SELECT $1::text::regclass::oid::int8",
+            &[&format!("{}.added", context.source_schema)],
+        )
+        .await?
+        .get(0);
+    let added_target = context
+        .target
+        .query_one(
+            "SELECT target_schema, target_table
+               FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND source_relation_id=$2 AND state='active'",
+            &[&context.pipeline.id.as_uuid(), &added_relation_id],
+        )
+        .await?;
+    let added_target_schema: String = added_target.get("target_schema");
+    let added_target_table: String = added_target.get("target_table");
+    let added_payload: String = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT payload FROM {}.{} WHERE id=1",
+                quote_identifier(&added_target_schema),
+                quote_identifier(&added_target_table)
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(added_payload, "created with table");
+    active = context.start_job().await?;
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.added VALUES (2, 'before drop')",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+    wait_for_named_target_count(
+        &context.target,
+        &added_target_schema,
+        &added_target_table,
+        2,
+        &active,
+    )
+    .await?;
+    context
+        .source
+        .batch_execute(&format!(
+            "DROP TABLE {}.items",
+            quote_identifier(&context.source_schema)
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    let dropped_states = context
+        .target
+        .query_one(
+            "SELECT count(*) FILTER (WHERE state='active'),
+                    count(*) FILTER (WHERE state='quarantined')
+               FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND target_schema=$2 AND source_relation_id<>$3",
+            &[
+                &context.pipeline.id.as_uuid(),
+                &context.target_schema,
+                &added_relation_id,
+            ],
+        )
+        .await?;
+    assert_eq!(dropped_states.get::<_, i64>(0), 0);
+    assert!(dropped_states.get::<_, i64>(1) >= 1);
+
+    active = context.start_job().await?;
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.added VALUES (3, 'after drop')",
+                quote_identifier(&context.source_schema)
+            ),
+            &[],
+        )
+        .await?;
+    wait_for_named_target_count(
+        &context.target,
+        &added_target_schema,
+        &added_target_table,
+        3,
+        &active,
+    )
+    .await?;
+    context
+        .source
+        .batch_execute(&format!(
+            "DROP TABLE {}.added",
+            quote_identifier(&context.source_schema)
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+    let active_count: i64 = context
+        .target
+        .query_one(
+            "SELECT count(*) FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND state='active'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(active_count, 0);
+
+    active = context.start_job().await?;
+    wait_for_running(&active).await?;
+    context
+        .source
+        .batch_execute(&format!(
+            "BEGIN;
+             CREATE TABLE {}.revived (id bigint PRIMARY KEY, payload text NOT NULL);
+             INSERT INTO {}.revived VALUES (1, 'after empty publication');
+             COMMIT;",
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    let revived_target = context
+        .target
+        .query_one(
+            "SELECT target_schema, target_table
+               FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND state='active'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    let revived_schema: String = revived_target.get(0);
+    let revived_table: String = revived_target.get(1);
+    let revived_payload: String = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT payload FROM {}.{} WHERE id=1",
+                quote_identifier(&revived_schema),
+                quote_identifier(&revived_table)
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(revived_payload, "after empty publication");
+    Ok(())
+}
+
+async fn run_schema_scoped_enum_reload(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+
+    context
+        .source
+        .batch_execute(&format!(
+            "BEGIN;
+             CREATE TYPE {}.item_state AS ENUM ('new', 'ready');
+             CREATE TABLE {}.typed_items (
+                 id bigint PRIMARY KEY,
+                 state {}.item_state NOT NULL
+             );
+             INSERT INTO {}.typed_items VALUES (1, 'new');
+             COMMIT;",
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+
+    let typed_relation_id: i64 = context
+        .source
+        .query_one(
+            "SELECT $1::text::regclass::oid::int8",
+            &[&format!("{}.typed_items", context.source_schema)],
+        )
+        .await?
+        .get(0);
+    let typed_target = context
+        .target
+        .query_one(
+            "SELECT target_schema, target_table
+               FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND source_relation_id=$2 AND state='active'",
+            &[&context.pipeline.id.as_uuid(), &typed_relation_id],
+        )
+        .await?;
+    let typed_target_schema: String = typed_target.get(0);
+    let typed_target_table: String = typed_target.get(1);
+    wait_for_named_target_count(
+        &context.target,
+        &typed_target_schema,
+        &typed_target_table,
+        1,
+        &active,
+    )
+    .await?;
+
+    active = context.start_job().await?;
+    wait_for_running(&active).await?;
+    context
+        .source
+        .batch_execute(&format!(
+            "ALTER TYPE {}.item_state ADD VALUE 'archived'",
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    active
+        .expect_successful_exit(context.store.as_ref())
+        .await?;
+
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    let closure = context
+        .target
+        .query_one(
+            "SELECT count(*)::int8,
+                    count(*) FILTER (WHERE t.state='completed')::int8
+               FROM pg2cb_meta.schema_events e
+               JOIN pg2cb_meta.table_schema_transitions t
+                 ON t.pipeline_id=e.pipeline_id AND t.source_lsn=e.source_lsn
+                AND t.source_xid=e.source_xid
+              WHERE e.pipeline_id=$1 AND e.command_tag='ALTER TYPE'
+                AND t.action='reload'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(
+        closure.get::<_, i64>(0),
+        2,
+        "schema-scoped type DDL must conservatively reload both managed tables"
+    );
+    assert_eq!(closure.get::<_, i64>(1), 2);
+
+    let labels: Vec<String> = context
+        .target
+        .query_one(
+            "SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder)
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+               JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid
+               JOIN pg_catalog.pg_enum e ON e.enumtypid=a.atttypid
+              WHERE n.nspname=$1 AND c.relname=$2 AND a.attname='state'",
+            &[&typed_target_schema, &typed_target_table],
+        )
+        .await?
+        .get(0);
+    assert_eq!(labels, ["new", "ready", "archived"]);
+    active = context.start_job().await?;
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.typed_items VALUES (2, 'archived')",
+                quote_identifier(&context.source_schema),
+            ),
+            &[],
+        )
+        .await?;
+    wait_for_named_target_count(
+        &context.target,
+        &typed_target_schema,
+        &typed_target_table,
+        2,
+        &active,
+    )
+    .await?;
+    let state: String = context
+        .target
+        .query_one(
+            &format!(
+                "SELECT state::text FROM {}.{} WHERE id=2",
+                quote_identifier(&typed_target_schema),
+                quote_identifier(&typed_target_table),
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(state, "archived");
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
+    Ok(())
+}
+
+async fn run_ddl_snapshot_restart(context: &mut TestContext) -> Result<(), Box<dyn Error>> {
+    let mut active = context.start_job().await?;
+    wait_for_target_count(&context.target, &context.target_schema, 1, &active).await?;
+    context
+        .source
+        .execute(
+            &format!(
+                "INSERT INTO {}.items (id, payload)
+                 SELECT value, 'ddl-snapshot-' || value::text
+                   FROM generate_series(2::bigint, 6::bigint) AS value",
+                quote_identifier(&context.source_schema),
+            ),
+            &[],
+        )
+        .await?;
+    wait_for_target_count(&context.target, &context.target_schema, 6, &active).await?;
+
+    context
+        .controller
+        .arm(RecoveryFault::SnapshotPageAfterCommit);
+    context
+        .source
+        .batch_execute(&format!(
+            "ALTER TABLE {}.items ADD COLUMN note text",
+            quote_identifier(&context.source_schema),
+        ))
+        .await?;
+    context.controller.wait_until_fired().await?;
+    active.expect_fault(context.store.as_ref()).await?;
+
+    let interrupted = load_single_loading_snapshot(&context.target, context.pipeline.id).await?;
+    assert!(interrupted.pages_copied >= 1);
+    assert!(interrupted.rows_copied >= 1);
+    let transition = context
+        .target
+        .query_one(
+            "SELECT state, snapshot_group_id
+               FROM pg2cb_meta.table_schema_transitions
+              WHERE pipeline_id=$1 AND action='reload'
+              ORDER BY updated_at DESC LIMIT 1",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(transition.get::<_, String>("state"), "snapshotting");
+    assert_eq!(
+        transition.get::<_, Uuid>("snapshot_group_id"),
+        interrupted.group_id
+    );
+
+    active = context.start_job().await?;
+    wait_for_running(&active).await?;
+    wait_for_target_count(&context.target, &context.target_schema, 6, &active).await?;
+    assert_eq!(
+        stale_snapshot_artifact_count(&context.target, context.pipeline.id, interrupted.group_id,)
+            .await?,
+        0,
+        "restart must discard the shadow bound to the lost exported snapshot"
+    );
+    let active_group: Uuid = context
+        .target
+        .query_one(
+            "SELECT snapshot_group_id
+               FROM pg2cb_meta.managed_tables
+              WHERE pipeline_id=$1 AND target_schema=$2 AND target_table='items'
+                AND state='active'",
+            &[&context.pipeline.id.as_uuid(), &context.target_schema],
+        )
+        .await?
+        .get(0);
+    assert_ne!(active_group, interrupted.group_id);
+    let has_note: bool = context
+        .target
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM pg_catalog.pg_attribute a
+                   JOIN pg_catalog.pg_class c ON c.oid=a.attrelid
+                   JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                  WHERE n.nspname=$1 AND c.relname='items' AND a.attname='note'
+                    AND a.attnum>0 AND NOT a.attisdropped
+             )",
+            &[&context.target_schema],
+        )
+        .await?
+        .get(0);
+    assert!(has_note);
+    assert_eq!(rebuild_operation_count(context).await?, 0);
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    active.stop(context.store.as_ref()).await?;
     Ok(())
 }
 
@@ -748,6 +1782,15 @@ impl TestContext {
         source_dsn: &str,
         target_dsn: &str,
         profile: RuntimeProfile,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::setup_with_storage(source_dsn, target_dsn, profile, TargetStorage::AoColumn).await
+    }
+
+    async fn setup_with_storage(
+        source_dsn: &str,
+        target_dsn: &str,
+        profile: RuntimeProfile,
+        target_storage: TargetStorage,
     ) -> Result<Self, Box<dyn Error>> {
         let (mut source, source_connection) = connect(source_dsn, "source").await?;
         let (target, target_connection) = connect(target_dsn, "target").await?;
@@ -797,6 +1840,7 @@ impl TestContext {
                 target_schema: &target_schema,
                 suffix: &suffix,
                 profile,
+                target_storage,
             },
         )
         .await?;
@@ -886,6 +1930,7 @@ async fn persist_pipeline(
         target_schema,
         suffix,
         profile,
+        target_storage,
     } = spec;
     let source_id = SourceId::new();
     let target_id = TargetId::new();
@@ -895,7 +1940,10 @@ async fn persist_pipeline(
         .put_source(&SourceProfile {
             id: source_id,
             name: format!("recovery-source-{suffix}"),
-            prefix: SourcePrefix::new(format!("r{}", &suffix[..8]))?,
+            // UUIDv7's leading bytes are timestamp-dominated and repeat for long windows when
+            // truncated this aggressively. Use its random tail so interrupted fixtures cannot
+            // make every subsequent local E2E collide on the globally unique source prefix.
+            prefix: SourcePrefix::new(format!("r{}", &suffix[suffix.len() - 8..]))?,
             database_name: "source".to_owned(),
             topology: SourceTopology::Standalone,
             encrypted_dsn: master_key.encrypt(
@@ -928,7 +1976,9 @@ async fn persist_pipeline(
                 target_credential_aad(target_id).as_bytes(),
                 1,
             )?,
-            settings: json!({}),
+            settings: json!({
+                "default_table_storage": target_storage,
+            }),
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -1012,14 +2062,80 @@ async fn insert_bulk_source_transaction(
     Ok(())
 }
 
+async fn insert_bulk_source_transactions(
+    source: &Client,
+    source_schema: &str,
+    first_id: i64,
+    rows: i64,
+    payload_bytes: i32,
+    transaction_rows: i64,
+) -> Result<(), tokio_postgres::Error> {
+    let mut inserted = 0_i64;
+    while inserted < rows {
+        let current_rows = transaction_rows.min(rows - inserted);
+        insert_bulk_source_transaction(
+            source,
+            source_schema,
+            first_id + inserted,
+            current_rows,
+            payload_bytes,
+        )
+        .await?;
+        inserted += current_rows;
+    }
+    Ok(())
+}
+
+async fn update_bulk_source_transactions(
+    source: &Client,
+    source_schema: &str,
+    first_id: i64,
+    rows: i64,
+    transaction_rows: i64,
+    pass: i64,
+) -> Result<(), tokio_postgres::Error> {
+    let mut updated = 0_i64;
+    while updated < rows {
+        let current_rows = transaction_rows.min(rows - updated);
+        let range_start = first_id + updated;
+        let range_end = range_start + current_rows;
+        let prefix = format!("coalesced-{pass}-");
+        source
+            .execute(
+                &format!(
+                    "UPDATE {}.items SET payload=$3 || id::text WHERE id >= $1 AND id < $2",
+                    quote_identifier(source_schema)
+                ),
+                &[&range_start, &range_end, &prefix],
+            )
+            .await?;
+        updated += current_rows;
+    }
+    Ok(())
+}
+
 async fn wait_for_target_count(
     target: &Client,
     target_schema: &str,
     expected: i64,
     active: &ActiveJob,
 ) -> Result<(), Box<dyn Error>> {
+    wait_for_named_target_count(target, target_schema, "items", expected, active).await
+}
+
+async fn wait_for_named_target_count(
+    target: &Client,
+    target_schema: &str,
+    target_table: &str,
+    expected: i64,
+    active: &ActiveJob,
+) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + WAIT_TIMEOUT;
-    let relation = format!("{}.items", quote_identifier(target_schema));
+    let relation = format!(
+        "{}.{}",
+        quote_identifier(target_schema),
+        quote_identifier(target_table)
+    );
     loop {
         if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
             return Err(io::Error::other(format!(
@@ -1049,6 +2165,105 @@ async fn wait_for_target_count(
             .into());
         }
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_running(active: &ActiveJob) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before reaching steady CDC: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        if active.telemetry.snapshot().state == PipelineRuntimeState::Running {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pipeline did not reach steady CDC",
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_target_condition(
+    target: &Client,
+    target_schema: &str,
+    condition: &str,
+    expected: i64,
+    active: &ActiveJob,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    let relation = format!("{}.items", quote_identifier(target_schema));
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before target condition converged: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        let count: i64 = target
+            .query_one(
+                &format!("SELECT count(*) FROM {relation} WHERE {condition}"),
+                &[],
+            )
+            .await?
+            .get(0);
+        if count == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("target condition did not reach {expected} rows"),
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_target_id(
+    target: &Client,
+    target_schema: &str,
+    id: i64,
+    active: &ActiveJob,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    let relation = format!("{}.items", quote_identifier(target_schema));
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before latency row arrived: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        let exists: bool = target
+            .query_one(
+                &format!("SELECT EXISTS (SELECT 1 FROM {relation} WHERE id=$1)"),
+                &[&id],
+            )
+            .await?
+            .get(0);
+        if exists {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("target did not receive latency row {id}"),
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(5)).await;
     }
 }
 

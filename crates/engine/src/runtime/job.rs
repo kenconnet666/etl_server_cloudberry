@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use cloudberry_etl_core::{
     id::PipelineId,
     lsn::PgLsn,
+    mapping::shorten_identifier,
     pipeline::{PipelinePhase, SourceTopology},
 };
 use cloudberry_etl_metadata::{
@@ -40,22 +41,24 @@ use cloudberry_etl_target_cloudberry::{
     },
     migration::{MigrationError, migrate_target_database},
     schema_event::{
-        SchemaEventError, SchemaEventState, fail_schema_event_and_block_transitions,
-        load_schema_event,
+        SchemaEvent, SchemaEventError, SchemaEventState, advance_schema_event_state_in_transaction,
+        fail_schema_event_and_block_transitions, list_unfinished_schema_events, load_schema_event,
     },
     snapshot::{
-        ActiveTableRequirement, QuarantineGcPolicy, SnapshotActivationRequest,
+        ActiveTableRequirement, QuarantineGcPolicy, SnapshotActivationRequest, SnapshotOwnership,
         SnapshotPageCommitObserver, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, adopt_table_snapshot_replay_group, begin_snapshot_apply,
-        begin_snapshot_group, begin_snapshot_pages, cleanup_stale_snapshot_groups,
+        activate_snapshot_group, activate_table_snapshot_group_in_transaction,
+        adopt_table_snapshot_replay_group, begin_snapshot_apply, begin_snapshot_group,
+        begin_snapshot_group_in_transaction, begin_snapshot_pages, cleanup_stale_snapshot_groups,
         garbage_collect_quarantined_tables, load_snapshot_group_manifest,
-        plan_snapshot_target_with_storage, reset_interrupted_table_snapshot_group,
-        validate_active_tables,
+        plan_snapshot_target_with_storage, quarantine_active_table_in_transaction,
+        reset_interrupted_table_snapshot_group, validate_active_tables,
     },
     storage::{StorageCapabilityError, load_relation_storage, verify_storage_available},
     table_transition::{
-        TableTransition, TableTransitionError, TableTransitionState,
-        list_unfinished_table_transitions,
+        TableTransition, TableTransitionAction, TableTransitionError, TableTransitionState,
+        advance_table_transition_state_in_transaction,
+        begin_table_snapshot_transition_in_transaction, list_unfinished_table_transitions,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -67,11 +70,12 @@ use uuid::Uuid;
 use crate::{
     adapters::{
         AdapterConfigError, CloudberryTransactionSink, DdlScope, PgOutputTransactionSource,
-        SourceIngestObserver, TableBinding, TableBindingRegistry,
+        SourceIngestObserver, TableBinding, TableBindingRegistry, TableReplayFence,
     },
     batch::{BatchError, BatchLimits, Batcher},
     pipeline::{PipelineError, SchemaEventKey},
     runtime::reconciler::{JobFactoryError, PipelineJobFactory},
+    schema_transition::{SchemaAction, SchemaTransactionPlan},
     supervisor::{PipelineJob, SupervisorError},
     telemetry::PipelineTelemetryHandle,
 };
@@ -119,6 +123,12 @@ enum RuntimeJobError {
     CompletedSchemaEventBarrier { source_lsn: PgLsn, source_xid: u64 },
     #[error("table transition for relation {0} has no recoverable snapshot group")]
     MissingTableSnapshotGroup(u32),
+    #[error("table transition for relation {relation_id} has invalid plan: {reason}")]
+    InvalidTableTransitionPlan { relation_id: u32, reason: String },
+    #[error("table transition for relation {0} has no pending generation")]
+    MissingPendingTableGeneration(u32),
+    #[error("persisted online transition for relation {0} predates the AOCO reload executor")]
+    UnsupportedPersistedOnlineTransition(u32),
     #[error("table snapshot group `{group}` has an invalid standalone source boundary: {reason}")]
     InvalidTableSnapshotBoundary { group: Uuid, reason: String },
     #[error("table snapshot group `{0}` must not use the pipeline's main logical slot")]
@@ -432,6 +442,27 @@ struct RuntimeTable {
 struct PreparedRun {
     tables: Vec<RuntimeTable>,
     checkpoint: NodeCheckpoint,
+    replay_fences: Vec<TableReplayFence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableSchemaExecution {
+    Completed,
+    RequiresPipelineRebuild,
+}
+
+const fn transition_action_matches(
+    persisted: TableTransitionAction,
+    action: &SchemaAction,
+) -> bool {
+    matches!(
+        (persisted, action),
+        (TableTransitionAction::Noop, SchemaAction::Noop)
+            | (TableTransitionAction::Online, SchemaAction::Online { .. })
+            | (TableTransitionAction::Reload, SchemaAction::Reload { .. })
+            | (TableTransitionAction::Drop, SchemaAction::Drop)
+            | (TableTransitionAction::Add, SchemaAction::Add { .. })
+    )
 }
 
 /// Which runtime data plane serves a given source topology.
@@ -499,6 +530,12 @@ impl PostgresCloudberryJob {
         let names = replication_names(self.pipeline_id, STANDALONE_NODE_ID);
         self.recover_table_snapshot_transitions(&source_setup, &mut target, &report, &names.slot)
             .await?;
+        if !self
+            .resume_unfinished_table_schema_events(&mut target, &report, &names, &cancellation)
+            .await?
+        {
+            return Ok(());
+        }
         let stale_groups = cleanup_stale_snapshot_groups(&mut target, self.fence).await?;
         for group in &stale_groups {
             tracing::warn!(
@@ -690,6 +727,7 @@ impl PostgresCloudberryJob {
                 chunk_limits,
             )?,
         }
+        .with_replay_fences(prepared.replay_fences.clone())?
         .with_schema_source(source_setup, self.catalog_options())?;
         let batcher = Batcher::new(BatchLimits {
             max_rows: self.pipeline_settings.batch.max_rows,
@@ -710,7 +748,7 @@ impl PostgresCloudberryJob {
             result = self.monitor_wal_retention(
                 monitor_client,
                 names.slot.clone(),
-                cancellation,
+                cancellation.clone(),
             ) => Err(result),
         };
         drop(source);
@@ -726,13 +764,30 @@ impl PostgresCloudberryJob {
                     tracing::info!(
                         pipeline_id = %self.pipeline_id,
                         command_tag = %tag,
-                        "schema barrier raised by DDL; requesting rebuild"
+                        "schema barrier raised by DDL; starting table-local transition"
                     );
                 }
-                self.telemetry.mark_degraded(reason.clone());
                 if let Some(schema_event) = schema_event {
+                    match self
+                        .execute_table_schema_event(schema_event, &report, &names, &cancellation)
+                        .await?
+                    {
+                        TableSchemaExecution::Completed => {
+                            tracing::info!(
+                                pipeline_id = %self.pipeline_id,
+                                source_lsn = %schema_event.source_lsn,
+                                source_xid = schema_event.source_xid,
+                                "table-local schema transition completed; main-slot replay scheduled"
+                            );
+                            return Ok(());
+                        }
+                        TableSchemaExecution::RequiresPipelineRebuild => {}
+                    }
+                    self.telemetry.mark_degraded(reason.clone());
                     self.fail_schema_event_for_rebuild(schema_event, &reason)
                         .await?;
+                } else {
+                    self.telemetry.mark_degraded(reason.clone());
                 }
                 self.request_rebuild(&reason).await?;
                 Ok(())
@@ -780,6 +835,464 @@ impl PostgresCloudberryJob {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn execute_table_schema_event(
+        &self,
+        key: SchemaEventKey,
+        report: &PreflightReport,
+        names: &super::ReplicationNames,
+        cancellation: &CancellationToken,
+    ) -> Result<TableSchemaExecution, RuntimeJobError> {
+        let mut target = connect_sql(&self.target_dsn, EndpointRole::Target).await?;
+        let event = load_schema_event(&target, self.pipeline_id, key.source_lsn, key.source_xid)
+            .await?
+            .ok_or(RuntimeJobError::MissingSchemaEvent {
+                source_lsn: key.source_lsn,
+                source_xid: key.source_xid,
+            })?;
+        match event.state {
+            SchemaEventState::Completed => return Ok(TableSchemaExecution::Completed),
+            SchemaEventState::Failed => {
+                return Ok(TableSchemaExecution::RequiresPipelineRebuild);
+            }
+            SchemaEventState::Pending | SchemaEventState::InTransition => {}
+        }
+
+        let mut transitions = list_unfinished_table_transitions(&mut target, self.fence)
+            .await?
+            .into_iter()
+            .filter(|transition| {
+                transition.key.source_lsn == key.source_lsn
+                    && transition.key.source_xid == key.source_xid
+            })
+            .collect::<Vec<_>>();
+        if transitions.is_empty() {
+            let plan: SchemaTransactionPlan = serde_json::from_value(event.transitions.clone())
+                .map_err(|error| RuntimeJobError::InvalidTableTransitionPlan {
+                    relation_id: 0,
+                    reason: error.to_string(),
+                })?;
+            if plan.terminal_relations.is_empty() && !plan.unknown_scope {
+                self.cutover_table_schema_event(&mut target, &event, &[], None)
+                    .await?;
+                return Ok(TableSchemaExecution::Completed);
+            }
+            return Ok(TableSchemaExecution::RequiresPipelineRebuild);
+        }
+        if transitions
+            .iter()
+            .any(|transition| transition.action == TableTransitionAction::Online)
+        {
+            return Ok(TableSchemaExecution::RequiresPipelineRebuild);
+        }
+        for transition in &transitions {
+            if transition.event_id != event.event_id {
+                return Err(RuntimeJobError::InvalidTableTransitionPlan {
+                    relation_id: transition.key.source_relation_id,
+                    reason: "child event identity does not match its schema event".to_owned(),
+                });
+            }
+            let action: SchemaAction =
+                serde_json::from_value(transition.plan.clone()).map_err(|error| {
+                    RuntimeJobError::InvalidTableTransitionPlan {
+                        relation_id: transition.key.source_relation_id,
+                        reason: error.to_string(),
+                    }
+                })?;
+            if !transition_action_matches(transition.action, &action) {
+                return Err(RuntimeJobError::InvalidTableTransitionPlan {
+                    relation_id: transition.key.source_relation_id,
+                    reason: "persisted action tag does not match the typed plan".to_owned(),
+                });
+            }
+        }
+
+        let snapshot_transitions = transitions
+            .iter()
+            .filter(|transition| {
+                matches!(
+                    transition.action,
+                    TableTransitionAction::Reload | TableTransitionAction::Add
+                )
+            })
+            .collect::<Vec<_>>();
+        if snapshot_transitions.is_empty() {
+            self.cutover_table_schema_event(&mut target, &event, &transitions, None)
+                .await?;
+            return Ok(TableSchemaExecution::Completed);
+        }
+
+        let existing_group = snapshot_transitions
+            .iter()
+            .filter_map(|transition| transition.snapshot_group_id)
+            .next();
+        if let Some(group_id) = existing_group {
+            if snapshot_transitions
+                .iter()
+                .any(|transition| transition.snapshot_group_id != Some(group_id))
+            {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: "schema event references more than one snapshot group".to_owned(),
+                });
+            }
+            let manifest = load_snapshot_group_manifest(&mut target, self.fence, group_id).await?;
+            self.cutover_table_schema_event(
+                &mut target,
+                &event,
+                &transitions,
+                Some(&manifest.request),
+            )
+            .await?;
+            return Ok(TableSchemaExecution::Completed);
+        }
+
+        self.execute_new_table_snapshot(
+            &mut target,
+            &event,
+            &mut transitions,
+            report,
+            names,
+            cancellation,
+        )
+        .await?;
+        Ok(TableSchemaExecution::Completed)
+    }
+
+    async fn execute_new_table_snapshot(
+        &self,
+        target: &mut tokio_postgres::Client,
+        event: &SchemaEvent,
+        transitions: &mut [TableTransition],
+        report: &PreflightReport,
+        names: &super::ReplicationNames,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RuntimeJobError> {
+        let source = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
+        let inventory = cloudberry_etl_source_postgres::catalog::inspect_tables(
+            &source,
+            &self.catalog_options(),
+        )
+        .await?;
+        let publication_tables = self.plan_resume_inventory(inventory)?;
+        self.ensure_publication(&source, &names.publication, &publication_tables)
+            .await?;
+
+        let slot_name = shorten_identifier(&format!("pg2cb_t_{}", event.event_id.simple()));
+        if let Some(existing) = inspect_logical_slot(&source, &slot_name).await? {
+            if existing.active {
+                return Err(RuntimeJobError::ActiveOrphanSlot { slot: slot_name });
+            }
+            drop_logical_slot(&source, &slot_name).await?;
+        }
+
+        let result = async {
+            let mut guard =
+                SnapshotSlotGuard::create(self.source_dsn.expose_secret(), &slot_name, 1).await?;
+            let slot_snapshot = guard.snapshot().clone();
+            let mut snapshot_client = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
+            let mut snapshot =
+                begin_at_exported_snapshot(&mut snapshot_client, &slot_snapshot.snapshot_name)
+                    .await?;
+            guard.mark_reader_ready()?;
+            guard.release()?;
+
+            let snapshot_inventory = snapshot.inspect_tables(&self.catalog_options()).await?;
+            let snapshot_tables = self.plan_resume_inventory(snapshot_inventory)?;
+            if publication_tables.len() != snapshot_tables.len()
+                || publication_tables
+                    .iter()
+                    .zip(&snapshot_tables)
+                    .any(|(before, at_snapshot)| before.planned != at_snapshot.planned)
+            {
+                snapshot.rollback().await?;
+                return Err(RuntimeJobError::InitialCatalogChanged);
+            }
+
+            let mut reload_tables = Vec::new();
+            for transition in transitions.iter() {
+                if !matches!(
+                    transition.action,
+                    TableTransitionAction::Reload | TableTransitionAction::Add
+                ) {
+                    continue;
+                }
+                let pending_generation = transition.pending_table_generation.ok_or(
+                    RuntimeJobError::MissingPendingTableGeneration(
+                        transition.key.source_relation_id,
+                    ),
+                )?;
+                let action: SchemaAction = serde_json::from_value(transition.plan.clone())
+                    .map_err(|error| RuntimeJobError::InvalidTableTransitionPlan {
+                        relation_id: transition.key.source_relation_id,
+                        reason: error.to_string(),
+                    })?;
+                let (SchemaAction::Reload {
+                    after: expected_after,
+                    ..
+                }
+                | SchemaAction::Add {
+                    after: expected_after,
+                }) = action
+                else {
+                    unreachable!("snapshot action checked above")
+                };
+                let planned = snapshot_tables
+                    .iter()
+                    .find(|table| {
+                        table.planned.source.relation_id == transition.key.source_relation_id
+                    })
+                    .ok_or(RuntimeJobError::InitialCatalogChanged)?;
+                if planned.planned.source != expected_after {
+                    return Err(RuntimeJobError::InitialCatalogChanged);
+                }
+                let mut snapshot_schema = planned.planned.source.clone();
+                snapshot_schema.generation = pending_generation;
+                let snapshot_plan = plan_snapshot_target_with_storage(
+                    &snapshot_schema,
+                    planned.planned.target.clone(),
+                    planned.planned.shadow.clone(),
+                    planned.planned.storage,
+                )?;
+                reload_tables.push(RuntimeTable {
+                    planned: planned.planned.clone(),
+                    snapshot_plan,
+                    table_generation: pending_generation,
+                });
+            }
+
+            let snapshot_group_id = Uuid::now_v7();
+            let boundary = NodeCheckpoint {
+                key: CheckpointKey {
+                    pipeline_id: self.pipeline_id,
+                    topology_generation: self.topology_generation,
+                    node_id: STANDALONE_NODE_ID,
+                },
+                system_identifier: report.identity.system_identifier,
+                timeline: report.identity.timeline,
+                slot_name: slot_name.clone(),
+                applied_lsn: slot_snapshot.consistent_point,
+            };
+            let activation_request = SnapshotActivationRequest {
+                fence: self.fence,
+                snapshot_group_id,
+                tables: reload_tables
+                    .iter()
+                    .map(|table| {
+                        table
+                            .snapshot_plan
+                            .activation_table(&table.planned.schema_fingerprint)
+                    })
+                    .collect(),
+                initial_checkpoints: vec![boundary],
+            };
+
+            let transaction = target.transaction().await?;
+            begin_snapshot_group_in_transaction(&transaction, &activation_request).await?;
+            for transition in transitions.iter_mut().filter(|transition| {
+                matches!(
+                    transition.action,
+                    TableTransitionAction::Reload | TableTransitionAction::Add
+                )
+            }) {
+                begin_table_snapshot_transition_in_transaction(
+                    &transaction,
+                    self.fence,
+                    transition.key,
+                    transition.state,
+                    snapshot_group_id,
+                )
+                .await?;
+                transition.snapshot_group_id = Some(snapshot_group_id);
+                transition.state = TableTransitionState::Snapshotting;
+            }
+            if event.state == SchemaEventState::Pending {
+                advance_schema_event_state_in_transaction(
+                    &transaction,
+                    self.fence,
+                    event.source_lsn,
+                    event.source_xid,
+                    SchemaEventState::Pending,
+                    SchemaEventState::InTransition,
+                    None,
+                )
+                .await?;
+            }
+            transaction.commit().await?;
+
+            self.telemetry.set_phase(PipelinePhase::Snapshotting);
+            for table in &reload_tables {
+                let ownership = SnapshotOwnership {
+                    fence: self.fence,
+                    snapshot_group_id,
+                    schema_fingerprint: table.planned.schema_fingerprint.clone(),
+                };
+                if let Err(error) = self
+                    .load_table_snapshot(target, &mut snapshot, table, &ownership, cancellation)
+                    .await
+                {
+                    let _ = snapshot.rollback().await;
+                    return Err(error);
+                }
+            }
+            snapshot.commit().await?;
+            let mut cutover_event = event.clone();
+            cutover_event.state = SchemaEventState::InTransition;
+            self.cutover_table_schema_event(
+                target,
+                &cutover_event,
+                transitions,
+                Some(&activation_request),
+            )
+            .await
+        }
+        .await;
+
+        let cleanup = drop_logical_slot(&source, &slot_name).await;
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(RuntimeJobError::Source(error)),
+        }
+    }
+
+    async fn cutover_table_schema_event(
+        &self,
+        target: &mut tokio_postgres::Client,
+        event: &SchemaEvent,
+        transitions: &[TableTransition],
+        activation: Option<&SnapshotActivationRequest>,
+    ) -> Result<(), RuntimeJobError> {
+        let transaction = target.transaction().await?;
+        if event.state == SchemaEventState::Pending {
+            advance_schema_event_state_in_transaction(
+                &transaction,
+                self.fence,
+                event.source_lsn,
+                event.source_xid,
+                SchemaEventState::Pending,
+                SchemaEventState::InTransition,
+                None,
+            )
+            .await?;
+        }
+
+        for transition in transitions.iter().filter(|transition| {
+            matches!(
+                transition.action,
+                TableTransitionAction::Reload | TableTransitionAction::Add
+            )
+        }) {
+            let mut state = transition.state;
+            if state == TableTransitionState::Snapshotting {
+                advance_table_transition_state_in_transaction(
+                    &transaction,
+                    self.fence,
+                    transition.key,
+                    state,
+                    TableTransitionState::CatchingUp,
+                    None,
+                )
+                .await?;
+                state = TableTransitionState::CatchingUp;
+            }
+            if state == TableTransitionState::CatchingUp {
+                advance_table_transition_state_in_transaction(
+                    &transaction,
+                    self.fence,
+                    transition.key,
+                    state,
+                    TableTransitionState::CutoverPending,
+                    None,
+                )
+                .await?;
+            } else if state != TableTransitionState::CutoverPending {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: transition.snapshot_group_id.unwrap_or_default(),
+                    reason: format!("unexpected cutover state {state:?}"),
+                });
+            }
+        }
+        if let Some(activation) = activation {
+            activate_table_snapshot_group_in_transaction(&transaction, activation).await?;
+        }
+
+        for transition in transitions {
+            match transition.action {
+                TableTransitionAction::Reload | TableTransitionAction::Add => {
+                    advance_table_transition_state_in_transaction(
+                        &transaction,
+                        self.fence,
+                        transition.key,
+                        TableTransitionState::CutoverPending,
+                        TableTransitionState::Completed,
+                        None,
+                    )
+                    .await?;
+                }
+                TableTransitionAction::Drop => {
+                    advance_table_transition_state_in_transaction(
+                        &transaction,
+                        self.fence,
+                        transition.key,
+                        transition.state,
+                        TableTransitionState::CutoverPending,
+                        None,
+                    )
+                    .await?;
+                    quarantine_active_table_in_transaction(
+                        &transaction,
+                        self.fence,
+                        event.event_id,
+                        transition.key.source_relation_id,
+                        transition.active_table_generation.ok_or(
+                            RuntimeJobError::MissingPendingTableGeneration(
+                                transition.key.source_relation_id,
+                            ),
+                        )?,
+                    )
+                    .await?;
+                    advance_table_transition_state_in_transaction(
+                        &transaction,
+                        self.fence,
+                        transition.key,
+                        TableTransitionState::CutoverPending,
+                        TableTransitionState::Completed,
+                        None,
+                    )
+                    .await?;
+                }
+                TableTransitionAction::Noop => {
+                    advance_table_transition_state_in_transaction(
+                        &transaction,
+                        self.fence,
+                        transition.key,
+                        transition.state,
+                        TableTransitionState::Completed,
+                        None,
+                    )
+                    .await?;
+                }
+                TableTransitionAction::Online => {
+                    return Err(RuntimeJobError::UnsupportedPersistedOnlineTransition(
+                        transition.key.source_relation_id,
+                    ));
+                }
+            }
+        }
+        advance_schema_event_state_in_transaction(
+            &transaction,
+            self.fence,
+            event.source_lsn,
+            event.source_xid,
+            SchemaEventState::InTransition,
+            SchemaEventState::Completed,
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -916,6 +1429,46 @@ impl PostgresCloudberryJob {
             }
         }
         Ok(())
+    }
+
+    async fn resume_unfinished_table_schema_events(
+        &self,
+        target: &mut tokio_postgres::Client,
+        report: &PreflightReport,
+        names: &super::ReplicationNames,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RuntimeJobError> {
+        let events = list_unfinished_schema_events(target, self.fence).await?;
+
+        for event in events {
+            let event = SchemaEventKey {
+                source_lsn: event.source_lsn,
+                source_xid: event.source_xid,
+            };
+            match self
+                .execute_table_schema_event(event, report, names, cancellation)
+                .await?
+            {
+                TableSchemaExecution::Completed => {
+                    tracing::info!(
+                        pipeline_id = %self.pipeline_id,
+                        source_lsn = %event.source_lsn,
+                        source_xid = event.source_xid,
+                        "resumed unfinished table-local schema transition"
+                    );
+                }
+                TableSchemaExecution::RequiresPipelineRebuild => {
+                    let reason = format!(
+                        "unfinished schema event {}/{} cannot be resumed table-locally",
+                        event.source_lsn, event.source_xid
+                    );
+                    self.fail_schema_event_for_rebuild(event, &reason).await?;
+                    self.request_rebuild(&reason).await?;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     async fn request_rebuild(&self, reason: &str) -> Result<(), RuntimeJobError> {
@@ -1099,11 +1652,37 @@ impl PostgresCloudberryJob {
         &self,
         inventory: TableInventory,
     ) -> Result<Vec<RuntimeTable>, RuntimeJobError> {
+        self.plan_inventory_with_mode(inventory, false)
+    }
+
+    fn plan_resume_inventory(
+        &self,
+        inventory: TableInventory,
+    ) -> Result<Vec<RuntimeTable>, RuntimeJobError> {
+        self.plan_inventory_with_mode(inventory, true)
+    }
+
+    fn plan_inventory_with_mode(
+        &self,
+        inventory: TableInventory,
+        allow_missing_explicit_mappings: bool,
+    ) -> Result<Vec<RuntimeTable>, RuntimeJobError> {
         if let Some(rejected) = inventory.rejected.into_iter().next() {
             return Err(RuntimeJobError::UnsupportedIncludedTable {
                 table: rejected.name.to_string(),
                 reason: rejected.reason.to_string(),
             });
+        }
+        let mut settings = self.pipeline_settings.clone();
+        if allow_missing_explicit_mappings {
+            let available = inventory
+                .supported
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<HashSet<_>>();
+            settings
+                .table_mappings
+                .retain(|mapping| available.contains(&mapping.source));
         }
         let planned = plan_tables(
             self.pipeline_id,
@@ -1114,7 +1693,7 @@ impl PostgresCloudberryJob {
                 database: &self.target.database_name,
                 default_storage: self.target_settings.default_table_storage,
             },
-            &self.pipeline_settings,
+            &settings,
             inventory.supported,
         )?;
         let mut accepted = Vec::with_capacity(planned.len());
@@ -1133,7 +1712,7 @@ impl PostgresCloudberryJob {
                 table_generation: self.topology_generation,
             });
         }
-        if accepted.is_empty() {
+        if accepted.is_empty() && !allow_missing_explicit_mappings {
             Err(RuntimeJobError::NoEligibleTables)
         } else {
             Ok(accepted)
@@ -1448,7 +2027,11 @@ impl PostgresCloudberryJob {
             snapshot.commit().await?;
             preserve_slot_on_error = true;
             activate_snapshot_group(target, &activation_request).await?;
-            Ok(PreparedRun { tables, checkpoint })
+            Ok(PreparedRun {
+                tables,
+                checkpoint,
+                replay_fences: Vec::new(),
+            })
         }
         .await;
 
@@ -1549,7 +2132,7 @@ impl PostgresCloudberryJob {
             &self.catalog_options(),
         )
         .await?;
-        let mut tables = self.plan_inventory(inventory)?;
+        let mut tables = self.plan_resume_inventory(inventory)?;
         for table in &tables {
             if let Some(actual) = load_relation_storage(target, &table.planned.target).await?
                 && actual != table.planned.storage.access_method()
@@ -1580,14 +2163,52 @@ impl PostgresCloudberryJob {
             })
             .collect::<Vec<_>>();
         let active = validate_active_tables(target, self.fence, &active_requirements).await?;
+        let mut replay_fences = Vec::new();
+        let mut manifests = HashMap::new();
         for table in &mut tables {
-            table.table_generation = active
+            let metadata = active
                 .iter()
                 .find(|metadata| metadata.target == table.planned.target)
-                .ok_or(RuntimeJobError::NoEligibleTables)?
-                .table_generation;
+                .ok_or(RuntimeJobError::NoEligibleTables)?;
+            table.table_generation = metadata.table_generation;
+            let Some(group_id) = metadata.snapshot_group_id else {
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Vacant(entry) = manifests.entry(group_id) {
+                let manifest = load_snapshot_group_manifest(target, self.fence, group_id).await?;
+                entry.insert(manifest);
+            }
+            let manifest = &manifests[&group_id];
+            let [boundary] = manifest.request.initial_checkpoints.as_slice() else {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: format!(
+                        "expected one source node, found {}",
+                        manifest.request.initial_checkpoints.len()
+                    ),
+                });
+            };
+            if boundary.key.node_id != STANDALONE_NODE_ID
+                || boundary.system_identifier != report.identity.system_identifier
+                || boundary.timeline != report.identity.timeline
+            {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: "active table snapshot source identity does not match".to_owned(),
+                });
+            }
+            if boundary.applied_lsn > checkpoint.applied_lsn {
+                replay_fences.push(TableReplayFence {
+                    relation_id: table.planned.source.relation_id,
+                    snapshot_lsn: boundary.applied_lsn,
+                });
+            }
         }
-        Ok(PreparedRun { tables, checkpoint })
+        Ok(PreparedRun {
+            tables,
+            checkpoint,
+            replay_fences,
+        })
     }
 }
 

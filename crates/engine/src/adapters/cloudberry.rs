@@ -8,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 use cloudberry_etl_core::{
     change::{TableChange, TransactionChange},
+    lsn::PgLsn,
     schema::{QualifiedName, TableSchema},
 };
 use cloudberry_etl_source_postgres::{
@@ -17,9 +18,10 @@ use cloudberry_etl_source_postgres::{
 };
 use cloudberry_etl_target_cloudberry::{
     apply::{
-        ApplyPlan, ApplyPlanError, ApplyRequest, DataChunkDisposition, LedgeredCommitObserver,
-        LedgeredDataChunkOutcome, LedgeredDataChunkRequest, LedgeredEmptyTransactionOutcome,
-        LedgeredTransactionFinalizer, TableApplyBatch, execute_ledgered_data_chunk,
+        ApplyPlan, ApplyPlanError, ApplyRequest, AtomicApplyOutcome, DataChunkDisposition,
+        LedgeredCommitObserver, LedgeredDataChunkOutcome, LedgeredDataChunkRequest,
+        LedgeredEmptyTransactionOutcome, LedgeredTransactionFinalizer, TableApplyBatch,
+        execute_atomic_apply, execute_atomic_apply_observed, execute_ledgered_data_chunk,
         execute_ledgered_data_chunk_finalized, execute_ledgered_data_chunk_observed,
         execute_ledgered_data_chunk_observed_finalized, execute_ledgered_empty_transaction,
         execute_ledgered_empty_transaction_finalized, execute_ledgered_empty_transaction_observed,
@@ -28,7 +30,9 @@ use cloudberry_etl_target_cloudberry::{
     checkpoint::{CheckpointKey, NodeCheckpoint, PipelineFence},
     chunk::{DataChunkIdentity, TransactionChunkKey, TransactionChunkManifest},
     managed::TableApplyIdentity,
-    schema_event::{SchemaEventState, advance_schema_event_state_in_transaction},
+    schema_event::{
+        SchemaEventState, advance_schema_event_state_in_transaction, load_schema_event,
+    },
     storage::TargetStorage,
     table_transition::{
         TableTransitionKey, TableTransitionState, advance_table_transition_state_in_transaction,
@@ -49,7 +53,7 @@ use crate::{
 // storage representation. The same source transaction must retain one identity if spill policy
 // changes between attempts.
 const TRANSACTION_MANIFEST_VERSION: u16 = 1;
-const DEFAULT_CHUNK_MAX_RECORDS: usize = 10_000;
+const DEFAULT_CHUNK_MAX_RECORDS: usize = 100_000;
 const DEFAULT_CHUNK_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -74,6 +78,19 @@ pub enum AdapterConfigError {
     InvalidMetadataSchema,
     #[error("relation {0} has more than one active schema binding")]
     AmbiguousActiveRelation(u32),
+    #[error("replay fence relation ID must be positive")]
+    InvalidReplayFenceRelation,
+    #[error("relation {0} has more than one replay fence")]
+    DuplicateReplayFence(u32),
+}
+
+/// A table snapshot already contains every committed row through `snapshot_lsn`. During the
+/// subsequent main-slot replay, rows for this relation at or before that boundary are receipts
+/// only; later rows resolve against the newly active schema binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableReplayFence {
+    pub relation_id: u32,
+    pub snapshot_lsn: PgLsn,
 }
 
 /// Source schema selection used to decide whether a transactional DDL event requires a rebuild.
@@ -286,6 +303,21 @@ impl TableBindingRegistry {
         self.bindings.get(&(relation_id, generation))
     }
 
+    fn get_by_relation(
+        &self,
+        relation_id: u32,
+    ) -> Result<Option<&TableBinding>, AdapterConfigError> {
+        let mut matches = self
+            .bindings
+            .values()
+            .filter(|binding| binding.schema.relation_id == relation_id);
+        let found = matches.next();
+        if matches.next().is_some() {
+            return Err(AdapterConfigError::AmbiguousActiveRelation(relation_id));
+        }
+        Ok(found)
+    }
+
     #[must_use]
     pub fn contains_relation(&self, relation_id: u32) -> bool {
         self.bindings
@@ -429,6 +461,13 @@ fn build_table_apply_batches<'a>(
             .push(change);
     }
 
+    build_grouped_table_batches(registry, grouped)
+}
+
+fn build_grouped_table_batches(
+    registry: &TableBindingRegistry,
+    grouped: BTreeMap<(u32, u64), Vec<&TableChange>>,
+) -> Result<Vec<TableApplyBatch>, PipelineError> {
     let mut tables = Vec::with_capacity(grouped.len());
     for ((relation_id, generation), changes) in grouped {
         let binding = registry.get(relation_id, generation).ok_or_else(|| {
@@ -451,14 +490,52 @@ fn build_table_apply_batches<'a>(
 fn build_chunk_tables(
     registry: &TableBindingRegistry,
     chunk: &ChangeChunk,
+    transaction_lsn: PgLsn,
+    replay_fences: &BTreeMap<u32, PgLsn>,
 ) -> Result<Vec<TableApplyBatch>, PipelineError> {
-    build_table_apply_batches(
-        registry,
-        chunk.changes.iter().filter_map(|change| match change {
-            TransactionChange::Row(change) => Some(change),
-            TransactionChange::Ddl(_) | TransactionChange::Truncate { .. } => None,
-        }),
-    )
+    if replay_fences.is_empty() {
+        return build_table_apply_batches(
+            registry,
+            chunk.changes.iter().filter_map(|change| match change {
+                TransactionChange::Row(change) => Some(change),
+                TransactionChange::Ddl(_) | TransactionChange::Truncate { .. } => None,
+            }),
+        );
+    }
+
+    let mut grouped: BTreeMap<(u32, u64), Vec<TableChange>> = BTreeMap::new();
+    for change in chunk.changes.iter().filter_map(|change| match change {
+        TransactionChange::Row(change) => Some(change),
+        TransactionChange::Ddl(_) | TransactionChange::Truncate { .. } => None,
+    }) {
+        let (key, rewrite_generation) = match replay_fences.get(&change.relation_id) {
+            Some(snapshot_lsn) if transaction_lsn <= *snapshot_lsn => continue,
+            Some(_) => {
+                let key = registry
+                    .get_by_relation(change.relation_id)
+                    .map_err(|error| PipelineError::Target(error.to_string()))?
+                    .ok_or_else(|| {
+                        PipelineError::Target(format!(
+                            "no active replay binding for relation {}",
+                            change.relation_id
+                        ))
+                    })?
+                    .key();
+                (key, true)
+            }
+            None => ((change.relation_id, change.generation), false),
+        };
+        let mut change = change.clone();
+        if rewrite_generation {
+            change.generation = key.1;
+        }
+        grouped.entry(key).or_default().push(change);
+    }
+    let borrowed = grouped
+        .iter()
+        .map(|(key, changes)| (*key, changes.iter().collect::<Vec<_>>()))
+        .collect();
+    build_grouped_table_batches(registry, borrowed)
 }
 
 fn transaction_manifest(
@@ -563,6 +640,7 @@ pub struct CloudberryTransactionSink {
     ddl_scope: DdlScope,
     chunk_limits: ChunkLimits,
     commit_observer: Option<Arc<dyn LedgeredCommitObserver>>,
+    replay_fences: BTreeMap<u32, PgLsn>,
 }
 
 struct SchemaSource {
@@ -573,6 +651,7 @@ struct SchemaSource {
 enum PreparedSchemaBarrier {
     Block(PipelineError),
     CompleteNoop(NoopSchemaFinalizer),
+    ReplayCompleted,
 }
 
 struct NoopSchemaFinalizer {
@@ -700,7 +779,27 @@ impl CloudberryTransactionSink {
             ddl_scope,
             chunk_limits,
             commit_observer,
+            replay_fences: BTreeMap::new(),
         })
+    }
+
+    pub fn with_replay_fences(
+        mut self,
+        fences: impl IntoIterator<Item = TableReplayFence>,
+    ) -> Result<Self, AdapterConfigError> {
+        for fence in fences {
+            if fence.relation_id == 0 {
+                return Err(AdapterConfigError::InvalidReplayFenceRelation);
+            }
+            if self
+                .replay_fences
+                .insert(fence.relation_id, fence.snapshot_lsn)
+                .is_some()
+            {
+                return Err(AdapterConfigError::DuplicateReplayFence(fence.relation_id));
+            }
+        }
+        Ok(self)
     }
 
     /// Enable transaction-level schema planning with a dedicated source SQL connection.
@@ -750,13 +849,47 @@ impl CloudberryTransactionSink {
             ));
         }
         let transaction = batch.final_transaction();
-        let Some(plan) = plan_schema_transaction(transaction)
+        let Some(mut plan) = plan_schema_transaction(transaction)
             .map_err(|error| PipelineError::Source(error.to_string()))?
         else {
             return Ok(None);
         };
         if !self.plan_requires_barrier(&plan) {
             return Ok(None);
+        }
+        let relation_ids = plan.relation_ids();
+        if !relation_ids.is_empty()
+            && relation_ids.iter().all(|relation_id| {
+                self.replay_fences
+                    .get(relation_id)
+                    .is_some_and(|snapshot_lsn| plan.source_position.lsn <= *snapshot_lsn)
+            })
+        {
+            return Ok(Some(PreparedSchemaBarrier::ReplayCompleted));
+        }
+        let replay_record = plan
+            .schema_event_record(self.fence)
+            .map_err(|error| PipelineError::Source(error.to_string()))?;
+        if let Some(event) = load_schema_event(
+            client,
+            self.fence.pipeline_id,
+            plan.source_position.lsn,
+            u64::from(plan.source_xid),
+        )
+        .await
+        .map_err(|error| PipelineError::Target(error.to_string()))?
+            && event.state == SchemaEventState::Completed
+        {
+            if event.topology_generation != self.fence.topology_generation
+                || event.event_id != replay_record.event_id
+                || event.schema_fingerprint != replay_record.schema_fingerprint
+            {
+                return Err(PipelineError::Target(
+                    "completed schema-event replay identity does not match the WAL transaction"
+                        .to_owned(),
+                ));
+            }
+            return Ok(Some(PreparedSchemaBarrier::ReplayCompleted));
         }
         let command_tag = plan.changes.iter().find_map(|change| match change {
             crate::schema_transition::OrderedSchemaChange::Ddl { message, .. } => {
@@ -785,6 +918,7 @@ impl CloudberryTransactionSink {
             .registry
             .active_schemas()
             .map_err(|error| PipelineError::Target(error.to_string()))?;
+        plan.resolve_managed_schema_scope(&before);
         let active_generations = self
             .registry
             .active_table_generations()
@@ -821,7 +955,6 @@ impl CloudberryTransactionSink {
             source_xid: u64::from(prepared.event.plan.source_xid),
         };
         if prepared.capability.is_table_local()
-            && !prepared.capability.actions.is_empty()
             && prepared
                 .capability
                 .actions
@@ -922,7 +1055,12 @@ impl CloudberryTransactionSink {
                 end_seq: chunk.end_seq,
                 digest: chunk.digest,
             };
-            let tables = build_chunk_tables(&self.registry, &chunk)?;
+            let tables = build_chunk_tables(
+                &self.registry,
+                &chunk,
+                transaction.final_position.lsn,
+                &self.replay_fences,
+            )?;
             let request = LedgeredDataChunkRequest {
                 fence: self.fence,
                 manifest: manifest.clone(),
@@ -980,6 +1118,39 @@ impl CloudberryTransactionSink {
             next_seq = durable_next;
         }
     }
+
+    fn can_apply_atomic_batch(&self, batch: &TransactionBatch) -> bool {
+        !batch.has_generation_barrier()
+            && self.replay_fences.is_empty()
+            && batch.row_count() <= self.chunk_limits.max_records
+            && batch.estimated_bytes() <= self.chunk_limits.max_bytes
+    }
+
+    async fn apply_atomic_batch(
+        &self,
+        client: &mut Client,
+        batch: &TransactionBatch,
+    ) -> Result<(), PipelineError> {
+        let request = build_apply_request_scoped(
+            self.fence,
+            &self.slot_name,
+            &self.registry,
+            &self.ddl_scope,
+            batch,
+        )?;
+        let outcome = match &self.commit_observer {
+            Some(observer) => {
+                execute_atomic_apply_observed(client, &request, observer.as_ref()).await
+            }
+            None => execute_atomic_apply(client, &request).await,
+        }
+        .map_err(|error| PipelineError::Target(error.to_string()))?;
+        match outcome {
+            AtomicApplyOutcome::Applied(_) | AtomicApplyOutcome::AlreadyCheckpointed { .. } => {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn validate_chunk_step(
@@ -1030,8 +1201,11 @@ impl TransactionSink for CloudberryTransactionSink {
         let finalizer = match schema {
             Some(PreparedSchemaBarrier::Block(barrier)) => return Err(barrier),
             Some(PreparedSchemaBarrier::CompleteNoop(finalizer)) => Some(finalizer),
-            None => None,
+            Some(PreparedSchemaBarrier::ReplayCompleted) | None => None,
         };
+        if finalizer.is_none() && self.can_apply_atomic_batch(batch) {
+            return self.apply_atomic_batch(&mut client, batch).await;
+        }
         for transaction in batch.transactions() {
             self.apply_transaction(
                 &mut client,
@@ -1324,8 +1498,10 @@ mod tests {
         let spool_chunk = &spool_chunks[1];
         let registry =
             TableBindingRegistry::new([binding(7, 3, "items", "items", "stage_items")]).unwrap();
-        let memory_tables = build_chunk_tables(&registry, memory_chunk).unwrap();
-        let spool_tables = build_chunk_tables(&registry, spool_chunk).unwrap();
+        let memory_tables =
+            build_chunk_tables(&registry, memory_chunk, PgLsn::new(20), &BTreeMap::new()).unwrap();
+        let spool_tables =
+            build_chunk_tables(&registry, spool_chunk, PgLsn::new(20), &BTreeMap::new()).unwrap();
         let fence = fence();
 
         assert_eq!(
@@ -1374,7 +1550,8 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        let tables = build_chunk_tables(&registry, &chunk).unwrap();
+        let tables =
+            build_chunk_tables(&registry, &chunk, PgLsn::new(20), &BTreeMap::new()).unwrap();
 
         assert_eq!((chunk.start_seq, chunk.end_seq), (1, 2));
         assert_eq!(tables.len(), 1);
@@ -1385,6 +1562,48 @@ mod tests {
         );
         assert_eq!(tables[0].rows[0].old_key, Some(vec![text("2")]));
         assert_eq!(tables[0].rows[0].cells, [text("3"), text("second")]);
+    }
+
+    #[test]
+    fn replay_fence_skips_snapshotted_rows_and_preserves_unrelated_tables() {
+        let registry = TableBindingRegistry::new([
+            binding(7, 3, "items", "items", "stage_items"),
+            binding(8, 1, "orders", "orders", "stage_orders"),
+        ])
+        .unwrap();
+        let committed = CommittedTransaction::from(transaction(
+            20,
+            vec![
+                insert(7, 9, "1", "already snapshotted"),
+                insert(8, 1, "2", "must replay"),
+            ],
+        ));
+        let chunk = committed
+            .change_source
+            .chunks_from(
+                0,
+                ChunkLimits {
+                    max_records: 10,
+                    max_bytes: 1024,
+                },
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let fences = BTreeMap::from([(7, PgLsn::new(30))]);
+
+        let before = build_chunk_tables(&registry, &chunk, PgLsn::new(20), &fences).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].identity.source_relation_id, 8);
+
+        let after = build_chunk_tables(&registry, &chunk, PgLsn::new(40), &fences).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(
+            after
+                .iter()
+                .any(|table| table.identity.source_relation_id == 7)
+        );
     }
 
     #[test]

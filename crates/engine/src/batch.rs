@@ -16,7 +16,7 @@ pub struct BatchLimits {
 impl Default for BatchLimits {
     fn default() -> Self {
         Self {
-            max_rows: 10_000,
+            max_rows: 100_000,
             max_bytes: 16 * 1024 * 1024,
             max_delay: Duration::from_millis(250),
         }
@@ -157,6 +157,13 @@ impl Batcher {
         self.pending_bytes = self.pending_bytes.saturating_add(bytes);
         self.pending_has_generation_barrier = barrier;
         self.pending.push(transaction);
+        if full.is_none()
+            && (self.pending_rows >= self.limits.max_rows
+                || self.pending_bytes >= self.limits.max_bytes
+                || (self.pending_rows == 0 && self.pending.len() >= self.limits.max_rows))
+        {
+            return Ok(Some(self.take_pending()));
+        }
         Ok(full)
     }
 
@@ -227,9 +234,13 @@ impl Batcher {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use chrono::Utc;
     use cloudberry_etl_core::{
-        change::{DdlMessage, SourcePosition, SourceTransaction, TransactionChange},
+        change::{
+            Cell, DdlMessage, RowChange, SourcePosition, SourceTransaction, TableChange,
+            TransactionChange, Tuple,
+        },
         lsn::PgLsn,
     };
 
@@ -237,6 +248,18 @@ mod tests {
 
     fn transaction(lsn: u64, changes: Vec<TransactionChange>) -> SourceTransaction {
         transaction_at(1, 9, 1, lsn, changes)
+    }
+
+    fn row_change(value: u8) -> TransactionChange {
+        TransactionChange::Row(TableChange {
+            relation_id: 7,
+            generation: 1,
+            change: RowChange::Insert {
+                new: Tuple {
+                    cells: vec![Cell::Text(Bytes::from(vec![value]))],
+                },
+            },
+        })
     }
 
     fn transaction_at(
@@ -416,9 +439,31 @@ mod tests {
         })
         .unwrap();
         assert!(batcher.push(transaction(1, vec![])).unwrap().is_none());
-        assert!(batcher.push(transaction(2, vec![])).unwrap().is_none());
-        let full = batcher.push(transaction(3, vec![])).unwrap().unwrap();
+        let full = batcher.push(transaction(2, vec![])).unwrap().unwrap();
         assert_eq!(full.transactions().len(), 2);
         assert_eq!(full.row_count(), 0);
+        assert!(batcher.push(transaction(3, vec![])).unwrap().is_none());
+    }
+
+    #[test]
+    fn flushes_immediately_when_a_row_limit_is_reached_exactly() {
+        let mut batcher = Batcher::new(BatchLimits {
+            max_rows: 2,
+            max_bytes: 1024,
+            max_delay: Duration::from_secs(30),
+        })
+        .unwrap();
+        assert!(
+            batcher
+                .push(transaction(1, vec![row_change(1)]))
+                .unwrap()
+                .is_none()
+        );
+        let full = batcher
+            .push(transaction(2, vec![row_change(2)]))
+            .unwrap()
+            .expect("the exact row limit flushes without waiting for a timer");
+        assert_eq!(full.row_count(), 2);
+        assert!(batcher.is_empty());
     }
 }

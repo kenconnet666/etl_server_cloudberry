@@ -5,6 +5,6 @@ mod pgoutput;
 
 pub use cloudberry::{
     AdapterConfigError, CloudberryTransactionSink, DdlScope, TableBinding, TableBindingRegistry,
-    build_apply_request, build_apply_request_scoped,
+    TableReplayFence, build_apply_request, build_apply_request_scoped,
 };
 pub use pgoutput::{PgOutputTransactionSource, SourceIngestObserver, SourceIngestPoint};

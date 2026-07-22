@@ -143,6 +143,60 @@ impl SchemaTransactionPlan {
         self.terminal_relations.keys().copied().collect()
     }
 
+    /// Resolve relation-less DDL with a known schema to the managed tables in that schema.
+    ///
+    /// Type, domain, and collation DDL may not carry a relation OID even though it can change the
+    /// row type of every dependent table. Until the catalog dependency graph is available, all
+    /// managed tables in the affected schema form a conservative table-local dependency closure.
+    /// A relation-less event without a schema remains globally unknown and therefore fail-closed.
+    pub fn resolve_managed_schema_scope(&mut self, before: &BTreeMap<u32, TableSchema>) {
+        if !self.unknown_scope {
+            return;
+        }
+
+        let mut unknown_schema_ordinals = BTreeMap::<&str, u64>::new();
+        let mut has_globally_unknown_change = false;
+        for change in &self.changes {
+            let OrderedSchemaChange::Ddl { ordinal, message } = change else {
+                continue;
+            };
+            if !message.relation_ids.is_empty() {
+                continue;
+            }
+            if message.affected_schemas.is_empty() {
+                has_globally_unknown_change = true;
+                continue;
+            }
+            for schema in &message.affected_schemas {
+                unknown_schema_ordinals
+                    .entry(schema)
+                    .and_modify(|last| *last = (*last).max(*ordinal))
+                    .or_insert(*ordinal);
+            }
+        }
+
+        for (relation_id, schema) in before {
+            let Some(last_ordinal) = unknown_schema_ordinals.get(schema.name.schema.as_str())
+            else {
+                continue;
+            };
+            let replace = self
+                .terminal_relations
+                .get(relation_id)
+                .is_none_or(|state| state.last_ordinal() <= *last_ordinal);
+            if replace {
+                self.terminal_relations.insert(
+                    *relation_id,
+                    CapturedRelationState::Unknown {
+                        last_ordinal: *last_ordinal,
+                    },
+                );
+                self.reload_relations.insert(*relation_id);
+            }
+        }
+        self.unknown_scope = has_globally_unknown_change;
+    }
+
     #[must_use]
     pub fn command_summary(&self) -> String {
         let mut tags = self.changes.iter().map(|change| match change {
@@ -361,13 +415,6 @@ pub fn plan_schema_capabilities(
     if validation.unknown_scope {
         blockers.push(CapabilityBlocker::UnknownScope);
     }
-    blockers.extend(
-        validation
-            .mismatches
-            .iter()
-            .cloned()
-            .map(|mismatch| CapabilityBlocker::CatalogMismatch { mismatch }),
-    );
     if !blockers.is_empty() {
         return Ok(SchemaCapabilityPlan {
             actions: BTreeMap::new(),
@@ -379,6 +426,12 @@ pub fn plan_schema_capabilities(
         .unverifiable_relations
         .iter()
         .copied()
+        .chain(
+            validation
+                .mismatches
+                .iter()
+                .map(|mismatch| mismatch.relation_id),
+        )
         .collect::<BTreeSet<_>>();
     let mut actions = BTreeMap::new();
     for (relation_id, captured) in &plan.terminal_relations {
@@ -421,9 +474,12 @@ pub fn plan_schema_capabilities(
                             reason: ReloadReason::UnsafeDiff,
                         }
                     } else if transitions.iter().all(TransitionKind::is_online_safe) {
-                        SchemaAction::Online {
-                            transitions,
+                        // Classification alone is not a target capability proof. Until each
+                        // Cloudberry AOCO ALTER path has its own crash-safe executor, keep the
+                        // production action table-local but rebuild it through a typed shadow.
+                        SchemaAction::Reload {
                             after: after.clone(),
+                            reason: ReloadReason::ExplicitFallback,
                         }
                     } else {
                         SchemaAction::Reload {
@@ -518,27 +574,26 @@ where
         load_current_relation_schemas(source, &options.metadata_schema, &plan.relation_ids())
             .await?;
     let catalog_validation = plan.validate_catalog(&current)?;
-    let capability =
-        if catalog_validation.unknown_scope || !catalog_validation.mismatches.is_empty() {
-            plan_schema_capabilities(
-                &plan,
-                &catalog_validation,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            )?
-        } else {
-            let present_ids = current
-                .iter()
-                .filter_map(|(relation_id, state)| state.as_ref().map(|_| *relation_id))
-                .collect::<Vec<_>>();
-            let full = load_tables_by_relation_ids(source, options, &present_ids).await?;
-            let after = plan
-                .relation_ids()
-                .into_iter()
-                .map(|relation_id| (relation_id, full.get(&relation_id).cloned()))
-                .collect();
-            plan_schema_capabilities(&plan, &catalog_validation, before, &after)?
-        };
+    let capability = if catalog_validation.unknown_scope {
+        plan_schema_capabilities(
+            &plan,
+            &catalog_validation,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )?
+    } else {
+        let present_ids = current
+            .iter()
+            .filter_map(|(relation_id, state)| state.as_ref().map(|_| *relation_id))
+            .collect::<Vec<_>>();
+        let full = load_tables_by_relation_ids(source, options, &present_ids).await?;
+        let after = plan
+            .relation_ids()
+            .into_iter()
+            .map(|relation_id| (relation_id, full.get(&relation_id).cloned()))
+            .collect();
+        plan_schema_capabilities(&plan, &catalog_validation, before, &after)?
+    };
     let record = plan.schema_event_record(fence)?;
     let target_transaction = target.transaction().await?;
     let record_outcome = record_schema_event_in_transaction(&target_transaction, &record).await?;
@@ -1197,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_plan_selects_online_reload_drop_add_and_noop() {
+    fn capability_plan_defaults_online_candidates_to_reload_drop_add_and_noop() {
         let mut add_column = ddl(42, "after", snapshot(42, "description"));
         add_column.transitions[0].kind = TransitionKind::AddColumn {
             name: "note".to_owned(),
@@ -1218,11 +1273,13 @@ mod tests {
         let after = BTreeMap::from([(42, Some(after_schema.clone()))]);
         let capability = plan_schema_capabilities(&plan, &validation, &before, &after).unwrap();
         assert!(capability.is_table_local());
-        assert_eq!(capability.action_summary(), "online=1");
+        assert_eq!(capability.action_summary(), "reload=1");
         assert!(matches!(
             capability.actions.get(&42),
-            Some(SchemaAction::Online { transitions, after })
-                if transitions.len() == 1 && after == &after_schema
+            Some(SchemaAction::Reload {
+                after,
+                reason: ReloadReason::ExplicitFallback,
+            }) if after == &after_schema
         ));
 
         let add = plan_schema_capabilities(
@@ -1374,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_plan_keeps_unknown_relations_local_but_blocks_unknown_scope_and_drift() {
+    fn capability_plan_coalesces_relation_drift_but_blocks_unknown_scope() {
         let legacy = DdlMessage {
             version: 1,
             command_tag: "ALTER TABLE".to_owned(),
@@ -1406,6 +1463,30 @@ mod tests {
             })
         ));
 
+        let rapid = plan_schema_capabilities(
+            &plan,
+            &CatalogValidation {
+                matched_relations: Vec::new(),
+                unverifiable_relations: Vec::new(),
+                mismatches: vec![CatalogMismatch {
+                    relation_id: 42,
+                    kind: CatalogMismatchKind::DifferentPresentState,
+                }],
+                unknown_scope: false,
+            },
+            &BTreeMap::from([(42, table(42, &[("id", false)]))]),
+            &BTreeMap::from([(42, Some(table(42, &[("id", false), ("note", true)])))]),
+        )
+        .unwrap();
+        assert!(rapid.is_table_local());
+        assert!(matches!(
+            rapid.actions.get(&42),
+            Some(SchemaAction::Reload {
+                reason: ReloadReason::UnverifiableEvent,
+                ..
+            })
+        ));
+
         let blocked = plan_schema_capabilities(
             &plan,
             &CatalogValidation {
@@ -1423,7 +1504,91 @@ mod tests {
         .unwrap();
         assert!(!blocked.is_table_local());
         assert!(blocked.actions.is_empty());
-        assert_eq!(blocked.action_summary(), "blocked(2)");
+        assert_eq!(blocked.action_summary(), "blocked(1)");
         assert!(serde_json::to_value(&blocked).is_ok());
+    }
+
+    #[test]
+    fn schema_scoped_unknown_ddl_expands_only_to_managed_tables_in_that_schema() {
+        let message = DdlMessage {
+            version: 2,
+            command_tag: "ALTER TYPE".to_owned(),
+            relation_ids: Vec::new(),
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "enum-v2".to_owned(),
+            transitions: Vec::new(),
+        };
+        let mut plan = plan_schema_transaction(&committed(vec![TransactionChange::Ddl(message)]))
+            .unwrap()
+            .unwrap();
+        let mut private = table(84, &[("id", false)]);
+        private.name = QualifiedName::new("private", "items").unwrap();
+        let before = BTreeMap::from([(42, table(42, &[("id", false)])), (84, private)]);
+
+        plan.resolve_managed_schema_scope(&before);
+
+        assert!(!plan.unknown_scope);
+        assert_eq!(plan.relation_ids(), vec![42]);
+        assert_eq!(plan.reload_relations, BTreeSet::from([42]));
+        assert!(matches!(
+            plan.terminal_relations.get(&42),
+            Some(CapturedRelationState::Unknown { last_ordinal: 0 })
+        ));
+    }
+
+    #[test]
+    fn schema_scope_resolution_preserves_later_precise_state_and_global_unknown_scope() {
+        let scoped = DdlMessage {
+            version: 2,
+            command_tag: "ALTER DOMAIN".to_owned(),
+            relation_ids: Vec::new(),
+            affected_schemas: vec!["public".to_owned()],
+            schema_fingerprint: "domain-v2".to_owned(),
+            transitions: Vec::new(),
+        };
+        let global = DdlMessage {
+            version: 1,
+            command_tag: "ALTER COLLATION".to_owned(),
+            relation_ids: Vec::new(),
+            affected_schemas: Vec::new(),
+            schema_fingerprint: "unknown".to_owned(),
+            transitions: Vec::new(),
+        };
+        let mut plan = plan_schema_transaction(&committed(vec![
+            TransactionChange::Ddl(scoped),
+            TransactionChange::Ddl(global),
+        ]))
+        .unwrap()
+        .unwrap();
+        plan.terminal_relations
+            .insert(42, CapturedRelationState::Dropped { last_ordinal: 2 });
+
+        plan.resolve_managed_schema_scope(&BTreeMap::from([(42, table(42, &[("id", false)]))]));
+
+        assert!(plan.unknown_scope);
+        assert!(matches!(
+            plan.terminal_relations.get(&42),
+            Some(CapturedRelationState::Dropped { last_ordinal: 2 })
+        ));
+    }
+
+    #[test]
+    fn schema_scoped_unknown_with_no_managed_tables_becomes_table_local_noop() {
+        let message = DdlMessage {
+            version: 2,
+            command_tag: "ALTER TYPE".to_owned(),
+            relation_ids: Vec::new(),
+            affected_schemas: vec!["unmanaged".to_owned()],
+            schema_fingerprint: "enum-v2".to_owned(),
+            transitions: Vec::new(),
+        };
+        let mut plan = plan_schema_transaction(&committed(vec![TransactionChange::Ddl(message)]))
+            .unwrap()
+            .unwrap();
+
+        plan.resolve_managed_schema_scope(&BTreeMap::from([(42, table(42, &[("id", false)]))]));
+
+        assert!(!plan.unknown_scope);
+        assert!(plan.terminal_relations.is_empty());
     }
 }

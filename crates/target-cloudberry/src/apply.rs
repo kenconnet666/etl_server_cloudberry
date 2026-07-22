@@ -15,7 +15,7 @@ use tokio_postgres::{Client, Transaction};
 use crate::{
     checkpoint::{
         AdvanceOutcome, CheckpointError, NodeCheckpoint, PipelineFence, advance_node_checkpoint,
-        lock_pipeline_fence,
+        checkpoint_reached, load_node_checkpoint_locked, lock_pipeline_fence,
     },
     chunk::{
         ChunkLedgerError, DataChunkIdentity, PrepareDataChunkOutcome,
@@ -91,6 +91,7 @@ pub enum LedgeredCommitPhase {
 pub enum LedgeredCommitKind {
     DataChunk { final_chunk: bool },
     EmptyTransaction,
+    AtomicBatch,
 }
 
 pub trait LedgeredCommitObserver: Send + Sync {
@@ -155,6 +156,7 @@ pub struct ApplyPlan {
     pub copy_layout: CopyLayout,
     pub create_staging_sql: String,
     pub copy_sql: String,
+    pub direct_insert_copy_sql: String,
     pub validation_sql: String,
     pub materialize_moves_sql: Option<String>,
     pub delete_sql: String,
@@ -166,6 +168,8 @@ pub struct ApplyPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageOperation {
+    /// A source INSERT whose key was absent at the preceding durable source position.
+    Insert,
     Upsert,
     Delete,
     Move,
@@ -261,6 +265,15 @@ pub struct ApplyOutcome {
     pub checkpoint: AdvanceOutcome,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicApplyOutcome {
+    Applied(ApplyOutcome),
+    /// The target checkpoint already covers the complete atomic batch and no DML ran.
+    AlreadyCheckpointed {
+        applied_lsn: cloudberry_etl_core::lsn::PgLsn,
+    },
+}
+
 /// Applies all table batches and the node checkpoint in one Cloudberry transaction.
 ///
 /// Returning success means the transaction committed and the caller may ACK the
@@ -273,7 +286,7 @@ pub async fn execute_apply(
     let transaction = client.transaction().await?;
     let identities = table_identities(&request.tables);
     lock_active_apply_tables(&transaction, request.fence, &identities).await?;
-    let stats = apply_tables(&transaction, &request.tables).await?;
+    let stats = apply_tables(&transaction, &request.tables, false).await?;
     let checkpoint =
         advance_node_checkpoint(&transaction, request.fence, &request.checkpoint).await?;
     transaction.commit().await?;
@@ -285,6 +298,60 @@ pub async fn execute_apply(
         inserted_rows: stats.inserted_rows,
         checkpoint,
     })
+}
+
+/// Applies a bounded group of complete source transactions in one target transaction.
+///
+/// The checkpoint is locked and classified before DML. This makes direct INSERT COPY safe when a
+/// target COMMIT succeeded but its response was lost: replay observes the durable final LSN and
+/// skips the complete group before any row can be appended again.
+pub async fn execute_atomic_apply(
+    client: &mut Client,
+    request: &ApplyRequest,
+) -> Result<AtomicApplyOutcome, ApplyError> {
+    execute_atomic_apply_inner(client, request, &NOOP_LEDGERED_COMMIT_OBSERVER).await
+}
+
+pub async fn execute_atomic_apply_observed(
+    client: &mut Client,
+    request: &ApplyRequest,
+    observer: &dyn LedgeredCommitObserver,
+) -> Result<AtomicApplyOutcome, ApplyError> {
+    execute_atomic_apply_inner(client, request, observer).await
+}
+
+async fn execute_atomic_apply_inner(
+    client: &mut Client,
+    request: &ApplyRequest,
+    observer: &dyn LedgeredCommitObserver,
+) -> Result<AtomicApplyOutcome, ApplyError> {
+    validate_request(request)?;
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, request.fence).await?;
+    let current = load_node_checkpoint_locked(&transaction, request.checkpoint.key).await?;
+    if checkpoint_reached(current.as_ref(), &request.checkpoint)? {
+        let applied_lsn = current
+            .expect("a reached checkpoint must exist")
+            .checkpoint
+            .applied_lsn;
+        transaction.rollback().await?;
+        return Ok(AtomicApplyOutcome::AlreadyCheckpointed { applied_lsn });
+    }
+
+    let identities = table_identities(&request.tables);
+    lock_active_apply_tables(&transaction, request.fence, &identities).await?;
+    let stats = apply_tables(&transaction, &request.tables, true).await?;
+    let checkpoint =
+        advance_node_checkpoint(&transaction, request.fence, &request.checkpoint).await?;
+    commit_observed(transaction, observer, LedgeredCommitKind::AtomicBatch).await?;
+    Ok(AtomicApplyOutcome::Applied(ApplyOutcome {
+        staged_rows: stats.staged_rows,
+        deleted_rows: stats.deleted_rows,
+        moved_rows: stats.moved_rows,
+        updated_rows: stats.updated_rows,
+        inserted_rows: stats.inserted_rows,
+        checkpoint,
+    }))
 }
 
 /// Applies a bounded source-transaction chunk with its durable receipt.
@@ -355,7 +422,10 @@ async fn execute_ledgered_data_chunk_inner(
             let identities = table_identities(&request.tables);
             lock_active_apply_tables(&transaction, request.fence, &identities).await?;
             record_data_chunk(&transaction, prepared).await?;
-            let stats = apply_tables(&transaction, &request.tables).await?;
+            // `prepare_data_chunk` proved this immutable chunk has no durable receipt yet. Pure
+            // source INSERT batches can therefore append directly; a lost COMMIT response is
+            // resolved by the receipt on retry before this branch can run again.
+            let stats = apply_tables(&transaction, &request.tables, true).await?;
             finish_ledgered_data_chunk(
                 transaction,
                 request,
@@ -592,41 +662,7 @@ pub async fn execute_ledgered_completion(
 }
 
 pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>, ApplyError> {
-    if row.cells.len() != plan.table.columns.len() {
-        return Err(ApplyError::InvalidRowArity {
-            expected: plan.table.columns.len(),
-            actual: row.cells.len(),
-        });
-    }
-    for (column, cell) in plan.table.columns.iter().zip(&row.cells) {
-        if column.primary_key_ordinal.is_some() && matches!(cell, Cell::Null | Cell::UnchangedToast)
-        {
-            return Err(ApplyError::MissingPrimaryKey(column.name.clone()));
-        }
-    }
-
-    match (row.operation, row.old_key.as_deref()) {
-        (StageOperation::Move, None) => return Err(ApplyError::MissingOldPrimaryKey),
-        (StageOperation::Upsert | StageOperation::Delete, Some(_)) => {
-            return Err(ApplyError::UnexpectedOldPrimaryKey);
-        }
-        _ => {}
-    }
-    if let Some(old_key) = &row.old_key {
-        if old_key.len() != plan.copy_layout.old_key_columns.len() {
-            return Err(ApplyError::InvalidOldKeyArity {
-                expected: plan.copy_layout.old_key_columns.len(),
-                actual: old_key.len(),
-            });
-        }
-        for (column, cell) in plan.copy_layout.old_key_columns.iter().zip(old_key) {
-            if matches!(cell, Cell::Null | Cell::UnchangedToast) {
-                return Err(ApplyError::MissingOldPrimaryKeyColumn(
-                    column.source_column_name.clone(),
-                ));
-            }
-        }
-    }
+    validate_staging_row(plan, row)?;
 
     let mut fields = Vec::with_capacity(
         2 + plan.copy_layout.data_columns.len()
@@ -634,7 +670,7 @@ pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>,
             + plan.copy_layout.old_key_columns.len(),
     );
     fields.push(Cell::Text(Bytes::from_static(match row.operation {
-        StageOperation::Upsert => b"U",
+        StageOperation::Insert | StageOperation::Upsert => b"U",
         StageOperation::Delete => b"D",
         StageOperation::Move => b"M",
     })));
@@ -659,6 +695,44 @@ pub fn encode_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<Vec<u8>,
         None => fields.extend(plan.copy_layout.old_key_columns.iter().map(|_| Cell::Null)),
     }
     encode_row(&fields).map_err(ApplyError::from)
+}
+
+fn validate_staging_row(plan: &ApplyPlan, row: &StagingRow) -> Result<(), ApplyError> {
+    if row.cells.len() != plan.table.columns.len() {
+        return Err(ApplyError::InvalidRowArity {
+            expected: plan.table.columns.len(),
+            actual: row.cells.len(),
+        });
+    }
+    for (column, cell) in plan.table.columns.iter().zip(&row.cells) {
+        if column.primary_key_ordinal.is_some() && matches!(cell, Cell::Null | Cell::UnchangedToast)
+        {
+            return Err(ApplyError::MissingPrimaryKey(column.name.clone()));
+        }
+    }
+    match (row.operation, row.old_key.as_deref()) {
+        (StageOperation::Move, None) => return Err(ApplyError::MissingOldPrimaryKey),
+        (StageOperation::Insert | StageOperation::Upsert | StageOperation::Delete, Some(_)) => {
+            return Err(ApplyError::UnexpectedOldPrimaryKey);
+        }
+        _ => {}
+    }
+    if let Some(old_key) = &row.old_key {
+        if old_key.len() != plan.copy_layout.old_key_columns.len() {
+            return Err(ApplyError::InvalidOldKeyArity {
+                expected: plan.copy_layout.old_key_columns.len(),
+                actual: old_key.len(),
+            });
+        }
+        for (column, cell) in plan.copy_layout.old_key_columns.iter().zip(old_key) {
+            if matches!(cell, Cell::Null | Cell::UnchangedToast) {
+                return Err(ApplyError::MissingOldPrimaryKeyColumn(
+                    column.source_column_name.clone(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_request(request: &ApplyRequest) -> Result<(), ApplyError> {
@@ -694,10 +768,32 @@ fn table_identities(tables: &[TableApplyBatch]) -> Vec<&TableApplyIdentity> {
 async fn apply_tables(
     transaction: &Transaction<'_>,
     tables: &[TableApplyBatch],
+    allow_direct_insert: bool,
 ) -> Result<ApplyStats, ApplyError> {
     let mut stats = ApplyStats::default();
     for table in tables {
         if table.rows.is_empty() {
+            continue;
+        }
+        if allow_direct_insert
+            && table
+                .rows
+                .iter()
+                .all(|row| row.operation == StageOperation::Insert)
+        {
+            validate_unique_batch_keys(&table.plan, &table.rows)?;
+            let sink = transaction
+                .copy_in(&table.plan.direct_insert_copy_sql)
+                .await?;
+            let mut sink = std::pin::pin!(sink);
+            for row in &table.rows {
+                validate_staging_row(&table.plan, row)?;
+                sink.send(Bytes::from(crate::copy::encode_row(&row.cells)?))
+                    .await?;
+            }
+            let copied = sink.finish().await?;
+            stats.staged_rows = stats.staged_rows.saturating_add(copied);
+            stats.inserted_rows = stats.inserted_rows.saturating_add(copied);
             continue;
         }
         transaction
@@ -711,6 +807,37 @@ async fn apply_tables(
         }
         let copied = sink.finish().await?;
         stats.staged_rows = stats.staged_rows.saturating_add(copied);
+
+        let all_deletes = table
+            .rows
+            .iter()
+            .all(|row| row.operation == StageOperation::Delete);
+        if all_deletes {
+            validate_unique_batch_keys(&table.plan, &table.rows)?;
+            stats.deleted_rows = stats
+                .deleted_rows
+                .saturating_add(transaction.execute(&table.plan.delete_sql, &[]).await?);
+            continue;
+        }
+        let all_complete_upserts = table.rows.iter().all(|row| {
+            row.operation == StageOperation::Upsert
+                && row
+                    .cells
+                    .iter()
+                    .all(|cell| !matches!(cell, Cell::UnchangedToast))
+        });
+        if all_complete_upserts {
+            validate_unique_batch_keys(&table.plan, &table.rows)?;
+            if let Some(update_sql) = &table.plan.update_sql {
+                stats.updated_rows = stats
+                    .updated_rows
+                    .saturating_add(transaction.execute(update_sql, &[]).await?);
+            }
+            stats.inserted_rows = stats
+                .inserted_rows
+                .saturating_add(transaction.execute(&table.plan.insert_sql, &[]).await?);
+            continue;
+        }
 
         let invalid: bool = transaction
             .query_one(&table.plan.validation_sql, &[])
@@ -745,6 +872,29 @@ async fn apply_tables(
             .saturating_add(transaction.execute(&table.plan.insert_sql, &[]).await?);
     }
     Ok(stats)
+}
+
+fn validate_unique_batch_keys(plan: &ApplyPlan, rows: &[StagingRow]) -> Result<(), ApplyError> {
+    let mut key_columns = plan
+        .table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| column.primary_key_ordinal.map(|ordinal| (ordinal, index)))
+        .collect::<Vec<_>>();
+    key_columns.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    let mut keys = HashSet::with_capacity(rows.len());
+    for row in rows {
+        validate_staging_row(plan, row)?;
+        let cells = key_columns
+            .iter()
+            .map(|(_, index)| row.cells[*index].clone())
+            .collect::<Vec<_>>();
+        if !keys.insert(encode_row(&cells)?) {
+            return Err(ApplyError::InvalidBatch(plan.table.target.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Plans a typed temporary staging table and colocated current-state apply SQL.
@@ -878,6 +1028,18 @@ pub fn plan_apply_with_storage(
     let copy_sql = format!(
         "COPY {quoted_staging} ({}) FROM STDIN WITH (FORMAT text, DELIMITER {}, NULL {})",
         quote_identifier_list(&copy_columns)?,
+        quote_literal("\t")?,
+        quote_literal("\\N")?
+    );
+    let direct_insert_copy_sql = format!(
+        "COPY {quoted_target} ({}) FROM STDIN WITH (FORMAT text, DELIMITER {}, NULL {})",
+        quote_identifier_list(
+            &table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+        )?,
         quote_literal("\t")?,
         quote_literal("\\N")?
     );
@@ -1080,6 +1242,7 @@ pub fn plan_apply_with_storage(
         },
         create_staging_sql,
         copy_sql,
+        direct_insert_copy_sql,
         validation_sql,
         materialize_moves_sql,
         delete_sql,
@@ -1186,6 +1349,10 @@ mod tests {
                 .ends_with("DISTRIBUTED BY (\"id\", \"tenant\")")
         );
         assert!(plan.copy_sql.starts_with("COPY \"stage_orders\""));
+        assert!(
+            plan.direct_insert_copy_sql
+                .starts_with("COPY \"target\".\"orders\" (\"tenant\", \"id\", \"payload\")")
+        );
         assert_eq!(plan.copy_layout.presence_columns.len(), 1);
         assert_eq!(
             plan.copy_layout
@@ -1313,6 +1480,24 @@ mod tests {
         .unwrap();
         assert_eq!(unchanged, b"U\t1\t\\N\tf\tf\t\\N\n");
         assert_eq!(explicit_null, b"U\t1\t\\N\tt\tf\t\\N\n");
+        let inserted = StagingRow {
+            operation: StageOperation::Insert,
+            cells: vec![
+                Cell::Text(Bytes::from_static(b"2")),
+                Cell::Text(Bytes::from_static(b"inserted")),
+            ],
+            old_key: None,
+        };
+        assert!(
+            encode_staging_row(&plan, &inserted)
+                .unwrap()
+                .starts_with(b"U\t2\tinserted")
+        );
+        assert!(validate_unique_batch_keys(&plan, std::slice::from_ref(&inserted)).is_ok());
+        assert!(matches!(
+            validate_unique_batch_keys(&plan, &[inserted.clone(), inserted]),
+            Err(ApplyError::InvalidBatch(_))
+        ));
     }
 
     #[test]

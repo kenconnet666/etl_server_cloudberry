@@ -395,6 +395,97 @@ pub async fn activate_table_snapshot_group_in_transaction(
     })
 }
 
+/// Atomically removes one dropped source relation from the active target set by moving its
+/// physical table into deterministic quarantine. The schema-event ID is used as the durable
+/// reconciliation identity, so cleanup remains subject to the normal retention and OID checks.
+pub async fn quarantine_active_table_in_transaction(
+    transaction: &Transaction<'_>,
+    fence: crate::checkpoint::PipelineFence,
+    schema_event_id: Uuid,
+    source_relation_id: u32,
+    table_generation: u64,
+) -> Result<QualifiedName, SnapshotTargetError> {
+    if schema_event_id.is_nil() {
+        return Err(SnapshotTargetError::InvalidSnapshotGroupId);
+    }
+    lock_pipeline_fence(transaction, fence).await?;
+    let sql = format!(
+        "SELECT target_schema, target_table, pipeline_id, snapshot_group_id, relation_oid, source_relation_id, table_generation, schema_fingerprint, state, fencing_token FROM {}.managed_tables WHERE pipeline_id = $1 AND source_relation_id = $2 AND state = 'active' FOR UPDATE",
+        quote_identifier(TARGET_METADATA_SCHEMA)?
+    );
+    let rows = transaction
+        .query(
+            &sql,
+            &[&fence.pipeline_id.as_uuid(), &i64::from(source_relation_id)],
+        )
+        .await?;
+    let [row] = rows.as_slice() else {
+        return Err(SnapshotTargetError::ActiveTableSetMismatch);
+    };
+    let target = QualifiedName::new(
+        row.try_get::<_, String>("target_schema")?,
+        row.try_get::<_, String>("target_table")?,
+    )
+    .map_err(crate::schema::SchemaError::from)?;
+    let record = super::managed_table_record_from_row(&target, row)?;
+    validate_managed_identity(&target, &record, fence.pipeline_id, source_relation_id)?;
+    validate_managed_fence(&target, &record, fence.fencing_token)?;
+    require_state(&target, &record, ManagedTableState::Active)?;
+    if record.table_generation != table_generation {
+        return Err(SnapshotTargetError::ActiveTableGenerationMismatch {
+            table: target.to_string(),
+            expected: table_generation,
+            actual: record.table_generation,
+        });
+    }
+    let expected_oid = record
+        .relation_oid
+        .ok_or_else(|| SnapshotTargetError::MissingRelationIdentity(target.to_string()))?;
+    let actual_oid = relation_oid(transaction, &target)
+        .await?
+        .ok_or_else(|| SnapshotTargetError::ManagedRelationMissing(target.to_string()))?;
+    if actual_oid != expected_oid {
+        return Err(SnapshotTargetError::RelationIdentityMismatch {
+            table: target.to_string(),
+            expected: expected_oid,
+            actual: actual_oid,
+        });
+    }
+
+    let quarantine = quarantine_name(&target, &record)?;
+    if !matches!(
+        load_relation_state(transaction, &quarantine).await?,
+        RelationState::Vacant
+    ) {
+        return Err(SnapshotTargetError::QuarantineNameConflict(
+            quarantine.to_string(),
+        ));
+    }
+    transaction
+        .batch_execute(&rename_table_sql(&target, &quarantine.name)?)
+        .await?;
+    relocate_metadata(
+        transaction,
+        &target,
+        &quarantine,
+        &record,
+        ManagedTableState::Quarantined,
+        fence.fencing_token,
+    )
+    .await?;
+    record_reconciliation_with_identity(
+        transaction,
+        fence,
+        schema_event_id,
+        &target,
+        &quarantine,
+        &record,
+        ReconciliationReason::Stale,
+    )
+    .await?;
+    Ok(quarantine)
+}
+
 async fn load_stale_active_tables(
     transaction: &Transaction<'_>,
     request: &SnapshotActivationRequest,
@@ -496,12 +587,33 @@ async fn record_reconciliation(
     record: &ManagedTableRecord,
     reason: ReconciliationReason,
 ) -> Result<(), SnapshotTargetError> {
+    record_reconciliation_with_identity(
+        transaction,
+        request.fence,
+        request.snapshot_group_id,
+        original,
+        quarantine,
+        record,
+        reason,
+    )
+    .await
+}
+
+async fn record_reconciliation_with_identity(
+    transaction: &Transaction<'_>,
+    fence: crate::checkpoint::PipelineFence,
+    reconciliation_id: Uuid,
+    original: &QualifiedName,
+    quarantine: &QualifiedName,
+    record: &ManagedTableRecord,
+    reason: ReconciliationReason,
+) -> Result<(), SnapshotTargetError> {
     let sql = format!(
         "INSERT INTO {}.snapshot_reconciliation_log (snapshot_group_id, original_schema, original_table, quarantine_schema, quarantine_table, quarantine_relation_oid, pipeline_id, topology_generation, source_relation_id, previous_snapshot_group_id, table_generation, schema_fingerprint, reason, previous_fencing_token, fencing_token) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         quote_identifier(TARGET_METADATA_SCHEMA)?
     );
-    let pipeline_id = request.fence.pipeline_id.as_uuid();
-    let topology_generation = database_generation(request.fence.topology_generation)?;
+    let pipeline_id = fence.pipeline_id.as_uuid();
+    let topology_generation = database_generation(fence.topology_generation)?;
     let source_relation_id = i64::from(record.source_relation_id);
     let table_generation = database_generation(record.table_generation)?;
     let reason = reason.as_str();
@@ -509,7 +621,7 @@ async fn record_reconciliation(
         .execute(
             &sql,
             &[
-                &request.snapshot_group_id,
+                &reconciliation_id,
                 &original.schema,
                 &original.name,
                 &quarantine.schema,
@@ -523,7 +635,7 @@ async fn record_reconciliation(
                 &record.schema_fingerprint,
                 &reason,
                 &record.fencing_token,
-                &request.fence.fencing_token,
+                &fence.fencing_token,
             ],
         )
         .await?;
@@ -634,13 +746,11 @@ pub async fn validate_active_tables(
     requirements.sort_by(|left, right| {
         (&left.target.schema, &left.target.name).cmp(&(&right.target.schema, &right.target.name))
     });
-    if requirements.is_empty()
-        || requirements.iter().any(|requirement| {
-            requirement.source_relation_id == 0 || requirement.schema_fingerprint.is_empty()
-        })
-        || requirements
-            .windows(2)
-            .any(|pair| pair[0].target == pair[1].target)
+    if requirements.iter().any(|requirement| {
+        requirement.source_relation_id == 0 || requirement.schema_fingerprint.is_empty()
+    }) || requirements
+        .windows(2)
+        .any(|pair| pair[0].target == pair[1].target)
     {
         return Err(SnapshotTargetError::ActiveTableSetMismatch);
     }
@@ -655,7 +765,10 @@ pub async fn validate_active_tables(
         .query(&sql, &[&fence.pipeline_id.as_uuid()])
         .await?;
     if rows.len() != requirements.len() {
-        return Err(SnapshotTargetError::ActiveTableSetMismatch);
+        return Err(SnapshotTargetError::ActiveTableCountMismatch {
+            expected: requirements.len(),
+            actual: rows.len(),
+        });
     }
     let mut active = Vec::with_capacity(rows.len());
     for (requirement, row) in requirements.iter().zip(rows) {
@@ -665,7 +778,10 @@ pub async fn validate_active_tables(
         )
         .map_err(crate::schema::SchemaError::from)?;
         if target != requirement.target {
-            return Err(SnapshotTargetError::ActiveTableSetMismatch);
+            return Err(SnapshotTargetError::ActiveTableTargetMismatch {
+                expected: requirement.target.to_string(),
+                actual: target.to_string(),
+            });
         }
         let record = super::managed_table_record_from_row(&target, &row)?;
         validate_managed_identity(
