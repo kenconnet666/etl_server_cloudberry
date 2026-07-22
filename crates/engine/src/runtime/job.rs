@@ -1,7 +1,7 @@
 //! Concrete PostgreSQL 18 to Cloudberry pipeline job.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr as _,
     sync::Arc,
@@ -46,11 +46,17 @@ use cloudberry_etl_target_cloudberry::{
     snapshot::{
         ActiveTableRequirement, QuarantineGcPolicy, SnapshotActivationRequest,
         SnapshotPageCommitObserver, SnapshotTargetError, SnapshotTargetPlan,
-        activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group, begin_snapshot_pages,
-        cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables,
-        plan_snapshot_target_with_storage, validate_active_tables,
+        activate_snapshot_group, adopt_table_snapshot_replay_group, begin_snapshot_apply,
+        begin_snapshot_group, begin_snapshot_pages, cleanup_stale_snapshot_groups,
+        garbage_collect_quarantined_tables, load_snapshot_group_manifest,
+        plan_snapshot_target_with_storage, reset_interrupted_table_snapshot_group,
+        validate_active_tables,
     },
     storage::{StorageCapabilityError, load_relation_storage, verify_storage_available},
+    table_transition::{
+        TableTransition, TableTransitionError, TableTransitionState,
+        list_unfinished_table_transitions,
+    },
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -111,6 +117,12 @@ enum RuntimeJobError {
     MissingSchemaEvent { source_lsn: PgLsn, source_xid: u64 },
     #[error("completed schema event {source_lsn}/{source_xid} unexpectedly raised a barrier")]
     CompletedSchemaEventBarrier { source_lsn: PgLsn, source_xid: u64 },
+    #[error("table transition for relation {0} has no recoverable snapshot group")]
+    MissingTableSnapshotGroup(u32),
+    #[error("table snapshot group `{group}` has an invalid standalone source boundary: {reason}")]
+    InvalidTableSnapshotBoundary { group: Uuid, reason: String },
+    #[error("table snapshot group `{0}` must not use the pipeline's main logical slot")]
+    TableSnapshotUsesMainSlot(Uuid),
     #[error("{0} topology is validation-gated and cannot run yet")]
     UnsupportedTopology(&'static str),
     #[error("source endpoint is a standby; a writable primary endpoint is required")]
@@ -193,6 +205,8 @@ enum RuntimeJobError {
     Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
     SchemaEvent(#[from] SchemaEventError),
+    #[error(transparent)]
+    TableTransition(#[from] TableTransitionError),
     #[error(transparent)]
     Snapshot(#[from] SnapshotTargetError),
     #[error(transparent)]
@@ -482,6 +496,9 @@ impl PostgresCloudberryJob {
         self.validate_storage_capabilities(&target).await?;
         migrate_target_database(&mut target).await?;
         activate_pipeline_fence(&target, self.fence).await?;
+        let names = replication_names(self.pipeline_id, STANDALONE_NODE_ID);
+        self.recover_table_snapshot_transitions(&source_setup, &mut target, &report, &names.slot)
+            .await?;
         let stale_groups = cleanup_stale_snapshot_groups(&mut target, self.fence).await?;
         for group in &stale_groups {
             tracing::warn!(
@@ -505,7 +522,6 @@ impl PostgresCloudberryJob {
         }
         self.install_ddl_capture(&source_setup).await?;
 
-        let names = replication_names(self.pipeline_id, STANDALONE_NODE_ID);
         let checkpoint_key = CheckpointKey {
             pipeline_id: self.pipeline_id,
             topology_generation: self.topology_generation,
@@ -762,6 +778,141 @@ impl PostgresCloudberryJob {
                     reason,
                 )
                 .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover_table_snapshot_transitions(
+        &self,
+        source: &tokio_postgres::Client,
+        target: &mut tokio_postgres::Client,
+        report: &PreflightReport,
+        main_slot: &str,
+    ) -> Result<(), RuntimeJobError> {
+        let transitions = list_unfinished_table_transitions(target, self.fence).await?;
+        let mut groups = HashMap::<Uuid, Vec<TableTransition>>::new();
+        for transition in transitions {
+            match transition.snapshot_group_id {
+                Some(group) => groups.entry(group).or_default().push(transition),
+                None if matches!(
+                    transition.state,
+                    TableTransitionState::Snapshotting
+                        | TableTransitionState::CatchingUp
+                        | TableTransitionState::CutoverPending
+                ) =>
+                {
+                    return Err(RuntimeJobError::MissingTableSnapshotGroup(
+                        transition.key.source_relation_id,
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        for (group_id, group_transitions) in groups {
+            let manifest = load_snapshot_group_manifest(target, self.fence, group_id).await?;
+            let [boundary] = manifest.request.initial_checkpoints.as_slice() else {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: format!(
+                        "expected one source node, found {}",
+                        manifest.request.initial_checkpoints.len()
+                    ),
+                });
+            };
+            if boundary.key.node_id != STANDALONE_NODE_ID
+                || boundary.system_identifier != report.identity.system_identifier
+                || boundary.timeline != report.identity.timeline
+                || group_transitions
+                    .iter()
+                    .any(|transition| boundary.applied_lsn < transition.barrier_lsn)
+            {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: format!(
+                        "node={}, system_identifier={}, timeline={}, consistent_lsn={}",
+                        boundary.key.node_id,
+                        boundary.system_identifier,
+                        boundary.timeline,
+                        boundary.applied_lsn
+                    ),
+                });
+            }
+            if boundary.slot_name == main_slot {
+                return Err(RuntimeJobError::TableSnapshotUsesMainSlot(group_id));
+            }
+            if let Some(slot) = inspect_logical_slot(source, &boundary.slot_name).await? {
+                if slot.plugin != "pgoutput" {
+                    return Err(RuntimeJobError::WrongSlotPlugin {
+                        slot: boundary.slot_name.clone(),
+                        plugin: slot.plugin,
+                    });
+                }
+                if slot.active {
+                    return Err(RuntimeJobError::ActiveOrphanSlot {
+                        slot: boundary.slot_name.clone(),
+                    });
+                }
+                if slot.database.as_deref() != Some(self.source.database_name.as_str()) {
+                    return Err(RuntimeJobError::SlotDatabaseMismatch {
+                        slot: boundary.slot_name.clone(),
+                        actual: slot.database,
+                        expected: self.source.database_name.clone(),
+                    });
+                }
+                if slot.temporary || slot.two_phase || slot.failover || slot.synced {
+                    return Err(RuntimeJobError::UnsupportedSlotMode {
+                        slot: boundary.slot_name.clone(),
+                        reason: format!(
+                            "temporary={}, two_phase={}, failover={}, synced={}",
+                            slot.temporary, slot.two_phase, slot.failover, slot.synced
+                        ),
+                    });
+                }
+                drop_logical_slot(source, &boundary.slot_name).await?;
+            }
+
+            let state = group_transitions[0].state;
+            if group_transitions
+                .iter()
+                .any(|transition| transition.state != state)
+            {
+                return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                    group: group_id,
+                    reason: "group transitions are in different states".to_owned(),
+                });
+            }
+            match state {
+                TableTransitionState::Snapshotting => {
+                    let outcome =
+                        reset_interrupted_table_snapshot_group(target, self.fence, group_id)
+                            .await?;
+                    tracing::warn!(
+                        pipeline_id = %self.pipeline_id,
+                        snapshot_group_id = %group_id,
+                        dropped_shadows = outcome.dropped_shadows.len(),
+                        "reset interrupted table snapshot to a fresh source boundary"
+                    );
+                }
+                TableTransitionState::CatchingUp | TableTransitionState::CutoverPending => {
+                    let replay =
+                        adopt_table_snapshot_replay_group(target, self.fence, group_id).await?;
+                    tracing::info!(
+                        pipeline_id = %self.pipeline_id,
+                        snapshot_group_id = %group_id,
+                        consistent_lsn = %boundary.applied_lsn,
+                        status = ?replay.manifest.status,
+                        state = ?replay.transition_state,
+                        "adopted completed table snapshot for main-slot replay"
+                    );
+                }
+                _ => {
+                    return Err(RuntimeJobError::InvalidTableSnapshotBoundary {
+                        group: group_id,
+                        reason: format!("unexpected transition state {state:?}"),
+                    });
+                }
             }
         }
         Ok(())
