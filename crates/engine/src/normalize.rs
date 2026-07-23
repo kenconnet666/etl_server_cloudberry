@@ -1,6 +1,6 @@
 //! Fold pgoutput row events into one current-state staging row per lineage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -8,6 +8,7 @@ use cloudberry_etl_core::{
     change::{Cell, RowChange, TableChange, TransactionChange, Tuple},
     schema::TableSchema,
 };
+use cloudberry_etl_source_postgres::spool::ChangeSource;
 use cloudberry_etl_target_cloudberry::apply::{StageOperation, StagingRow};
 use thiserror::Error;
 
@@ -79,30 +80,39 @@ pub fn normalize_table_batch(
     schema: &TableSchema,
     batch: &TransactionBatch,
 ) -> Result<Vec<StagingRow>, NormalizeError> {
-    let mut changes = Vec::new();
+    schema.validate_supported()?;
+    let mut normalizer = Normalizer::new(schema);
     for transaction in batch.transactions() {
-        let reader = transaction
-            .change_source
-            .reader()
-            .map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
-        for change in reader {
-            let change = change.map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
-            if let TransactionChange::Row(change) = change
-                && change.relation_id == schema.relation_id
-            {
-                changes.push(change);
+        match &transaction.change_source {
+            // The memory source is already an Arc-backed slice. Borrow it directly so a batch
+            // normalization does not clone every TransactionChange just to borrow it again.
+            ChangeSource::Memory(changes) => {
+                for change in changes.iter() {
+                    normalizer.push_transaction_change(change)?;
+                }
+            }
+            ChangeSource::Spool(_) => {
+                let reader = transaction
+                    .change_source
+                    .reader()
+                    .map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
+                for change in reader {
+                    let change =
+                        change.map_err(|error| NormalizeError::ChangeSource(error.to_string()))?;
+                    normalizer.push_transaction_change(&change)?;
+                }
             }
         }
     }
-    normalize_table_changes(schema, &changes)
+    normalizer.finish()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key(Vec<KeyCell>);
 
 impl Key {
-    fn cells(&self) -> Vec<Cell> {
-        self.0.iter().map(KeyCell::cell).collect()
+    fn into_cells(self) -> Vec<Cell> {
+        self.0.into_iter().map(KeyCell::into_cell).collect()
     }
 }
 
@@ -115,6 +125,12 @@ impl KeyCell {
     fn cell(&self) -> Cell {
         match self {
             Self::Text(value) => Cell::Text(value.clone()),
+        }
+    }
+
+    fn into_cell(self) -> Cell {
+        match self {
+            Self::Text(value) => Cell::Text(value),
         }
     }
 }
@@ -167,7 +183,6 @@ struct Lineage {
     origin_key: Option<Key>,
     current_key: Option<Key>,
     cells: Vec<Cell>,
-    first_sequence: usize,
 }
 
 struct Normalizer<'a> {
@@ -176,7 +191,6 @@ struct Normalizer<'a> {
     lineages: Vec<Lineage>,
     current_by_key: HashMap<Key, usize>,
     origin_by_key: HashMap<Key, usize>,
-    sequence: usize,
 }
 
 impl<'a> Normalizer<'a> {
@@ -187,7 +201,6 @@ impl<'a> Normalizer<'a> {
             lineages: Vec::new(),
             current_by_key: HashMap::new(),
             origin_by_key: HashMap::new(),
-            sequence: 0,
         }
     }
 
@@ -206,16 +219,26 @@ impl<'a> Normalizer<'a> {
             });
         }
 
-        let sequence = self.sequence;
-        self.sequence = self.sequence.saturating_add(1);
         match &change.change {
-            RowChange::Insert { new } => self.insert(new, sequence),
-            RowChange::Update { old_key, new } => self.update(old_key.as_ref(), new, sequence),
-            RowChange::Delete { old_key } => self.delete(old_key, sequence),
+            RowChange::Insert { new } => self.insert(new),
+            RowChange::Update { old_key, new } => self.update(old_key.as_ref(), new),
+            RowChange::Delete { old_key } => self.delete(old_key),
         }
     }
 
-    fn insert(&mut self, new: &Tuple, sequence: usize) -> Result<(), NormalizeError> {
+    fn push_transaction_change(
+        &mut self,
+        change: &TransactionChange,
+    ) -> Result<(), NormalizeError> {
+        if let TransactionChange::Row(change) = change
+            && change.relation_id == self.schema.relation_id
+        {
+            self.push(change)?;
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, new: &Tuple) -> Result<(), NormalizeError> {
         self.validate_new_tuple(new, "insert")?;
         if let Some((index, _)) = new
             .cells
@@ -247,18 +270,12 @@ impl<'a> Normalizer<'a> {
             origin_key: None,
             current_key: Some(key.clone()),
             cells: new.cells.clone(),
-            first_sequence: sequence,
         });
         self.current_by_key.insert(key, lineage_index);
         Ok(())
     }
 
-    fn update(
-        &mut self,
-        old_tuple: Option<&Tuple>,
-        new: &Tuple,
-        sequence: usize,
-    ) -> Result<(), NormalizeError> {
+    fn update(&mut self, old_tuple: Option<&Tuple>, new: &Tuple) -> Result<(), NormalizeError> {
         self.validate_new_tuple(new, "update")?;
         let old_key = old_tuple
             .map(|tuple| self.key_from_old_tuple(tuple))
@@ -274,7 +291,7 @@ impl<'a> Normalizer<'a> {
                         "update references a key whose baseline lineage has already moved or died",
                     ));
                 }
-                self.new_baseline(lookup_key.clone(), sequence, true)
+                self.new_baseline(lookup_key.clone(), true)
             }
         };
 
@@ -318,7 +335,7 @@ impl<'a> Normalizer<'a> {
         Ok(())
     }
 
-    fn delete(&mut self, old_tuple: &Tuple, sequence: usize) -> Result<(), NormalizeError> {
+    fn delete(&mut self, old_tuple: &Tuple) -> Result<(), NormalizeError> {
         let key = self.key_from_old_tuple(old_tuple)?;
         let lineage_index = match self.current_by_key.remove(&key) {
             Some(index) => index,
@@ -328,14 +345,14 @@ impl<'a> Normalizer<'a> {
                         "delete references a key whose baseline lineage has already moved or died",
                     ));
                 }
-                self.new_baseline(key.clone(), sequence, false)
+                self.new_baseline(key.clone(), false)
             }
         };
         self.lineages[lineage_index].current_key = None;
         Ok(())
     }
 
-    fn new_baseline(&mut self, key: Key, sequence: usize, live: bool) -> usize {
+    fn new_baseline(&mut self, key: Key, live: bool) -> usize {
         let lineage_index = self.lineages.len();
         let mut cells = vec![Cell::UnchangedToast; self.schema.columns.len()];
         self.write_key(&mut cells, &key);
@@ -343,7 +360,6 @@ impl<'a> Normalizer<'a> {
             origin_key: Some(key.clone()),
             current_key: live.then(|| key.clone()),
             cells,
-            first_sequence: sequence,
         });
         self.origin_by_key.insert(key.clone(), lineage_index);
         if live {
@@ -353,55 +369,53 @@ impl<'a> Normalizer<'a> {
     }
 
     fn finish(mut self) -> Result<Vec<StagingRow>, NormalizeError> {
-        let baseline_keys = self.origin_by_key.keys().cloned().collect::<HashSet<_>>();
-        let moved_destinations = self
-            .lineages
-            .iter()
-            .filter_map(
-                |lineage| match (&lineage.origin_key, &lineage.current_key) {
-                    (Some(origin), Some(current)) if origin != current => Some(current.clone()),
-                    _ => None,
-                },
-            )
-            .collect::<HashSet<_>>();
-        self.lineages.sort_by_key(|lineage| lineage.first_sequence);
+        // `lineages` is append-only and each new entry is created while consuming a strictly
+        // increasing input sequence. It is therefore already ordered by first appearance.
+        // Mark deleted baseline lineages whose origin is occupied by a newly inserted lineage;
+        // only those deletes are redundant in the final batch.
+        let mut suppress_delete = vec![false; self.lineages.len()];
+        for (key, &occupant_index) in &self.current_by_key {
+            if let Some(&deleted_index) = self.origin_by_key.get(key)
+                && self.lineages[occupant_index].origin_key.is_none()
+            {
+                suppress_delete[deleted_index] = true;
+            }
+        }
         let lineages = std::mem::take(&mut self.lineages);
         lineages
             .into_iter()
-            .filter_map(|lineage| match (lineage.origin_key, lineage.current_key) {
-                (None, None) => None,
-                (None, Some(current)) => Some(self.inserted_staging_row(
-                    lineage.cells,
-                    if baseline_keys.contains(&current) {
-                        StageOperation::Upsert
-                    } else {
-                        StageOperation::Insert
-                    },
-                )),
-                (Some(origin), Some(current)) if origin == current => Some(Ok(StagingRow {
-                    operation: StageOperation::Upsert,
-                    cells: lineage.cells,
-                    old_key: None,
-                })),
-                (Some(origin), Some(_)) => Some(Ok(StagingRow {
-                    operation: StageOperation::Move,
-                    cells: lineage.cells,
-                    old_key: Some(origin.cells()),
-                })),
-                (Some(origin), None)
-                    if self.current_by_key.contains_key(&origin)
-                        && !moved_destinations.contains(&origin) =>
-                {
-                    None
-                }
-                (Some(origin), None) => {
-                    let mut cells = vec![Cell::UnchangedToast; self.schema.columns.len()];
-                    self.write_key(&mut cells, &origin);
-                    Some(Ok(StagingRow {
-                        operation: StageOperation::Delete,
-                        cells,
+            .enumerate()
+            .filter_map(|(lineage_index, lineage)| {
+                match (lineage.origin_key, lineage.current_key) {
+                    (None, None) => None,
+                    (None, Some(current)) => Some(self.inserted_staging_row(
+                        lineage.cells,
+                        if self.origin_by_key.contains_key(&current) {
+                            StageOperation::Upsert
+                        } else {
+                            StageOperation::Insert
+                        },
+                    )),
+                    (Some(origin), Some(current)) if origin == current => Some(Ok(StagingRow {
+                        operation: StageOperation::Upsert,
+                        cells: lineage.cells,
                         old_key: None,
-                    }))
+                    })),
+                    (Some(origin), Some(_)) => Some(Ok(StagingRow {
+                        operation: StageOperation::Move,
+                        cells: lineage.cells,
+                        old_key: Some(origin.into_cells()),
+                    })),
+                    (Some(_), None) if suppress_delete[lineage_index] => None,
+                    (Some(origin), None) => {
+                        let mut cells = vec![Cell::UnchangedToast; self.schema.columns.len()];
+                        self.write_key(&mut cells, &origin);
+                        Some(Ok(StagingRow {
+                            operation: StageOperation::Delete,
+                            cells,
+                            old_key: None,
+                        }))
+                    }
                 }
             })
             .collect()
@@ -454,10 +468,10 @@ impl<'a> Normalizer<'a> {
     }
 
     fn key_from_old_tuple(&self, tuple: &Tuple) -> Result<Key, NormalizeError> {
-        let indexes = if tuple.cells.len() == self.schema.columns.len() {
-            self.primary_key.ordinal_indexes.clone()
+        let indexes: &[usize] = if tuple.cells.len() == self.schema.columns.len() {
+            &self.primary_key.ordinal_indexes
         } else if tuple.cells.len() == self.primary_key.ordinal_indexes.len() {
-            self.primary_key.key_tuple_positions.clone()
+            &self.primary_key.key_tuple_positions
         } else {
             return Err(NormalizeError::InvalidOldKeyArity {
                 key_only: self.primary_key.ordinal_indexes.len(),
@@ -465,7 +479,7 @@ impl<'a> Normalizer<'a> {
                 actual: tuple.cells.len(),
             });
         };
-        self.key_from_selected_cells(&tuple.cells, &indexes, "old-key")
+        self.key_from_selected_cells(&tuple.cells, indexes, "old-key")
     }
 
     fn key_from_full_tuple(
@@ -550,8 +564,8 @@ impl<'a> Normalizer<'a> {
     }
 
     fn write_key(&self, cells: &mut [Cell], key: &Key) {
-        for (index, value) in self.primary_key.ordinal_indexes.iter().zip(key.cells()) {
-            cells[*index] = value;
+        for (index, value) in self.primary_key.ordinal_indexes.iter().zip(&key.0) {
+            cells[*index] = value.cell();
         }
     }
 
@@ -562,16 +576,24 @@ impl<'a> Normalizer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
 
     use chrono::Utc;
     use cloudberry_etl_core::{
         change::{SourcePosition, SourceTransaction},
+        id::PipelineId,
         lsn::PgLsn,
         schema::{
             ColumnSchema, GeneratedColumn, IdentityColumn, PgType, PgTypeKind, QualifiedName,
             ReplicaIdentity, TableKind,
         },
+    };
+    use cloudberry_etl_source_postgres::{
+        spool::{SpoolIdentity, SpoolJournal, SpoolLimits},
+        wal::CommittedTransaction,
     };
 
     use super::*;
@@ -620,6 +642,24 @@ mod tests {
             relation_id: 7,
             generation: 3,
             change,
+        }
+    }
+
+    fn source_transaction(
+        xid: u32,
+        lsn: u64,
+        changes: Vec<TransactionChange>,
+    ) -> SourceTransaction {
+        SourceTransaction {
+            xid,
+            commit_time: Utc::now(),
+            final_position: SourcePosition {
+                node_id: 1,
+                system_identifier: 2,
+                timeline: 1,
+                lsn: PgLsn::new(lsn),
+            },
+            changes,
         }
     }
 
@@ -1104,5 +1144,137 @@ mod tests {
             normalize_table_batch(&schema(), &batch).unwrap(),
             [insertion("1", text("kept"))]
         );
+    }
+
+    #[test]
+    fn normalizes_rows_across_transactions_in_first_seen_order() {
+        let first = source_transaction(
+            1,
+            10,
+            vec![
+                TransactionChange::Row(update("10", text("before"))),
+                TransactionChange::Row(insert("20", "new")),
+            ],
+        );
+        let second = source_transaction(
+            2,
+            20,
+            vec![
+                TransactionChange::Row(move_key("10", "11", Cell::UnchangedToast)),
+                TransactionChange::Row(update("20", text("latest"))),
+            ],
+        );
+        let mut batcher = Batcher::new(BatchLimits {
+            max_rows: 100,
+            max_bytes: 16 * 1024,
+            max_delay: Duration::from_secs(1),
+        })
+        .unwrap();
+        batcher.push(first).unwrap();
+        batcher.push(second).unwrap();
+        let batch = batcher.flush().unwrap();
+
+        assert_eq!(
+            normalize_table_batch(&schema(), &batch).unwrap(),
+            [
+                movement("10", "11", text("before")),
+                insertion("20", text("latest")),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_and_spool_batches_match_for_reused_move_destination() {
+        let mut ignored = insert("99", "ignored");
+        ignored.relation_id = 8;
+        let changes = vec![
+            TransactionChange::Row(delete("2")),
+            TransactionChange::Row(move_key("1", "2", Cell::UnchangedToast)),
+            TransactionChange::Row(ignored),
+            TransactionChange::Row(update("2", text("moved"))),
+        ];
+        let limits = BatchLimits {
+            max_rows: 100,
+            max_bytes: 16 * 1024,
+            max_delay: Duration::from_secs(1),
+        };
+
+        let mut memory_batcher = Batcher::new(limits).unwrap();
+        memory_batcher
+            .push(source_transaction(1, 20, changes.clone()))
+            .unwrap();
+        let memory_batch = memory_batcher.flush().unwrap();
+
+        let pipeline_id = PipelineId::new();
+        let root = std::env::temp_dir().join(format!("pg2cb-normalize-spool-{pipeline_id}"));
+        let journal = SpoolJournal::open(
+            &root,
+            SpoolIdentity {
+                pipeline_id,
+                topology_generation: 1,
+                node_id: 1,
+                system_identifier: 2,
+                timeline: 1,
+            },
+            SpoolLimits {
+                memory_high_water_bytes: 1,
+                segment_target_bytes: 128,
+                disk_high_water_bytes: 1024 * 1024,
+                minimum_free_disk_bytes: 1,
+            },
+        )
+        .unwrap();
+        let mut writer = journal.begin(1, PgLsn::new(10)).unwrap();
+        for change in &changes {
+            writer.append(change).unwrap();
+        }
+        let handle = writer.finish(PgLsn::new(19), PgLsn::new(20)).unwrap();
+        let mut spool_batcher = Batcher::new(limits).unwrap();
+        spool_batcher
+            .push(CommittedTransaction {
+                transaction: source_transaction(1, 20, Vec::new()),
+                commit_lsn: PgLsn::new(19),
+                change_source: ChangeSource::Spool(handle.clone()),
+            })
+            .unwrap();
+        let spool_batch = spool_batcher.flush().unwrap();
+
+        let memory_rows = normalize_table_batch(&schema(), &memory_batch).unwrap();
+        let spool_rows = normalize_table_batch(&schema(), &spool_batch).unwrap();
+        handle.remove().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        let expected = [deletion("2"), movement("1", "2", text("moved"))];
+        assert_eq!(memory_rows, expected);
+        assert_eq!(spool_rows, expected);
+    }
+
+    #[test]
+    #[ignore = "manual normalizer throughput probe"]
+    fn benchmark_normalize_table_batch_throughput() {
+        const ROWS: usize = 100_000;
+        let changes = (0..ROWS)
+            .map(|id| TransactionChange::Row(insert(&id.to_string(), "payload")))
+            .collect();
+        let transaction = source_transaction(1, 10, changes);
+        let mut batcher = Batcher::new(BatchLimits {
+            max_rows: ROWS + 1,
+            max_bytes: 64 * 1024 * 1024,
+            max_delay: Duration::from_secs(1),
+        })
+        .unwrap();
+        batcher.push(transaction).unwrap();
+        let batch = batcher.flush().unwrap();
+
+        let started = Instant::now();
+        let normalized = normalize_table_batch(&schema(), &batch).unwrap();
+        let elapsed = started.elapsed();
+        let rows_per_second = normalized.len() as f64 / elapsed.as_secs_f64();
+        println!(
+            "normalize_table_batch: {} rows in {:?} ({rows_per_second:.0} rows/s)",
+            normalized.len(),
+            elapsed
+        );
+        assert_eq!(normalized.len(), ROWS);
     }
 }
