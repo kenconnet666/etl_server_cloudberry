@@ -1006,9 +1006,9 @@ pub fn plan_apply_with_storage(
             .collect::<Result<Vec<_>, SqlRenderError>>()?,
     );
 
-    let quoted_key = quote_identifier_list(key_names)?;
+    let quoted_distribution_key = quote_identifier_list(&table.distribution_key)?;
     let create_staging_sql = format!(
-        "CREATE TEMPORARY TABLE {quoted_staging} (\n{}\n)\nUSING heap\nON COMMIT DROP\nDISTRIBUTED BY ({quoted_key})",
+        "CREATE TEMPORARY TABLE {quoted_staging} (\n{}\n)\nUSING heap\nON COMMIT DROP\nDISTRIBUTED BY ({quoted_distribution_key})",
         staging_definitions.join(",\n")
     );
 
@@ -1388,6 +1388,29 @@ mod tests {
         assert!(
             plan.validation_sql
                 .contains("r.\"__pg2cb_old_2\" = s.\"id\"")
+        );
+    }
+
+    #[test]
+    fn citus_staging_uses_source_distribution_key() {
+        let mut source = table(vec![
+            column(1, "tenant", Some(1)),
+            column(2, "id", Some(2)),
+            column(3, "payload", None),
+        ]);
+        source.kind = TableKind::CitusDistributed;
+        source.distribution_key = vec![1];
+        let plan = plan_apply(
+            &source,
+            QualifiedName::new("target", "accounts").unwrap(),
+            "stage_accounts",
+        )
+        .unwrap();
+        assert_eq!(plan.table.primary_key, ["tenant", "id"]);
+        assert_eq!(plan.table.distribution_key, ["tenant"]);
+        assert!(
+            plan.create_staging_sql
+                .ends_with("DISTRIBUTED BY (\"tenant\")")
         );
     }
 

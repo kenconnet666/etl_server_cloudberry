@@ -22,9 +22,9 @@ pub const DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v2";
 pub const DDL_MESSAGE_VERSION: u16 = 2;
 const LEGACY_DDL_MESSAGE_PREFIX: &str = "pg2cloudberry_ddl_v1";
 const LEGACY_DDL_MESSAGE_VERSION: u16 = 1;
-/// Marker stored on both event triggers and their functions. Bumped to v6 when the command-end
-/// trigger began emitting typed per-relation after-schema snapshots in the v2 envelope.
-pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v6";
+/// Marker stored on both event triggers and their functions. V7 identifies Citus workers through
+/// `citus_is_coordinator()` so propagated DDL emits one logical event from the coordinator only.
+pub const DDL_CAPTURE_MARKER: &str = "pg2cloudberry_ddl_capture_v7";
 pub const CANONICAL_DDL_TRIGGER_NAME: &str = "pg2cb_ddl_command_end";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +75,7 @@ impl DdlInstallSpec {
     fn worker_guard_sql(&self) -> &'static str {
         if self.allow_citus_worker_guard {
             "        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus')
-           AND to_regclass('pg_catalog.pg_dist_node') IS NULL THEN
+           AND NOT pg_catalog.citus_is_coordinator() THEN
             RETURN;
         END IF;"
         } else {
@@ -1069,7 +1069,8 @@ mod tests {
         assert!(sql.contains("pg_event_trigger_dropped_objects"));
         assert!(sql.contains("parse_ident(object_identity, true)"));
         assert!(sql.contains("TG_TAG LIKE 'DROP %'"));
-        assert!(sql.contains("to_regclass('pg_catalog.pg_dist_node')"));
+        assert!(sql.contains("NOT pg_catalog.citus_is_coordinator()"));
+        assert!(!sql.contains("to_regclass('pg_catalog.pg_dist_node')"));
         assert!(sql.contains("current_setting('pg2cb.internal_ddl', true)"));
         assert!(sql.contains("'table_transitions', table_transitions"));
         assert!(sql.contains("'default_expression'"));

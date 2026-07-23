@@ -91,7 +91,9 @@ pub fn plan_type(data_type: &PgType, target_type_schema: &str) -> Result<TypePla
     Ok(TypePlan { sql, prerequisites })
 }
 
-/// Builds a business table whose distribution key is the complete source PK.
+/// Builds a business table whose distribution key follows the source contract. Ordinary tables
+/// use their complete PK; Citus distributed tables use the source distribution columns so target
+/// writes remain colocated with source shard ownership while the complete PK remains row identity.
 pub fn plan_create_table(
     source: &TableSchema,
     target: QualifiedName,
@@ -172,12 +174,36 @@ pub fn plan_create_table_with_storage(
         .into_iter()
         .map(|column| column.name.clone())
         .collect();
-    let create_sql = render_create_table(&target, &columns, &primary_key, storage)?;
+    let distribution_key = if source.kind == TableKind::CitusDistributed {
+        source
+            .distribution_key
+            .iter()
+            .map(|attnum| {
+                source
+                    .columns
+                    .iter()
+                    .find(|column| column.attnum == *attnum)
+                    .map(|column| column.name.clone())
+                    .ok_or_else(|| {
+                        SchemaError::Core(CoreError::UnsupportedTable {
+                            table: source.name.to_string(),
+                            reason: format!(
+                                "Citus distribution attribute {attnum} is absent from the table"
+                            ),
+                        })
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        primary_key.clone()
+    };
+    let create_sql =
+        render_create_table(&target, &columns, &primary_key, &distribution_key, storage)?;
     Ok(CreateTablePlan {
         target,
         storage,
         columns,
-        distribution_key: primary_key.clone(),
+        distribution_key,
         primary_key,
         prerequisites,
         create_sql,
@@ -188,6 +214,7 @@ fn render_create_table(
     target: &QualifiedName,
     columns: &[ColumnPlan],
     primary_key: &[String],
+    distribution_key: &[String],
     storage: TargetStorage,
 ) -> Result<String, SchemaError> {
     let mut definitions = Vec::with_capacity(columns.len() + 1);
@@ -201,6 +228,7 @@ fn render_create_table(
         ));
     }
     let quoted_key = quote_identifier_list(primary_key)?;
+    let quoted_distribution_key = quote_identifier_list(distribution_key)?;
     definitions.push(format!("    PRIMARY KEY ({quoted_key})"));
 
     Ok(format!(
@@ -208,7 +236,7 @@ fn render_create_table(
         quote_qualified_name(target)?,
         definitions.join(",\n"),
         storage.create_clause(),
-        quoted_key
+        quoted_distribution_key
     ))
 }
 
@@ -445,6 +473,7 @@ mod tests {
         match name {
             "int4" => 23,
             "int8" => 20,
+            "text" => 25,
             "varchar" => 1043,
             other => panic!("test fixture has no builtin OID for {other}"),
         }
@@ -594,6 +623,38 @@ mod tests {
             plan.create_sql
                 .ends_with("DISTRIBUTED BY (\"id\", \"tenant_id\")")
         );
+    }
+
+    #[test]
+    fn citus_tables_use_source_distribution_key_but_keep_complete_pk() {
+        let mut source = table(vec![
+            column(1, "tenant_id", "int8", PgTypeKind::Int8, Some(1)),
+            column(2, "id", "int8", PgTypeKind::Int8, Some(2)),
+            column(3, "payload", "text", PgTypeKind::Text, None),
+        ]);
+        source.kind = TableKind::CitusDistributed;
+        source.distribution_key = vec![1];
+
+        let plan =
+            plan_create_table(&source, QualifiedName::new("target", "accounts").unwrap()).unwrap();
+        assert_eq!(plan.primary_key, ["tenant_id", "id"]);
+        assert_eq!(plan.distribution_key, ["tenant_id"]);
+        assert!(
+            plan.create_sql
+                .contains("PRIMARY KEY (\"tenant_id\", \"id\")")
+        );
+        assert!(plan.create_sql.ends_with("DISTRIBUTED BY (\"tenant_id\")"));
+    }
+
+    #[test]
+    fn citus_distribution_attribute_must_be_a_real_column() {
+        let mut source = table(vec![column(1, "id", "int8", PgTypeKind::Int8, Some(1))]);
+        source.kind = TableKind::CitusDistributed;
+        source.distribution_key = vec![2];
+        assert!(matches!(
+            plan_create_table(&source, QualifiedName::new("target", "accounts").unwrap()),
+            Err(SchemaError::Core(CoreError::UnsupportedTable { .. }))
+        ));
     }
 
     #[test]

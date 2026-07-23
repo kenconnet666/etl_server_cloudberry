@@ -82,7 +82,7 @@ async fn citus14_pg18_topology_and_distributed_catalog() -> SourceResult<()> {
         coordinator_topology
             .nodes
             .iter()
-            .map(|node| (node.group_id, node.host.as_str(), node.port))
+            .map(|node| (node.lane_id.get(), node.host.as_str(), node.port))
             .collect::<Vec<_>>(),
         vec![
             (0, "coordinator", 5432),
