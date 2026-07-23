@@ -151,6 +151,36 @@ pub async fn cleanup_loading_snapshot_group(
     Ok(outcome)
 }
 
+/// Removes the exact loading group supplied by a table-local reconciliation reload.
+///
+/// The caller must provide the complete activation request that was persisted when the group was
+/// registered.  We canonicalize and compare it with the durable manifest before delegating to the
+/// normal identity/OID-checked cleanup path.  This entry point is crate-visible because the
+/// reconciliation ledger and snapshot metadata must be changed in one caller-owned transaction.
+pub(crate) async fn cleanup_exact_loading_snapshot_group_in_transaction(
+    transaction: &Transaction<'_>,
+    current_fence: PipelineFence,
+    request: &super::SnapshotActivationRequest,
+) -> Result<SnapshotCleanupOutcome, SnapshotTargetError> {
+    let canonical = manifest::canonical_request(request)?;
+    if canonical.fence != current_fence {
+        return Err(SnapshotTargetError::InvalidSnapshotCleanupFence);
+    }
+    lock_pipeline_fence(transaction, current_fence).await?;
+    let stored = manifest::load_snapshot_group(transaction, canonical.snapshot_group_id).await?;
+    let canonical = manifest::validate_exact_request(&stored, &canonical)?;
+    let group_fence = stored.request.fence;
+    cleanup_loading_snapshot_group_locked(
+        transaction,
+        SnapshotGroupCleanupRequest {
+            current_fence,
+            group_fence,
+            snapshot_group_id: canonical.snapshot_group_id,
+        },
+    )
+    .await
+}
+
 /// Discovers and removes every loading group made stale by the current fence.
 ///
 /// Discovery, validation, all physical drops, and manifest deletion run in one transaction under

@@ -22,13 +22,14 @@ use cloudberry_etl_target_cloudberry::{
         ReconciliationStartupRecovery, ReconciliationState, ReconciliationStateError,
         ReconciliationStats, ReconciliationTransitionOutcome, activate_reconciliation_reload,
         begin_reconciliation, complete_reconciliation_scan, fail_reconciliation,
-        load_reconciliation_startup_recovery, load_reconciliation_state,
-        mark_reconciliation_scanning, next_reconciliation_candidate, supersede_reconciliation,
+        fail_reconciliation_reload, load_reconciliation_startup_recovery,
+        load_reconciliation_state, mark_reconciliation_scanning, next_reconciliation_candidate,
+        supersede_reconciliation,
     },
     snapshot::{
         SnapshotActivationDisposition, SnapshotActivationRequest, SnapshotApplyOutcome,
-        SnapshotOwnership, activate_snapshot_group, begin_snapshot_apply, begin_snapshot_group,
-        plan_snapshot_target,
+        SnapshotOwnership, SnapshotTargetError, activate_snapshot_group, begin_snapshot_apply,
+        begin_snapshot_group, plan_snapshot_target,
     },
 };
 use futures::stream;
@@ -397,6 +398,269 @@ async fn cloudberry21_reconciliation_reload_activation_is_atomic_and_idempotent(
     );
     assert_eq!(
         replay.reconciliation,
+        ReconciliationTransitionOutcome::AlreadyComplete
+    );
+
+    assert!(matches!(
+        fail_reconciliation_reload(
+            &mut client,
+            &reconciliation,
+            &reload_request,
+            "late reload failure",
+            next_due_at,
+        )
+        .await,
+        Err(ReconciliationStateError::IllegalTransition {
+            from: "reloaded",
+            to: "failed"
+        })
+    ));
+    let active_group_state: String = client
+        .query_one(
+            "SELECT state FROM pg2cb_meta.snapshot_groups WHERE snapshot_group_id = $1",
+            &[&reload_request.snapshot_group_id],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(active_group_state, "active");
+    let ids_after_rejected_failure = client
+        .query(&format!("SELECT id FROM {target} ORDER BY id"), &[])
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<_, i64>(0))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(ids_after_rejected_failure, vec![2]);
+
+    connection_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Apache Cloudberry 2.1 and PG2CB_TEST_TARGET_DSN"]
+async fn cloudberry21_reconciliation_reload_failure_cleans_loading_group_atomically()
+-> Result<(), Box<dyn Error>> {
+    let dsn = std::env::var("PG2CB_TEST_TARGET_DSN")?;
+    let (mut client, connection) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("reconciliation reload failure connection ended: {error}");
+        }
+    });
+
+    migrate_target_database(&mut client).await?;
+    let fence = PipelineFence {
+        pipeline_id: PipelineId::new(),
+        topology_generation: 1,
+        fencing_token: 20,
+    };
+    activate_pipeline_fence(&client, fence).await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let target = QualifiedName::new(format!("pg2cb_fail_{}", &suffix[..12]), "orders")?;
+    let fingerprint = "sha256:reconciliation-failure-v1";
+
+    let initial_schema = reconciliation_source_schema(242, 1);
+    let initial_plan = plan_snapshot_target(
+        &initial_schema,
+        target.clone(),
+        QualifiedName::new(&target.schema, "orders_initial_shadow")?,
+    )?;
+    let initial_request = SnapshotActivationRequest {
+        fence,
+        snapshot_group_id: Uuid::now_v7(),
+        tables: vec![initial_plan.activation_table(fingerprint)],
+        initial_checkpoints: vec![NodeCheckpoint {
+            key: CheckpointKey {
+                pipeline_id: fence.pipeline_id,
+                topology_generation: fence.topology_generation,
+                node_id: 0,
+            },
+            system_identifier: 7_123_456_790,
+            timeline: 1,
+            slot_name: format!("pg2cb_initial_{}", &suffix[..16]),
+            applied_lsn: PgLsn::new(0x180),
+        }],
+    };
+    begin_snapshot_group(&mut client, &initial_request).await?;
+    load_shadow(
+        &mut client,
+        initial_plan,
+        SnapshotOwnership {
+            fence,
+            snapshot_group_id: initial_request.snapshot_group_id,
+            schema_fingerprint: fingerprint.to_owned(),
+        },
+        "1\n",
+    )
+    .await?;
+    activate_snapshot_group(&mut client, &initial_request).await?;
+
+    let target_oid_raw: i64 = client
+        .query_one(
+            "SELECT c.oid::bigint FROM pg_catalog.pg_class AS c \
+             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&target.schema, &target.name],
+        )
+        .await?
+        .try_get(0)?;
+    let reconciliation = ReconciliationRunIdentity {
+        fence,
+        source_relation_id: initial_schema.relation_id,
+        target: target.clone(),
+        target_relation_oid: u32::try_from(target_oid_raw)?,
+        table_generation: initial_schema.generation,
+        schema_fingerprint: fingerprint.to_owned(),
+        run_id: Uuid::now_v7(),
+        source_node_id: 0,
+        temporary_slot_name: format!("pg2cb_reconcile_{}", &suffix[..16]),
+        source_system_identifier: 7_123_456_790,
+        source_timeline: 1,
+        source_snapshot_lsn: PgLsn::new(0x200),
+    };
+    begin_reconciliation(&mut client, &reconciliation).await?;
+    mark_reconciliation_scanning(&mut client, &reconciliation, PgLsn::new(0x1ff)).await?;
+    complete_reconciliation_scan(
+        &mut client,
+        &reconciliation,
+        &ReconciliationScanCompletion::ReloadPending {
+            source: stats(2, 16, 0x11),
+            target: stats(1, 8, 0x22),
+        },
+    )
+    .await?;
+
+    let reload_schema = reconciliation_source_schema(242, 2);
+    let reload_plan = plan_snapshot_target(
+        &reload_schema,
+        target.clone(),
+        QualifiedName::new(&target.schema, "orders_failure_shadow")?,
+    )?;
+    let reload_request = SnapshotActivationRequest {
+        fence,
+        snapshot_group_id: Uuid::now_v7(),
+        tables: vec![reload_plan.activation_table(fingerprint)],
+        initial_checkpoints: vec![NodeCheckpoint {
+            key: CheckpointKey {
+                pipeline_id: fence.pipeline_id,
+                topology_generation: fence.topology_generation,
+                node_id: reconciliation.source_node_id,
+            },
+            system_identifier: reconciliation.source_system_identifier,
+            timeline: reconciliation.source_timeline,
+            slot_name: reconciliation.temporary_slot_name.clone(),
+            applied_lsn: reconciliation.source_snapshot_lsn,
+        }],
+    };
+    begin_snapshot_group(&mut client, &reload_request).await?;
+    load_shadow(
+        &mut client,
+        reload_plan,
+        SnapshotOwnership {
+            fence,
+            snapshot_group_id: reload_request.snapshot_group_id,
+            schema_fingerprint: fingerprint.to_owned(),
+        },
+        "2\n",
+    )
+    .await?;
+
+    let retry_at = SystemTime::now() + Duration::from_secs(30);
+    assert!(matches!(
+        fail_reconciliation(&mut client, &reconciliation, "reload copy failed", retry_at,).await,
+        Err(ReconciliationStateError::ReloadFailureRequiresCleanup { .. })
+    ));
+
+    // A request that does not exactly match the persisted manifest must be rejected before DROP.
+    let mut mismatched_request = reload_request.clone();
+    mismatched_request.tables[0].shadow =
+        QualifiedName::new(&target.schema, "orders_wrong_failure_shadow")?;
+    assert!(matches!(
+        fail_reconciliation_reload(
+            &mut client,
+            &reconciliation,
+            &mismatched_request,
+            "reload copy failed",
+            retry_at,
+        )
+        .await,
+        Err(ReconciliationStateError::Snapshot(
+            SnapshotTargetError::SnapshotGroupManifestMismatch { .. }
+        ))
+    ));
+    let pending = load_reconciliation_state(&mut client, fence, reconciliation.source_relation_id)
+        .await?
+        .expect("reload-pending state must survive validation failure");
+    assert_eq!(pending.state, ReconciliationState::ReloadPending);
+    let loading_groups: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint FROM pg2cb_meta.snapshot_groups WHERE snapshot_group_id = $1 AND state = 'loading'",
+            &[&reload_request.snapshot_group_id],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(loading_groups, 1);
+
+    assert_eq!(
+        fail_reconciliation_reload(
+            &mut client,
+            &reconciliation,
+            &reload_request,
+            "reload copy failed",
+            retry_at,
+        )
+        .await?,
+        ReconciliationTransitionOutcome::Transitioned
+    );
+    let failed = load_reconciliation_state(&mut client, fence, reconciliation.source_relation_id)
+        .await?
+        .expect("failed state");
+    assert_eq!(failed.state, ReconciliationState::Failed);
+    assert_eq!(failed.consecutive_failures, 1);
+    assert_eq!(failed.failure_reason.as_deref(), Some("reload copy failed"));
+
+    for table in [
+        "snapshot_groups",
+        "snapshot_group_tables",
+        "snapshot_group_nodes",
+        "snapshot_table_progress",
+    ] {
+        let sql =
+            format!("SELECT count(*)::bigint FROM pg2cb_meta.{table} WHERE snapshot_group_id = $1");
+        let count: i64 = client
+            .query_one(&sql, &[&reload_request.snapshot_group_id])
+            .await?
+            .try_get(0)?;
+        assert_eq!(count, 0, "leftover rows in {table}");
+    }
+    let shadow_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2)",
+            &[&reload_request.tables[0].shadow.schema, &reload_request.tables[0].shadow.name],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(!shadow_exists);
+    let ids = client
+        .query(&format!("SELECT id FROM {target} ORDER BY id"), &[])
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<_, i64>(0))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        ids,
+        vec![1],
+        "failed reload must leave the active table intact"
+    );
+
+    assert_eq!(
+        fail_reconciliation_reload(
+            &mut client,
+            &reconciliation,
+            &reload_request,
+            "reload copy failed",
+            retry_at,
+        )
+        .await?,
         ReconciliationTransitionOutcome::AlreadyComplete
     );
 

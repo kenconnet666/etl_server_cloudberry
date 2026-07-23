@@ -726,6 +726,20 @@ async fn load_snapshot_group_optional(
     }))
 }
 
+/// Returns whether a snapshot group header and its manifest still exist.
+///
+/// Reconciliation reload failure uses this only after a durable `failed` state has been observed
+/// to classify an unknown commit result.  The full manifest is still parsed and checksum-checked,
+/// so a corrupt leftover is never mistaken for a successfully cleaned group.
+pub(crate) async fn snapshot_group_exists_in_transaction(
+    transaction: &Transaction<'_>,
+    snapshot_group_id: Uuid,
+) -> Result<bool, SnapshotTargetError> {
+    Ok(load_snapshot_group_optional(transaction, snapshot_group_id)
+        .await?
+        .is_some())
+}
+
 fn table_from_row(
     row: &Row,
     snapshot_group_id: Uuid,

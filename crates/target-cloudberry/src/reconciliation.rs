@@ -24,8 +24,9 @@ use crate::{
     snapshot::{
         ManagedTableState, RelationState, SnapshotActivationDisposition, SnapshotActivationOutcome,
         SnapshotActivationRequest, SnapshotTargetError,
-        activate_table_snapshot_group_in_transaction, load_relation_state, relation_oid,
-        validate_managed_fence, validate_managed_identity,
+        activate_table_snapshot_group_in_transaction,
+        cleanup_exact_loading_snapshot_group_in_transaction, load_relation_state, relation_oid,
+        snapshot_group_exists_in_transaction, validate_managed_fence, validate_managed_identity,
     },
 };
 
@@ -393,6 +394,18 @@ pub enum ReconciliationStateError {
     CompletionMismatch { field: &'static str },
     #[error("reconciliation reload activation request differs in `{field}`")]
     ReloadRequestMismatch { field: &'static str },
+    #[error(
+        "reload-pending reconciliation run {run_id} must use fail_reconciliation_reload so its snapshot group is cleaned"
+    )]
+    ReloadFailureRequiresCleanup { run_id: Uuid },
+    #[error(
+        "reconciliation reload failure retry found snapshot group {0} still present; refusing to clean it implicitly"
+    )]
+    ReloadFailureGroupStillPresent(Uuid),
+    #[error(
+        "reconciliation reload target is already activated; refusing to clean the requested snapshot group"
+    )]
+    ReloadFailureTargetAlreadyActive,
     #[error("reconciliation reload table generation overflowed after {0}")]
     ReloadGenerationOverflow(u64),
     #[error("active reconciliation target differs from the run in `{field}`")]
@@ -768,6 +781,83 @@ pub async fn activate_reconciliation_reload(
     })
 }
 
+/// Atomically removes a failed reload's exact loading snapshot and marks the run `failed`.
+///
+/// A reload-pending run owns a process-scoped snapshot group.  Failing the ledger row without
+/// removing that group leaves a shadow which can collide with a later retry, so this operation
+/// deliberately owns one transaction containing manifest validation, identity-safe physical
+/// cleanup, and the reconciliation state transition.  If the commit response is lost, retrying
+/// the same run and reason returns [`ReconciliationTransitionOutcome::AlreadyComplete`] only after
+/// observing the durable failed row and an absent snapshot group.
+pub async fn fail_reconciliation_reload(
+    client: &mut Client,
+    run: &ReconciliationRunIdentity,
+    request: &SnapshotActivationRequest,
+    reason: &str,
+    next_due_at: SystemTime,
+) -> Result<ReconciliationTransitionOutcome, ReconciliationStateError> {
+    validate_run(run)?;
+    validate_reload_request(run, request)?;
+    validate_reason(reason)?;
+    let transaction = client.transaction().await?;
+    let outcome =
+        fail_reconciliation_reload_in_transaction(&transaction, run, request, reason, next_due_at)
+            .await?;
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+/// Performs [`fail_reconciliation_reload`] in a caller-owned transaction.
+///
+/// The caller must commit or roll back the transaction.  The pipeline fence is still acquired by
+/// this function so every run, manifest, progress row, and shadow mutation shares one serialization
+/// boundary.
+pub async fn fail_reconciliation_reload_in_transaction(
+    transaction: &Transaction<'_>,
+    run: &ReconciliationRunIdentity,
+    request: &SnapshotActivationRequest,
+    reason: &str,
+    next_due_at: SystemTime,
+) -> Result<ReconciliationTransitionOutcome, ReconciliationStateError> {
+    validate_run(run)?;
+    validate_reload_request(run, request)?;
+    validate_reason(reason)?;
+    lock_pipeline_fence(transaction, run.fence).await?;
+    let stored = require_run_locked(transaction, run, true).await?;
+
+    if stored.state == ReconciliationState::Failed {
+        if stored.failure_reason.as_deref() != Some(reason) {
+            return Err(ReconciliationStateError::CompletionMismatch {
+                field: "failure_reason",
+            });
+        }
+        if snapshot_group_exists_in_transaction(transaction, request.snapshot_group_id).await? {
+            return Err(ReconciliationStateError::ReloadFailureGroupStillPresent(
+                request.snapshot_group_id,
+            ));
+        }
+        return Ok(ReconciliationTransitionOutcome::AlreadyComplete);
+    }
+
+    require_transition(stored.state, ReconciliationState::Failed)?;
+    if stored.state != ReconciliationState::ReloadPending {
+        return Err(ReconciliationStateError::IllegalTransition {
+            from: stored.state.as_str(),
+            to: ReconciliationState::Failed.as_str(),
+        });
+    }
+
+    if validate_reload_target(transaction, run, request).await? != ReloadTargetState::Original {
+        return Err(ReconciliationStateError::ReloadFailureTargetAlreadyActive);
+    }
+
+    // This validates the complete persisted manifest before any DROP/DELETE statement.  The
+    // helper also verifies every shadow's managed ownership and physical OID, then removes all
+    // progress, shadows, group children, and the loading group in this same transaction.
+    cleanup_exact_loading_snapshot_group_in_transaction(transaction, run.fence, request).await?;
+    mark_reconciliation_failed_locked(transaction, run, &stored, reason, next_due_at).await
+}
+
 /// Fails an active run and schedules its retry.
 pub async fn fail_reconciliation(
     client: &mut Client,
@@ -793,6 +883,19 @@ pub async fn fail_reconciliation_in_transaction(
     validate_reason(reason)?;
     lock_pipeline_fence(transaction, run.fence).await?;
     let stored = require_run_locked(transaction, run, true).await?;
+    if stored.state == ReconciliationState::ReloadPending {
+        return Err(ReconciliationStateError::ReloadFailureRequiresCleanup { run_id: run.run_id });
+    }
+    mark_reconciliation_failed_locked(transaction, run, &stored, reason, next_due_at).await
+}
+
+async fn mark_reconciliation_failed_locked(
+    transaction: &Transaction<'_>,
+    run: &ReconciliationRunIdentity,
+    stored: &StoredReconciliationState,
+    reason: &str,
+    next_due_at: SystemTime,
+) -> Result<ReconciliationTransitionOutcome, ReconciliationStateError> {
     if stored.state == ReconciliationState::Failed {
         return if stored.failure_reason.as_deref() == Some(reason) {
             Ok(ReconciliationTransitionOutcome::AlreadyComplete)

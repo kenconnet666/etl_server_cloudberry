@@ -37,12 +37,14 @@ pub use activation::{
     activate_table_snapshot_group_in_transaction, quarantine_active_table_in_transaction,
     validate_active_snapshot_group, validate_active_tables,
 };
+pub(crate) use cleanup::cleanup_exact_loading_snapshot_group_in_transaction;
 pub use cleanup::{
     QuarantineGcOutcome, QuarantineGcPolicy, SnapshotCleanupOutcome, SnapshotGroupCleanupRequest,
     TableSnapshotReplayGroup, adopt_table_snapshot_replay_group, cleanup_loading_snapshot_group,
     cleanup_stale_snapshot_groups, garbage_collect_quarantined_tables,
     reset_interrupted_table_snapshot_group,
 };
+pub(crate) use manifest::snapshot_group_exists_in_transaction;
 pub use manifest::{
     SnapshotGroupManifest, SnapshotGroupRegistrationDisposition, SnapshotGroupStatus,
     begin_snapshot_group, begin_snapshot_group_in_transaction, load_snapshot_group_manifest,
