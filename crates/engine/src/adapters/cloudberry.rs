@@ -13,7 +13,7 @@ use cloudberry_etl_core::{
 };
 use cloudberry_etl_source_postgres::{
     catalog::CatalogOptions,
-    spool::{ChangeChunk, ChangeStats, ChunkLimits},
+    spool::{ChangeChunk, ChangeSource, ChangeStats, ChunkLimits},
     wal::CommittedTransaction,
 };
 use cloudberry_etl_target_cloudberry::{
@@ -44,7 +44,7 @@ use tokio_postgres::{Client, IsolationLevel};
 
 use crate::{
     batch::TransactionBatch,
-    normalize::normalize_table_changes,
+    normalize::TableNormalizer,
     pipeline::{PipelineError, SchemaEventKey, TransactionSink},
     schema_transition::{SchemaAction, plan_schema_transaction, prepare_schema_capability_event},
 };
@@ -415,21 +415,7 @@ pub fn build_apply_request_scoped(
     batch: &TransactionBatch,
 ) -> Result<ApplyRequest, PipelineError> {
     reject_schema_barriers(batch, ddl_scope)?;
-
-    let mut changes = Vec::new();
-    for transaction in batch.transactions() {
-        let reader = transaction
-            .change_source
-            .reader()
-            .map_err(|error| PipelineError::Source(error.to_string()))?;
-        for change in reader {
-            let change = change.map_err(|error| PipelineError::Source(error.to_string()))?;
-            if let TransactionChange::Row(change) = change {
-                changes.push(change);
-            }
-        }
-    }
-    let tables = build_table_apply_batches(registry, &changes)?;
+    let tables = build_batch_table_apply_batches(registry, batch)?;
 
     let final_position = &batch.final_transaction().final_position;
     Ok(ApplyRequest {
@@ -449,33 +435,88 @@ pub fn build_apply_request_scoped(
     })
 }
 
-fn build_table_apply_batches<'a>(
+fn build_batch_table_apply_batches(
     registry: &TableBindingRegistry,
-    changes: impl IntoIterator<Item = &'a TableChange>,
+    batch: &TransactionBatch,
 ) -> Result<Vec<TableApplyBatch>, PipelineError> {
-    let mut grouped: BTreeMap<(u32, u64), Vec<&TableChange>> = BTreeMap::new();
-    for change in changes {
-        grouped
-            .entry((change.relation_id, change.generation))
-            .or_default()
-            .push(change);
+    let mut normalizer = TableNormalizer::default();
+    for transaction in batch.transactions() {
+        match &transaction.change_source {
+            ChangeSource::Memory(changes) => {
+                for change in changes.iter() {
+                    push_transaction_change(registry, &mut normalizer, change)?;
+                }
+            }
+            ChangeSource::Spool(_) => {
+                let reader = transaction
+                    .change_source
+                    .reader()
+                    .map_err(|error| PipelineError::Source(error.to_string()))?;
+                for change in reader {
+                    let change =
+                        change.map_err(|error| PipelineError::Source(error.to_string()))?;
+                    push_transaction_change(registry, &mut normalizer, &change)?;
+                }
+            }
+        }
     }
-
-    build_grouped_table_batches(registry, grouped)
+    finish_table_apply_batches(registry, normalizer)
 }
 
-fn build_grouped_table_batches(
-    registry: &TableBindingRegistry,
-    grouped: BTreeMap<(u32, u64), Vec<&TableChange>>,
+fn build_table_apply_batches<'a>(
+    registry: &'a TableBindingRegistry,
+    changes: impl IntoIterator<Item = &'a TableChange>,
 ) -> Result<Vec<TableApplyBatch>, PipelineError> {
-    let mut tables = Vec::with_capacity(grouped.len());
-    for ((relation_id, generation), changes) in grouped {
-        let binding = registry.get(relation_id, generation).ok_or_else(|| {
-            PipelineError::Target(format!(
-                "no immutable table binding for relation {relation_id} generation {generation}"
-            ))
-        })?;
-        let rows = normalize_table_changes(binding.schema(), changes)?;
+    let mut normalizer = TableNormalizer::default();
+    for change in changes {
+        push_table_change(registry, &mut normalizer, change)?;
+    }
+    finish_table_apply_batches(registry, normalizer)
+}
+
+fn push_transaction_change<'a>(
+    registry: &'a TableBindingRegistry,
+    normalizer: &mut TableNormalizer<'a>,
+    change: &TransactionChange,
+) -> Result<(), PipelineError> {
+    let TransactionChange::Row(row) = change else {
+        return Ok(());
+    };
+    let binding = require_table_binding(registry, row.relation_id, row.generation)?;
+    normalizer.push_transaction_change(binding.schema(), change)?;
+    Ok(())
+}
+
+fn push_table_change<'a>(
+    registry: &'a TableBindingRegistry,
+    normalizer: &mut TableNormalizer<'a>,
+    change: &TableChange,
+) -> Result<(), PipelineError> {
+    let binding = require_table_binding(registry, change.relation_id, change.generation)?;
+    normalizer.push_table_change(binding.schema(), change)?;
+    Ok(())
+}
+
+fn require_table_binding(
+    registry: &TableBindingRegistry,
+    relation_id: u32,
+    generation: u64,
+) -> Result<&TableBinding, PipelineError> {
+    registry.get(relation_id, generation).ok_or_else(|| {
+        PipelineError::Target(format!(
+            "no immutable table binding for relation {relation_id} generation {generation}"
+        ))
+    })
+}
+
+fn finish_table_apply_batches(
+    registry: &TableBindingRegistry,
+    normalizer: TableNormalizer<'_>,
+) -> Result<Vec<TableApplyBatch>, PipelineError> {
+    let normalized = normalizer.finish()?;
+    let mut tables = Vec::with_capacity(normalized.len());
+    for ((relation_id, generation), rows) in normalized {
+        let binding = require_table_binding(registry, relation_id, generation)?;
         if !rows.is_empty() {
             tables.push(TableApplyBatch {
                 identity: Arc::clone(binding.identity()),
@@ -503,7 +544,7 @@ fn build_chunk_tables(
         );
     }
 
-    let mut grouped: BTreeMap<(u32, u64), Vec<TableChange>> = BTreeMap::new();
+    let mut normalizer = TableNormalizer::default();
     for change in chunk.changes.iter().filter_map(|change| match change {
         TransactionChange::Row(change) => Some(change),
         TransactionChange::Ddl(_) | TransactionChange::Truncate { .. } => None,
@@ -525,17 +566,15 @@ fn build_chunk_tables(
             }
             None => ((change.relation_id, change.generation), false),
         };
-        let mut change = change.clone();
         if rewrite_generation {
-            change.generation = key.1;
+            let mut rewritten = change.clone();
+            rewritten.generation = key.1;
+            push_table_change(registry, &mut normalizer, &rewritten)?;
+        } else {
+            push_table_change(registry, &mut normalizer, change)?;
         }
-        grouped.entry(key).or_default().push(change);
     }
-    let borrowed = grouped
-        .iter()
-        .map(|(key, changes)| (*key, changes.iter().collect::<Vec<_>>()))
-        .collect();
-    build_grouped_table_batches(registry, borrowed)
+    finish_table_apply_batches(registry, normalizer)
 }
 
 fn transaction_manifest(
@@ -1336,7 +1375,10 @@ mod tests {
         batcher.flush().unwrap()
     }
 
-    fn spooled_transaction(changes: &[TransactionChange]) -> (PathBuf, CommittedTransaction) {
+    fn spooled_transaction_at(
+        lsn: u64,
+        changes: &[TransactionChange],
+    ) -> (PathBuf, CommittedTransaction) {
         let root =
             std::env::temp_dir().join(format!("pg2cb-engine-spool-{}", uuid::Uuid::new_v4()));
         let journal = SpoolJournal::open(
@@ -1356,19 +1398,27 @@ mod tests {
             },
         )
         .unwrap();
-        let mut writer = journal.begin(20, PgLsn::new(10)).unwrap();
+        let mut writer = journal
+            .begin(lsn as u32, PgLsn::new(lsn.saturating_sub(10)))
+            .unwrap();
         for change in changes {
             writer.append(change).unwrap();
         }
-        let handle = writer.finish(PgLsn::new(19), PgLsn::new(20)).unwrap();
+        let handle = writer
+            .finish(PgLsn::new(lsn.saturating_sub(1)), PgLsn::new(lsn))
+            .unwrap();
         (
             root,
             CommittedTransaction {
-                transaction: transaction(20, Vec::new()),
-                commit_lsn: PgLsn::new(19),
+                transaction: transaction(lsn, Vec::new()),
+                commit_lsn: PgLsn::new(lsn.saturating_sub(1)),
                 change_source: ChangeSource::Spool(handle),
             },
         )
+    }
+
+    fn spooled_transaction(changes: &[TransactionChange]) -> (PathBuf, CommittedTransaction) {
+        spooled_transaction_at(20, changes)
     }
 
     fn fence() -> PipelineFence {
@@ -1433,6 +1483,79 @@ mod tests {
         assert_eq!(request.checkpoint.timeline, 2);
         assert_eq!(request.checkpoint.slot_name, "slot_node_3");
         assert_eq!(request.checkpoint.applied_lsn, PgLsn::new(20));
+    }
+
+    #[test]
+    fn memory_and_spool_build_identical_cross_transaction_requests() {
+        let registry = TableBindingRegistry::new([
+            binding(8, 1, "orders", "orders", "stage_orders"),
+            binding(7, 3, "items", "items", "stage_items"),
+        ])
+        .unwrap();
+        let first = vec![insert(7, 3, "1", "first"), insert(8, 1, "2", "keep")];
+        let second = vec![
+            move_key(7, 3, "1", "3", "final"),
+            insert(8, 1, "4", "later"),
+        ];
+
+        let mut memory_batcher = Batcher::new(BatchLimits::default()).unwrap();
+        assert!(
+            memory_batcher
+                .push(transaction(20, first.clone()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            memory_batcher
+                .push(transaction(21, second.clone()))
+                .unwrap()
+                .is_none()
+        );
+        let memory_batch = memory_batcher.flush().unwrap();
+
+        let mut mixed_batcher = Batcher::new(BatchLimits::default()).unwrap();
+        assert!(
+            mixed_batcher
+                .push(transaction(20, first))
+                .unwrap()
+                .is_none()
+        );
+        let (root, spool) = spooled_transaction_at(21, &second);
+        assert!(mixed_batcher.push(spool.clone()).unwrap().is_none());
+        let mixed_batch = mixed_batcher.flush().unwrap();
+
+        let fence = fence();
+        let memory = build_apply_request(fence, "slot", &registry, &memory_batch).unwrap();
+        let mixed = build_apply_request(fence, "slot", &registry, &mixed_batch).unwrap();
+
+        assert_eq!(memory.checkpoint, mixed.checkpoint);
+        assert_eq!(memory.tables.len(), mixed.tables.len());
+        for (memory_table, mixed_table) in memory.tables.iter().zip(&mixed.tables) {
+            assert_eq!(memory_table.identity, mixed_table.identity);
+            assert_eq!(memory_table.rows, mixed_table.rows);
+        }
+        assert_eq!(memory.tables[0].identity.source_relation_id, 7);
+        assert_eq!(memory.tables[0].rows.len(), 1);
+        assert_eq!(memory.tables[0].rows[0].old_key, None);
+        assert_eq!(memory.tables[0].rows[0].cells, [text("3"), text("final")]);
+
+        if let ChangeSource::Spool(handle) = &spool.change_source {
+            handle.remove().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_request_rejects_unknown_table_binding() {
+        let registry =
+            TableBindingRegistry::new([binding(7, 3, "items", "items", "stage_items")]).unwrap();
+        let batch = batch(vec![insert(99, 1, "1", "unknown")]);
+
+        assert!(matches!(
+            build_apply_request(fence(), "slot", &registry, &batch),
+            Err(PipelineError::Target(reason))
+                if reason.contains("no immutable table binding for relation 99 generation 1")
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Fold pgoutput row events into one current-state staging row per lineage.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use cloudberry_etl_core::{
@@ -66,8 +66,7 @@ pub fn normalize_table_changes<'a>(
     schema: &TableSchema,
     changes: impl IntoIterator<Item = &'a TableChange>,
 ) -> Result<Vec<StagingRow>, NormalizeError> {
-    schema.validate_supported()?;
-    let mut normalizer = Normalizer::new(schema);
+    let mut normalizer = Normalizer::new_validated(schema)?;
     for change in changes {
         normalizer.push(change)?;
     }
@@ -80,8 +79,7 @@ pub fn normalize_table_batch(
     schema: &TableSchema,
     batch: &TransactionBatch,
 ) -> Result<Vec<StagingRow>, NormalizeError> {
-    schema.validate_supported()?;
-    let mut normalizer = Normalizer::new(schema);
+    let mut normalizer = Normalizer::new_validated(schema)?;
     for transaction in batch.transactions() {
         match &transaction.change_source {
             // The memory source is already an Arc-backed slice. Borrow it directly so a batch
@@ -105,6 +103,51 @@ pub fn normalize_table_batch(
         }
     }
     normalizer.finish()
+}
+
+/// Accumulates normalized rows for multiple immutable `(relation_id, generation)` bindings.
+///
+/// A single instance is fed in source order and owns one normalizer per table. The map is ordered
+/// so callers produce the same deterministic table order as the previous grouped implementation,
+/// without retaining every decoded [`TableChange`] until the batch ends.
+#[derive(Default)]
+pub(crate) struct TableNormalizer<'a> {
+    normalizers: BTreeMap<(u32, u64), Normalizer<'a>>,
+}
+
+impl<'a> TableNormalizer<'a> {
+    pub(crate) fn push_table_change(
+        &mut self,
+        schema: &'a TableSchema,
+        change: &TableChange,
+    ) -> Result<(), NormalizeError> {
+        let key = (schema.relation_id, schema.generation);
+        let normalizer = match self.normalizers.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Normalizer::new_validated(schema)?)
+            }
+        };
+        normalizer.push(change)
+    }
+
+    pub(crate) fn push_transaction_change(
+        &mut self,
+        schema: &'a TableSchema,
+        change: &TransactionChange,
+    ) -> Result<(), NormalizeError> {
+        if let TransactionChange::Row(change) = change {
+            self.push_table_change(schema, change)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<BTreeMap<(u32, u64), Vec<StagingRow>>, NormalizeError> {
+        self.normalizers
+            .into_iter()
+            .map(|(key, normalizer)| normalizer.finish().map(|rows| (key, rows)))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -202,6 +245,11 @@ impl<'a> Normalizer<'a> {
             current_by_key: HashMap::new(),
             origin_by_key: HashMap::new(),
         }
+    }
+
+    fn new_validated(schema: &'a TableSchema) -> Result<Self, NormalizeError> {
+        schema.validate_supported()?;
+        Ok(Self::new(schema))
     }
 
     fn push(&mut self, change: &TableChange) -> Result<(), NormalizeError> {
