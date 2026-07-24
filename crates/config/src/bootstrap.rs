@@ -21,6 +21,12 @@ pub enum ConfigError {
     Invalid(String),
     #[error("required environment variable {0} is not set")]
     MissingEnvironment(String),
+    #[error("failed to read secret file {path} selected by {environment}: {source}")]
+    ReadSecret {
+        environment: String,
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,15 +61,19 @@ impl BootstrapConfig {
         if self.admin.username.trim().is_empty() {
             return Err(ConfigError::Invalid("admin.username is empty".into()));
         }
-        if !self
-            .admin
-            .password_hash
-            .expose_secret()
-            .starts_with("$argon2id$")
-        {
-            return Err(ConfigError::Invalid(
-                "admin.password_hash must be an Argon2id PHC string".into(),
-            ));
+        match (&self.admin.password_hash, &self.admin.password_hash_env) {
+            (Some(password_hash), None) => validate_password_hash(password_hash)?,
+            (None, Some(environment)) => validate_environment_name(environment)?,
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "admin.password_hash and admin.password_hash_env are mutually exclusive".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(ConfigError::Invalid(
+                    "one of admin.password_hash or admin.password_hash_env is required".into(),
+                ));
+            }
         }
         validate_environment_name(&self.control.database_url_env)?;
         validate_environment_name(&self.security.master_key_env)?;
@@ -78,6 +88,20 @@ impl BootstrapConfig {
 
     pub fn master_key(&self) -> Result<SecretString, ConfigError> {
         secret_from_environment(&self.security.master_key_env)
+    }
+
+    pub fn admin_password_hash(&self) -> Result<SecretString, ConfigError> {
+        let password_hash = match (&self.admin.password_hash, &self.admin.password_hash_env) {
+            (Some(password_hash), None) => password_hash.clone(),
+            (None, Some(environment)) => secret_from_environment(environment)?,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "administrator password hash configuration is invalid".into(),
+                ));
+            }
+        };
+        validate_password_hash(&password_hash)?;
+        Ok(password_hash)
     }
 }
 
@@ -103,6 +127,11 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        if !self.listen.ip().is_loopback() && !self.secure_cookies {
+            return Err(ConfigError::Invalid(
+                "server.secure_cookies must be true when server.listen is not loopback".into(),
+            ));
+        }
         if self.session_ttl_seconds == 0 {
             return Err(ConfigError::Invalid(
                 "server.session_ttl_seconds must be greater than zero".into(),
@@ -185,7 +214,10 @@ impl EngineConfig {
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     pub username: String,
-    pub password_hash: SecretString,
+    #[serde(default)]
+    pub password_hash: Option<SecretString>,
+    #[serde(default)]
+    pub password_hash_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,10 +246,47 @@ fn validate_environment_name(name: &str) -> Result<(), ConfigError> {
     }
 }
 
+fn validate_password_hash(password_hash: &SecretString) -> Result<(), ConfigError> {
+    if password_hash.expose_secret().starts_with("$argon2id$") {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(
+            "administrator password hash must be an Argon2id PHC string".into(),
+        ))
+    }
+}
+
 fn secret_from_environment(name: &str) -> Result<SecretString, ConfigError> {
-    env::var(name)
-        .map(SecretString::from)
-        .map_err(|_| ConfigError::MissingEnvironment(name.to_owned()))
+    let file_environment = format!("{name}_FILE");
+    let inline = env::var(name).ok();
+    let file = env::var(&file_environment).ok();
+    let value = match (inline, file) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::Invalid(format!(
+                "{name} and {file_environment} are mutually exclusive"
+            )));
+        }
+        (Some(value), None) => value,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .map_err(|source| ConfigError::ReadSecret {
+                environment: file_environment,
+                path,
+                source,
+            })?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned(),
+        (None, None) => {
+            return Err(ConfigError::MissingEnvironment(format!(
+                "{name} (or {name}_FILE)"
+            )));
+        }
+    };
+    if value.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "secret selected by {name} is empty"
+        )));
+    }
+    Ok(SecretString::from(value))
 }
 
 #[cfg(test)]
@@ -261,6 +330,8 @@ mod tests {
             config
                 .admin
                 .password_hash
+                .as_ref()
+                .unwrap()
                 .expose_secret()
                 .starts_with("$argon2id$")
         );
@@ -285,5 +356,35 @@ mod tests {
     fn rejects_zero_session_ttl() {
         let config = CONFIG.replace("session_ttl_seconds = 3600", "session_ttl_seconds = 0");
         assert!(BootstrapConfig::from_toml(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_insecure_cookies_on_non_loopback_listener() {
+        let config = CONFIG.replace("127.0.0.1:9090", "0.0.0.0:9090");
+        let error = BootstrapConfig::from_toml(&config).unwrap_err();
+        assert!(error.to_string().contains("secure_cookies must be true"));
+    }
+
+    #[test]
+    fn accepts_password_hash_environment_reference() {
+        let config = CONFIG.replace(
+            "password_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"",
+            "password_hash_env = \"ETL_ADMIN_PASSWORD_HASH\"",
+        );
+        let config = BootstrapConfig::from_toml(&config).unwrap();
+        assert_eq!(
+            config.admin.password_hash_env.as_deref(),
+            Some("ETL_ADMIN_PASSWORD_HASH")
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_password_hash_sources() {
+        let config = CONFIG.replace(
+            "password_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"",
+            "password_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"\npassword_hash_env = \"ETL_ADMIN_PASSWORD_HASH\"",
+        );
+        let error = BootstrapConfig::from_toml(&config).unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 }

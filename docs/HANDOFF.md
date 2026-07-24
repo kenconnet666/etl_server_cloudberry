@@ -3,8 +3,11 @@
 > 单一权威交接文档。取代早期的 PHASE0_PROGRESS / PHASE0_COMPLETE / PHASE1_PROGRESS
 > （已删除）。每次换机或阶段推进后更新本文。
 
-**最后更新:** 2026-07-22
+**最后更新:** 2026-07-23
 **工作分支:** `codex/phase2-ddl`（以 `git status --short --branch` 为准）
+
+下一步执行顺序与验收口径见 [next-steps.md](next-steps.md)；PostgreSQL heap 与 Cloudberry AOCO
+分析价值实测见 [analytics-value-benchmark.md](analytics-value-benchmark.md)。
 
 ## 换机快速开始
 
@@ -29,9 +32,12 @@ cargo test --workspace --lib
 - **Spool:** 固定目录（`engine.spool_directory`，默认 `data/spool`），不设硬容量上限；按 topology generation 自动清理被取代的旧目录；磁盘水位到达时进入 `RESOURCE_WAIT` 背压，不提前 ACK、不丢数据。
 - **Reconciliation:** Phase 1-2 差异一律触发 shadow rebuild；原地 repair 保持 capability-gated，直到 replay-compatible 协议对 PK move/delete/reuse/swap 的证明与故障矩阵成立。见 [reconciliation.md](reconciliation.md)。
 - **Topology:** Citus 真实数据面推到 Phase 4（per-worker slot/checkpoint/topology generation），当前 fail-closed（`DataPlane::Gated`）。`PhysicalHa` 只复用 Standalone 的单 active primary 路径；failover slot continuity 未实现或验证，且 runtime 当前拒绝 `failover`/`synced` slot。identity/timeline 漂移只提供安全停止/新 generation 边界，不等于无缝 HA。
-- **Reconciliation:** 有界 page/digest/diff primitives 与源/目标 canonical read 已存在，但没有周期 runtime caller；静默漂移尚不能自动触发表级重拉。
+- **Reconciliation:** Standalone 周期 runtime caller、持久 candidate/run state、canonical compare、
+  差异触发表级 reload 和 reload 前置失败的原子清理均已接入。真实外部进程 SIGKILL、Cloudberry/
+  PostgreSQL 容器重启、source/target 网络断连矩阵已通过；5 分钟 mixed DML+DDL+篡改 soak 已通过。
+  24/72h 长稳门禁仍未关闭。
 - **Migration:** control 与 target metadata 各自版本化、SHA-256 checksum 保护、启动时执行。已到 **target V9**（V8 = `schema_events`，V9 = per-table schema transition ledger）。
-- **Web UI:** **已重建为 Vue 3 + Naive UI + Pinia + Vue Router**（`9e48e29`），5 视图 + API 层 + 认证 store，构建通过。JWT/CSRF 认证待后端对接。
+- **Web UI:** **已重建为 Vue 3 + Naive UI + Pinia + Vue Router**（`9e48e29`），5 视图 + API 层 + 认证 store，Vite 8.1.5 clean build/audit 通过。JWT/CSRF 认证待后端对接。
 - **Cloudberry 镜像:** Apache Cloudberry 2.1 无官方即用 server 镜像（Docker Hub 只有 build/test 环境镜像）。**已解决**：`tests/integration/cloudberry/build-local-image.sh` 把官方 2.1.0 RPM 装进 rockylinux9 + `gpinitsystem` 起单节点 demo cluster（`init-singlenode.sh`），可复现地提供可运行 Cloudberry。CI 的 `integration-cloudberry` job 用它跑 target + E2E 测试。
 - **CI 验证矩阵:** 4 个 job——rust-checks（fmt/clippy/build/单测）、integration-pg18（真实 PG18 source + control-store）、integration-cloudberry（真实 Cloudberry target + 跨库 E2E）、web-checks（Vue 构建）。真实两端集成测试均已进 PR 门禁并本地验证通过。
 
@@ -57,9 +63,9 @@ cargo test --workspace --lib
 
 - **1.3 runtime 接入 bounded snapshot** ✅ `crates/engine/src/runtime/job.rs`：`load_table_snapshot` 按 PK page 循环（`read_canonical_pk_page` → `copy_range` → `copy_text_pk_range` → target `SnapshotPageLoader::apply_page` 同事务 cursor）；无 PK 表 fallback 整表 COPY。target 侧 `begin_snapshot_pages`/`SnapshotPageLoader`（`crates/target-cloudberry/src/snapshot.rs`）。含集成测试 `cloudberry21_snapshot_paging_with_resume`。**源侧 PK 分页已在真实 PG18 验证通过**。
 
-**Phase 1 功能基线：** transaction spool 在 target checkpoint 持久后立即幂等 retire；重启时先证明 slot 可从 checkpoint 重放，再清理同 identity 的中断残留；新 topology generation 清理旧目录。spool 不承担审计留存，避免额外 retention 配置和无谓磁盘占用。最大测试事务约 32 MiB，相对 64 KiB memory high-water 超过 512 倍，RSS 增量约 5.39 MiB；snapshot post-commit 与 5 个 in-process fault observer 边界全部收敛；磁盘 high-water 可自动退出 `RESOURCE_WAIT` 且不触发 rebuild。100k 默认批次和满批立即 flush 后，真实组合 E2E 测试耗时 32.04 秒（含 release 增量编译的命令总耗时 63.7 秒）。独立进程 SIGKILL、数据库/网络重启和长稳矩阵仍是生产退出条件。
+**Phase 1 功能基线：** transaction spool 在 target checkpoint 持久后立即幂等 retire；重启时先证明 slot 可从 checkpoint 重放，再清理同 identity 的中断残留；新 topology generation 清理旧目录。spool 不承担审计留存，避免额外 retention 配置和无谓磁盘占用。最大测试事务约 32 MiB，相对 64 KiB memory high-water 超过 512 倍，RSS 增量约 5.39 MiB；snapshot post-commit 与 5 个 in-process fault observer 边界全部收敛；磁盘 high-water 可自动退出 `RESOURCE_WAIT` 且不触发 rebuild。外部进程 SIGKILL、source/target 网络与容器重启均已在真实 PG18/Cloudberry 2.1 通过；长稳矩阵仍是生产退出条件。
 
-### Phase 2 — DDL 紧密跟随 🔶 Standalone 功能闭环，生产故障矩阵待完成
+### Phase 2 — DDL 紧密跟随 🔶 Standalone 功能闭环，长稳门禁待完成
 已完成（构建块 + 单测，见 `docs/phase2-ddl-tight-follow-adr.md`）：
 - **DDL 分类** ✅ `DdlMessage::replication_impact()`（`core/src/change.rs`）：CREATE INDEX/GRANT/ANALYZE 等证明无害命令不再触发 rebuild（fail-closed 白名单）。
 - **DDL event v2 类型** ✅ `TableTransition`/`TransitionKind`（AddColumn/DropColumn/RenameColumn/AlterColumnType/AddTable/DropTable/Unknown），`is_online_safe()` 保守判定；`DdlMessage.transitions`（`#[serde(default)]` 向后兼容 v1）。
@@ -84,12 +90,27 @@ cargo test --workspace --lib
 - **rapid DDL 与自动准入**：同 relation 的 catalog 超前按最新权威 catalog 合并为一次 reload；新表自动加入 publication 并 snapshot；最后一张表删除后 publication 可保持空并继续接收 transactional logical message。
 - **schema-scoped dependency closure**：ALTER TYPE/domain/collation 无 relation OID 但有 schema 时，保守重拉该 schema 全部受管表；完全未知 scope 仍 pipeline fail-closed。真实 enum 追加 E2E 通过。
 - **崩溃恢复**：新 lease 同时接管父 schema event 和子 transition；中断的 snapshot page/group 丢弃旧 exported-snapshot 边界并从新 slot 重拉，完成 COPY/cutover 的 group 幂等接管。真实 DDL page post-commit fault E2E 通过。
+- **generation 单调性与 schema drift recovery**：全量 snapshot 按 target active table generation 规划 `max(topology_generation, active+1)`；局部 reconciliation 后再次 full rebuild 的 generation 回归和三阶段 DDL/mixed soak 已通过。resume 发现 active fingerprint/table-set 漂移时会请求新 snapshot generation，不再以同一 epoch 无限重启。
+- **mixed soak 与分页预算回归**：5 分钟基线（582 个事务、11,640 insert、5,820 update、1,164
+  delete）以及新增 180 秒/120 秒（64 KiB `batch.max_bytes`）mixed soak 均最终逐行一致；64 KiB
+  回归为 4,640 insert、2,320 update、464 delete、最终 4,177 行，RSS 峰值 49,446,912 bytes，
+  retained WAL 峰值 161,208 bytes，spool 峰值/结束值均为 0。后者覆盖了 byte-bounded PK page
+  continuation，修复了旧实现超过 page budget 后无限 reload 重试的问题。
+- **production artifact smoke**：新 release image（linux/amd64）本地 digest 为
+  `sha256:459b06600d85f1ed863d569aeb8eb3d2e2044ab3525ccd0ecff37934a2281afb`；UID 10001 spool
+  写入、`check-config`、PostgreSQL 18 control volume、one-shot migration、`*_FILE` secrets、
+  read-only/non-root app、live/ready health、Caddy validate 和 6 条 Prometheus rules 均已通过。
+  PostgreSQL 18 control volume 必须挂载 `/var/lib/postgresql`。
+- **控制库恢复演练**：`deploy/standalone/control-db-backup.sh` 已完成原子 custom-format 备份、
+  archive 校验和隔离临时库 restore drill；实测恢复 8 张控制表并自动清理临时库。Compose、Caddy、
+  Prometheus rules 和脚本语法已加入 CI。上一版本镜像与控制库成对停机回滚及 RTO/RPO 仍待演练。
 
 **未完成（下一位优先处理，按顺序）：**
-1. **在线 ALTER 白名单。** 当前 Online 候选有意默认走 AOCO table-local reload；逐项证明 Cloudberry 2.1 ADD/DROP/RENAME/default/nullability/widening 的 crash-safe 原地 ALTER 后再启用，失败仍回落局部 reload。
-2. **完整 catalog dependency graph。** 当前已知 schema 使用保守闭包，正确但可能多拉无关表；补 type/domain/collation OID 依赖图后缩小闭包。
-3. **长时间 soak 与更多 cutover kill 点。** 现有 activation integration test 已证明 idempotent retry，runtime 还应增加 group registration 前后和 cutover commit response 丢失的显式 observer 矩阵。
-4. **代码整理。** 将 `runtime/job.rs` 的 table schema executor 移到独立模块，保持行为不变；不要在搬文件时同时修改状态机。
+1. **Phase 2/reconciliation 长稳矩阵。** 继续运行 24/72h DML+DDL+reconciliation，记录 lag、RSS、
+   spool、retained WAL、Cloudberry 膨胀和恢复时间；短时外部故障矩阵已通过。
+2. **在线 ALTER 白名单。** 当前 Online 候选有意默认走 AOCO table-local reload；逐项证明 Cloudberry 2.1 ADD/DROP/RENAME/default/nullability/widening 的 crash-safe 原地 ALTER 后再启用，失败仍回落局部 reload。
+3. **完整 catalog dependency graph。** 当前已知 schema 使用保守闭包，正确但可能多拉无关表；补 type/domain/collation OID 依赖图后缩小闭包。
+4. **代码整理。** 将 `runtime/job.rs` 的 table schema/reconciliation executor 移到独立模块，保持行为不变；不要在搬文件时同时修改状态机。
 
 **Phase 2 退出条件：** 并发 DML+DDL、同事务多次 DDL、rapid DDL、rename/drop/recreate、目标 commit ambiguity、进程重启和重复 WAL 矩阵通过；普通 DDL 不调用 `request_pipeline_rebuild`。
 
@@ -104,6 +125,10 @@ cargo test --workspace --lib
 
 ### Phase 3 / 4
 Standalone AOCO 已完成 bounded atomic batch：无 schema barrier 且未超过 row/byte 水位时，多个完整源事务跨事务按 table/key 折叠，一次 COPY/DML、一次 target commit、一次 checkpoint；超大事务继续走 chunk ledger。100k 行的 100×1k 小事务 A/B 从 backlog/streaming 6,739/7,041 提升到三次复跑中位数 35,288/45,212 rows/s（范围 32,835-41,262/43,327-45,739）；1M 小事务最终复跑为 46,753/46,753 rows/s（前一轮 48,270/47,077）。同一 25k key 的 4 轮/100k UPDATE 从按轮 4 commit、100k 行应用、21,545 ops/s，收敛到 1 commit、25k 行应用、35,654 input ops/s；默认 row limit 已由 10k 调到 100k，byte/delay 限界不变，满批立即 flush。`REPLICA IDENTITY DEFAULT` 保持推荐配置；FULL 在 64-byte/约 6 KiB PG18 A/B 中分别多产生 19.3%/45.3% WAL，对 key lineage 与最终状态折叠无收益。真实 runtime 已覆盖 atomic COMMIT 响应丢失重启和三事务同 key 折叠为一次 target commit。单 segment Cloudberry 的 target-only 4 表/400k 行 AOCO COPY 中，1/2/4 连接为 452,602/306,164/302,840 rows/s，分表连接池下降 32%-33%，Standalone 主线保持单连接和全局 bounded batch；未来只在真实多 segment 正收益后引入分表 durable applied LSN 协议。完整数据和 DuckLake 对比见 [standalone-benchmark.md](standalone-benchmark.md)。下一性能步骤是 Rust decode-only 分层基准，再决定是否用完整事务有界 channel 重叠 decode/spool 与 ordered apply；外部 MQ 与客户端列式转置不作为当前吞吐补丁。剩余为运行时 reconciliation、AOCO update/delete、多 segment 并行与 soak；Citus 当前 `DataPlane::Gated`，PhysicalHa 仅复用单 primary 路径。
+
+分析价值首轮基准使用相同 5M 事实表和 SQL：4 segment AOCO 比 PostgreSQL heap 节省 71.6%
+存储，五项 OLAP 几何平均快 1.44 倍（高基数聚合 4.50 倍），但维表 join 慢 32%、点查慢
+28.9 倍。结论是部分验证，未达到 2 倍整体门槛；下一轮需真实业务权重、50M+ 和并发矩阵。
 
 ## 测试环境
 

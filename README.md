@@ -36,7 +36,7 @@ next-machine checklist live in [docs/HANDOFF.md](docs/HANDOFF.md).
 - `crates/engine`: pipeline lifecycle, batching, recovery, and reconciliation.
 - `crates/api`: authenticated management HTTP API.
 - `crates/app`: command-line entry point and process lifecycle.
-- `web`: Svelte management interface.
+- `web`: Vue 3 management interface.
 
 ## Bootstrap configuration
 
@@ -56,7 +56,14 @@ restart_backoff_reset_seconds = 300
 `lease_renew_interval_seconds` must be shorter than `lease_ttl_seconds`; all six
 values must be positive, and the initial restart backoff must not exceed its
 maximum. Connection and master-key secrets are read from the environment names
-configured under `[control]` and `[security]`.
+configured under `[control]` and `[security]`. Each configured name also accepts
+the Docker/Kubernetes-style `<NAME>_FILE` alternative; setting both forms is an
+error. The administrator hash can likewise be supplied through
+`admin.password_hash_env`. Non-loopback listeners require Secure cookies.
+
+The hardened single-instance Compose bundle, TLS boundary, secret generation,
+backup, upgrade, alerting, and incident procedures are documented in
+[`docs/production-standalone.md`](docs/production-standalone.md).
 
 ## Development
 
@@ -75,3 +82,5 @@ run PostgreSQL, the service, and Cloudberry in one Linux/WSL instance to remove
 virtual-network noise; cross-boundary benchmarks are reported separately.
 The current Standalone AOCO 10k/100k/1M results and DuckLake comparison are in
 [`docs/standalone-benchmark.md`](docs/standalone-benchmark.md).
+The reproducible PostgreSQL heap versus Cloudberry AOCO analytical comparison and current value
+assessment are in [`docs/analytics-value-benchmark.md`](docs/analytics-value-benchmark.md).

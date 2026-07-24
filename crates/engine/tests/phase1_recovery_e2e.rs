@@ -846,6 +846,9 @@ async fn run_reconciliation_reload(context: &mut TestContext) -> Result<(), Box<
 
     let target = format!("{}.items", quote_identifier(&context.target_schema));
     context
+        .controller
+        .arm(RecoveryFault::SnapshotPageAfterCommit);
+    context
         .target
         .batch_execute(&format!(
             "BEGIN;
@@ -856,6 +859,38 @@ async fn run_reconciliation_reload(context: &mut TestContext) -> Result<(), Box<
         ))
         .await?;
 
+    context.controller.wait_until_fired().await?;
+    active.expect_fault(context.store.as_ref()).await?;
+    let failed = context
+        .target
+        .query_one(
+            "SELECT state, failure_reason FROM pg2cb_meta.table_reconciliation_state
+             WHERE pipeline_id=$1 ORDER BY source_relation_id LIMIT 1",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(failed.get::<_, String>("state"), "failed");
+    assert!(
+        failed
+            .get::<_, Option<String>>("failure_reason")
+            .as_deref()
+            .is_some_and(|reason| reason.contains("injected fatal recovery fault"))
+    );
+    let loading_groups: i64 = context
+        .target
+        .query_one(
+            "SELECT count(*) FROM pg2cb_meta.snapshot_groups
+             WHERE pipeline_id=$1 AND state='loading'",
+            &[&context.pipeline.id.as_uuid()],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        loading_groups, 0,
+        "failed reconciliation reload must remove its loading group atomically"
+    );
+
+    active = context.start_job().await?;
     wait_for_reconciliation_state(
         &context.target,
         context.pipeline.id,
@@ -920,6 +955,39 @@ async fn run_reconciliation_reload(context: &mut TestContext) -> Result<(), Box<
         reloaded_identity,
         "a clean follow-up cycle must not replace the AOCO relation again"
     );
+
+    // A table-local reload advances the persistent table generation independently of the
+    // pipeline topology epoch. The next full rebuild must choose a generation newer than both.
+    active.stop(context.store.as_ref()).await?;
+    let rebuild = context
+        .store
+        .request_pipeline_rebuild(context.pipeline.id)
+        .await?
+        .ok_or_else(|| {
+            io::Error::other("pipeline disappeared while requesting regression rebuild")
+        })?;
+    context.pipeline = rebuild.pipeline;
+    active = context.start_job().await?;
+    let rebuilt_identity = wait_for_active_table_generation(
+        &context.target,
+        context.pipeline.id,
+        reloaded_identity.1 + 1,
+        &active,
+    )
+    .await?;
+    assert_source_target_equal(
+        &context.source,
+        &context.target,
+        &context.source_schema,
+        &context.target_schema,
+    )
+    .await?;
+    assert_eq!(
+        rebuilt_identity.1,
+        reloaded_identity.1 + 1,
+        "full rebuild must advance beyond a table-local reconciliation generation"
+    );
+    assert_ne!(rebuilt_identity.0, reloaded_identity.0);
 
     active.stop(context.store.as_ref()).await?;
     Ok(())
@@ -2378,6 +2446,39 @@ async fn active_table_identity(
         )
         .await
         .map(|row| (row.get(0), row.get(1)))
+}
+
+async fn wait_for_active_table_generation(
+    target: &Client,
+    pipeline_id: PipelineId,
+    expected_generation: i64,
+    active: &ActiveJob,
+) -> Result<(i64, i64), Box<dyn Error>> {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if active.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err(io::Error::other(format!(
+                "pipeline stopped before active table reached generation {expected_generation}: {:?}",
+                active.telemetry.snapshot().last_error
+            ))
+            .into());
+        }
+        let identity = active_table_identity(target, pipeline_id).await?;
+        if identity.1 == expected_generation {
+            return Ok(identity);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "active table did not reach generation {expected_generation}; last generation was {}",
+                    identity.1
+                ),
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn wait_for_target_condition(

@@ -45,9 +45,10 @@ use cloudberry_etl_target_cloudberry::{
     },
     migration::{MigrationError, migrate_target_database},
     reconciliation::{
-        ReconciliationCandidate, ReconciliationRunIdentity, ReconciliationScanCompletion,
-        ReconciliationStartupRecovery, ReconciliationState, ReconciliationStateError,
-        activate_reconciliation_reload, begin_reconciliation, complete_reconciliation_scan,
+        RECONCILIATION_REASON_MAX_BYTES, ReconciliationCandidate, ReconciliationRunIdentity,
+        ReconciliationScanCompletion, ReconciliationStartupRecovery, ReconciliationState,
+        ReconciliationStateError, activate_reconciliation_reload, begin_reconciliation,
+        complete_reconciliation_scan, fail_reconciliation_reload,
         load_reconciliation_startup_recovery, load_reconciliation_state,
         mark_reconciliation_scanning, next_reconciliation_candidate, supersede_reconciliation,
     },
@@ -66,9 +67,10 @@ use cloudberry_etl_target_cloudberry::{
         activate_snapshot_group, activate_table_snapshot_group_in_transaction,
         adopt_table_snapshot_replay_group, begin_snapshot_apply, begin_snapshot_group,
         begin_snapshot_group_in_transaction, begin_snapshot_pages, cleanup_stale_snapshot_groups,
-        garbage_collect_quarantined_tables, load_snapshot_group_manifest,
-        plan_snapshot_target_with_storage, quarantine_active_table_in_transaction,
-        reset_interrupted_table_snapshot_group, validate_active_tables,
+        garbage_collect_quarantined_tables, load_active_table_generations,
+        load_snapshot_group_manifest, plan_snapshot_target_with_storage,
+        quarantine_active_table_in_transaction, reset_interrupted_table_snapshot_group,
+        validate_active_tables,
     },
     storage::{StorageCapabilityError, load_relation_storage, verify_storage_available},
     table_transition::{
@@ -268,6 +270,8 @@ enum RuntimeJobError {
     },
     #[error("reconciliation table generation overflowed after {0}")]
     ReconciliationGenerationOverflow(u64),
+    #[error("table `{table}` generation {active} cannot advance within the target bigint range")]
+    TableGenerationExhausted { table: String, active: u64 },
     #[error("reconciliation deadline overflowed the system clock")]
     ReconciliationDeadlineOverflow,
     #[error(transparent)]
@@ -558,6 +562,83 @@ const fn data_plane_for_topology(topology: SourceTopology) -> DataPlane {
     }
 }
 
+fn should_record_reconciliation_failure(error: &RuntimeJobError) -> bool {
+    match error {
+        RuntimeJobError::Cancelled => false,
+        RuntimeJobError::Checkpoint(error) => !checkpoint_error_is_stale(error),
+        RuntimeJobError::ReconciliationState(error) => !reconciliation_state_error_is_stale(error),
+        RuntimeJobError::Snapshot(error) => !snapshot_error_is_stale(error),
+        RuntimeJobError::ReconciliationReader(error) => {
+            !reconciliation_reader_error_is_stale(error)
+        }
+        _ => true,
+    }
+}
+
+fn preparation_error_requires_rebuild(error: &RuntimeJobError) -> bool {
+    matches!(
+        error,
+        RuntimeJobError::MissingSlot(_)
+            | RuntimeJobError::SlotInvalidated { .. }
+            | RuntimeJobError::SlotAheadOfTarget { .. }
+            | RuntimeJobError::WalLost
+            | RuntimeJobError::WalRetentionExceeded { .. }
+            | RuntimeJobError::PublicationDrift(_)
+            | RuntimeJobError::TargetStorageDrift { .. }
+            | RuntimeJobError::Snapshot(
+                SnapshotTargetError::ActiveTableCountMismatch { .. }
+                    | SnapshotTargetError::ActiveTableTargetMismatch { .. }
+                    | SnapshotTargetError::ActiveTableFingerprintMismatch(_)
+                    | SnapshotTargetError::ManagedByOtherSource { .. }
+            )
+    )
+}
+
+fn checkpoint_error_is_stale(error: &CheckpointError) -> bool {
+    matches!(
+        error,
+        CheckpointError::StaleFence { .. } | CheckpointError::MissingFence
+    )
+}
+
+fn reconciliation_state_error_is_stale(error: &ReconciliationStateError) -> bool {
+    match error {
+        ReconciliationStateError::Fence(error) => checkpoint_error_is_stale(error),
+        ReconciliationStateError::NewerStoredFence { .. } => true,
+        ReconciliationStateError::Snapshot(error) => snapshot_error_is_stale(error),
+        _ => false,
+    }
+}
+
+fn snapshot_error_is_stale(error: &SnapshotTargetError) -> bool {
+    matches!(error, SnapshotTargetError::Checkpoint(error) if checkpoint_error_is_stale(error))
+}
+
+fn reconciliation_reader_error_is_stale(error: &ReconciliationReaderError) -> bool {
+    match error {
+        ReconciliationReaderError::Checkpoint(error) => checkpoint_error_is_stale(error),
+        ReconciliationReaderError::ReconciliationState(error) => {
+            reconciliation_state_error_is_stale(error)
+        }
+        _ => false,
+    }
+}
+
+fn bounded_reconciliation_failure_reason(error: &RuntimeJobError) -> String {
+    let mut reason = error.to_string().replace('\0', " ");
+    if reason.is_empty() {
+        reason.push_str("reconciliation reload failed");
+    }
+    if reason.len() > RECONCILIATION_REASON_MAX_BYTES {
+        let mut end = RECONCILIATION_REASON_MAX_BYTES;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
+}
+
 /// Bridge a source canonical PK key into the target's durable text cursor.
 ///
 /// Canonical snapshot keys are produced through PostgreSQL's text output with a
@@ -668,18 +749,7 @@ impl PostgresCloudberryJob {
         };
         let prepared = match preparation {
             Ok(prepared) => prepared,
-            Err(error)
-                if matches!(
-                    error,
-                    RuntimeJobError::MissingSlot(_)
-                        | RuntimeJobError::SlotInvalidated { .. }
-                        | RuntimeJobError::SlotAheadOfTarget { .. }
-                        | RuntimeJobError::WalLost
-                        | RuntimeJobError::WalRetentionExceeded { .. }
-                        | RuntimeJobError::PublicationDrift(_)
-                        | RuntimeJobError::TargetStorageDrift { .. }
-                ) =>
-            {
+            Err(error) if preparation_error_requires_rebuild(&error) => {
                 self.request_rebuild(&error.to_string()).await?;
                 return Ok(StandaloneEpochOutcome::Finished);
             }
@@ -1096,19 +1166,39 @@ impl PostgresCloudberryJob {
 
         let run_id = Uuid::now_v7();
         let temporary_slot_name = shorten_identifier(&format!("pg2cb_r_{}", run_id.simple()));
-        let mut boundary_guard = ReconciliationBoundaryGuard::create(
-            self.source_dsn.expose_secret(),
-            &temporary_slot_name,
-        )
-        .await?;
-        let boundary = boundary_guard.boundary().clone();
-        if boundary.system_identifier != report.identity.system_identifier
-            || boundary.timeline != report.identity.timeline
-        {
-            boundary_guard.cleanup().await?;
-            return Err(RuntimeJobError::SourceIdentityChanged);
-        }
-        stop_boundary.set(boundary.consistent_point)?;
+        let (mut boundary_guard, boundary) = {
+            let mut attempt = 0_u8;
+            loop {
+                attempt += 1;
+                let mut guard = ReconciliationBoundaryGuard::create(
+                    self.source_dsn.expose_secret(),
+                    &temporary_slot_name,
+                )
+                .await?;
+                let boundary = guard.boundary().clone();
+                if boundary.system_identifier != report.identity.system_identifier
+                    || boundary.timeline != report.identity.timeline
+                {
+                    guard.cleanup().await?;
+                    return Err(RuntimeJobError::SourceIdentityChanged);
+                }
+                match stop_boundary.set(boundary.consistent_point) {
+                    Ok(()) => break (guard, boundary),
+                    Err(error) => {
+                        guard.cleanup().await?;
+                        if attempt >= 3 {
+                            return Err(error.into());
+                        }
+                        tracing::debug!(
+                            pipeline_id = %self.pipeline_id,
+                            source_relation_id = candidate.source_relation_id,
+                            attempt,
+                            "CDC passed a reconciliation boundary before it was armed; retrying"
+                        );
+                    }
+                }
+            }
+        };
 
         let mut snapshot_client = connect_sql(&self.source_dsn, EndpointRole::Source).await?;
         let mut snapshot =
@@ -1316,23 +1406,71 @@ impl PostgresCloudberryJob {
                 applied_lsn: boundary.consistent_point,
             }],
         };
-        begin_snapshot_group(&mut target, &activation_request).await?;
+        if let Err(error) = begin_snapshot_group(&mut target, &activation_request).await {
+            let error = RuntimeJobError::Snapshot(error);
+            let _ = snapshot.rollback().await;
+            self.record_reconciliation_reload_failure(
+                &mut target,
+                &run,
+                &activation_request,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
         let ownership = SnapshotOwnership {
             fence: self.fence,
             snapshot_group_id,
             schema_fingerprint: candidate.schema_fingerprint.clone(),
         };
         self.telemetry.set_phase(PipelinePhase::Snapshotting);
-        self.load_table_snapshot(
-            &mut target,
-            &mut snapshot,
-            &reload_table,
-            &ownership,
-            &cancellation,
-        )
-        .await?;
-        snapshot.commit().await?;
-        activate_reconciliation_reload(&mut target, &run, &activation_request, next_due_at).await?;
+        if let Err(error) = self
+            .load_table_snapshot(
+                &mut target,
+                &mut snapshot,
+                &reload_table,
+                &ownership,
+                &cancellation,
+            )
+            .await
+        {
+            let _ = snapshot.rollback().await;
+            self.record_reconciliation_reload_failure(
+                &mut target,
+                &run,
+                &activation_request,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+        if let Err(error) = snapshot.commit().await {
+            let error = RuntimeJobError::Source(error);
+            tracing::warn!(
+                pipeline_id = %self.pipeline_id,
+                source_relation_id = run.source_relation_id,
+                run_id = %run.run_id,
+                snapshot_group_id = %activation_request.snapshot_group_id,
+                error = %error,
+                "source snapshot commit result is uncertain; preserving reconciliation reload for recovery"
+            );
+            return Err(error);
+        }
+        if let Err(error) =
+            activate_reconciliation_reload(&mut target, &run, &activation_request, next_due_at)
+                .await
+        {
+            let error = RuntimeJobError::ReconciliationState(error);
+            tracing::warn!(
+                pipeline_id = %self.pipeline_id,
+                source_relation_id = run.source_relation_id,
+                run_id = %run.run_id,
+                snapshot_group_id = %activation_request.snapshot_group_id,
+                error = %error,
+                "reconciliation activation result is uncertain; preserving durable state for idempotent recovery"
+            );
+            return Err(error);
+        }
         tracing::warn!(
             pipeline_id = %self.pipeline_id,
             table = %candidate.target,
@@ -1342,6 +1480,57 @@ impl PostgresCloudberryJob {
             "reconciliation mismatch reloaded only the affected AOCO table"
         );
         Ok(())
+    }
+
+    /// Best-effort durable failure handling before reload activation is attempted.
+    ///
+    /// The source snapshot is rolled back by the caller before reaching this helper. Cancellation
+    /// and stale leases remain nonterminal for startup recovery. Other pre-activation failures use
+    /// the target-side atomic cleanup API. This helper must not be called after source snapshot
+    /// commit or target activation starts, because either response may be ambiguous.
+    async fn record_reconciliation_reload_failure(
+        &self,
+        target: &mut tokio_postgres::Client,
+        run: &ReconciliationRunIdentity,
+        request: &SnapshotActivationRequest,
+        error: &RuntimeJobError,
+    ) {
+        if !should_record_reconciliation_failure(error) {
+            return;
+        }
+        let Some(next_due_at) =
+            SystemTime::now().checked_add(self.pipeline_settings.reconciliation.retry_delay())
+        else {
+            tracing::error!(
+                pipeline_id = %self.pipeline_id,
+                run_id = %run.run_id,
+                "unable to schedule reconciliation reload failure retry"
+            );
+            return;
+        };
+        let reason = bounded_reconciliation_failure_reason(error);
+        match fail_reconciliation_reload(target, run, request, &reason, next_due_at).await {
+            Ok(outcome) => {
+                tracing::warn!(
+                    pipeline_id = %self.pipeline_id,
+                    source_relation_id = run.source_relation_id,
+                    run_id = %run.run_id,
+                    ?outcome,
+                    %reason,
+                    "reconciliation reload failed; loading snapshot was cleaned"
+                );
+            }
+            Err(cleanup_error) => {
+                tracing::warn!(
+                    pipeline_id = %self.pipeline_id,
+                    source_relation_id = run.source_relation_id,
+                    run_id = %run.run_id,
+                    %reason,
+                    error = %cleanup_error,
+                    "reconciliation reload failure could not be durably recorded"
+                );
+            }
+        }
     }
 
     async fn fail_schema_event_for_rebuild(
@@ -2265,6 +2454,47 @@ impl PostgresCloudberryJob {
         }
     }
 
+    async fn advance_full_snapshot_table_generations(
+        &self,
+        target: &mut tokio_postgres::Client,
+        tables: &mut [RuntimeTable],
+    ) -> Result<(), RuntimeJobError> {
+        let active = load_active_table_generations(target, self.fence).await?;
+        for table in tables {
+            let active_generation = active
+                .iter()
+                .find(|current| current.target == table.planned.target)
+                .map(|current| current.table_generation);
+            let generation = match active_generation {
+                Some(active) => self
+                    .topology_generation
+                    .max(active.checked_add(1).ok_or_else(|| {
+                        RuntimeJobError::TableGenerationExhausted {
+                            table: table.planned.target.to_string(),
+                            active,
+                        }
+                    })?),
+                None => self.topology_generation,
+            };
+            if i64::try_from(generation).is_err() {
+                return Err(RuntimeJobError::TableGenerationExhausted {
+                    table: table.planned.target.to_string(),
+                    active: active_generation.unwrap_or(generation),
+                });
+            }
+            let mut snapshot_schema = table.planned.source.clone();
+            snapshot_schema.generation = generation;
+            table.snapshot_plan = plan_snapshot_target_with_storage(
+                &snapshot_schema,
+                table.planned.target.clone(),
+                table.planned.shadow.clone(),
+                table.planned.storage,
+            )?;
+            table.table_generation = generation;
+        }
+        Ok(())
+    }
+
     async fn ensure_publication(
         &self,
         source: &tokio_postgres::Client,
@@ -2501,7 +2731,7 @@ impl PostgresCloudberryJob {
             guard.release()?;
 
             let inventory = snapshot.inspect_tables(&self.catalog_options()).await?;
-            let tables = self.plan_inventory(inventory)?;
+            let mut tables = self.plan_inventory(inventory)?;
             let catalog_unchanged = publication_tables.len() == tables.len()
                 && publication_tables
                     .iter()
@@ -2511,6 +2741,8 @@ impl PostgresCloudberryJob {
                 snapshot.rollback().await?;
                 return Err(RuntimeJobError::InitialCatalogChanged);
             }
+            self.advance_full_snapshot_table_generations(target, &mut tables)
+                .await?;
 
             let checkpoint = NodeCheckpoint {
                 key: CheckpointKey {
@@ -2868,6 +3100,83 @@ mod tests {
             rebuild_bytes: 200,
             minimum_safe_bytes: 50,
         }
+    }
+
+    #[test]
+    fn reconciliation_failure_cleanup_skips_cancellation_and_stale_fences() {
+        assert!(!should_record_reconciliation_failure(
+            &RuntimeJobError::Cancelled
+        ));
+        assert!(!should_record_reconciliation_failure(
+            &RuntimeJobError::Checkpoint(CheckpointError::StaleFence {
+                expected_generation: 4,
+                expected_token: 8,
+                actual_generation: 4,
+                actual_token: 9,
+            })
+        ));
+        assert!(!should_record_reconciliation_failure(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::Checkpoint(
+                CheckpointError::MissingFence,
+            ))
+        ));
+        assert!(!should_record_reconciliation_failure(
+            &RuntimeJobError::ReconciliationState(ReconciliationStateError::NewerStoredFence {
+                stored: 9,
+                active: 8,
+            },)
+        ));
+        assert!(should_record_reconciliation_failure(
+            &RuntimeJobError::ReconciliationDeadlineOverflow
+        ));
+    }
+
+    #[test]
+    fn resume_schema_drift_and_source_recreation_request_rebuilds_without_masking_ownership() {
+        assert!(preparation_error_requires_rebuild(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::ActiveTableFingerprintMismatch(
+                "analytics.items".to_owned(),
+            ))
+        ));
+        assert!(preparation_error_requires_rebuild(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::ActiveTableCountMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        ));
+        assert!(!preparation_error_requires_rebuild(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::ExistingUnmanagedTable(
+                "analytics.items".to_owned(),
+            ))
+        ));
+        assert!(preparation_error_requires_rebuild(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::ManagedByOtherSource {
+                table: "analytics.items".to_owned(),
+                expected: 7,
+                actual: 8,
+            })
+        ));
+        assert!(!preparation_error_requires_rebuild(
+            &RuntimeJobError::Snapshot(SnapshotTargetError::ManagedByOtherPipeline {
+                table: "analytics.items".to_owned(),
+                expected: PipelineId::from_uuid(Uuid::from_u128(7)),
+                actual: PipelineId::from_uuid(Uuid::from_u128(8)),
+            })
+        ));
+    }
+
+    #[test]
+    fn reconciliation_failure_reason_is_utf8_bounded_and_nul_free() {
+        let error = RuntimeJobError::ReconciliationScanTimeout(format!(
+            "bad\0{}",
+            "界".repeat(RECONCILIATION_REASON_MAX_BYTES)
+        ));
+        let reason = bounded_reconciliation_failure_reason(&error);
+
+        assert!(!reason.contains('\0'));
+        assert!(!reason.is_empty());
+        assert!(reason.len() <= RECONCILIATION_REASON_MAX_BYTES);
+        assert!(reason.is_char_boundary(reason.len()));
     }
 
     #[test]

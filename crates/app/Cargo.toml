@@ -36,3 +36,11 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+cloudberry-etl-core.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+url.workspace = true
+uuid.workspace = true

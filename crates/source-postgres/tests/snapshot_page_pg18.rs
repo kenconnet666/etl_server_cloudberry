@@ -70,6 +70,33 @@ async fn canonical_composite_pk_pages_drive_direct_range_copy() -> SourceResult<
         assert_eq!(first.next_key, Some(key("a", "2")));
         assert!(first.materialized_bytes <= limits.max_page_bytes);
 
+        let single = session
+            .read_canonical_pk_page(
+                &schema,
+                None,
+                SnapshotPageLimits {
+                    row_limit: 1,
+                    max_page_bytes: 1024 * 1024,
+                },
+            )
+            .await?;
+        let byte_bounded = session
+            .read_canonical_pk_page(
+                &schema,
+                None,
+                SnapshotPageLimits {
+                    row_limit: 4,
+                    max_page_bytes: single.materialized_bytes,
+                },
+            )
+            .await?;
+        assert!(
+            byte_bounded.has_more,
+            "a byte-bounded prefix must retain a continuation cursor"
+        );
+        assert_eq!(byte_bounded.rows.len(), 1);
+        assert!(byte_bounded.next_cursor().is_some());
+
         let first_copy = {
             let range = first.copy_range()?;
             assert_eq!(range.start_exclusive(), None);

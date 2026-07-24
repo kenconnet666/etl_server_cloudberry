@@ -17,8 +17,8 @@ use crate::{
 };
 
 use super::{
-    ActiveTableMetadata, ActiveTableRequirement, ManagedTableRecord, ManagedTableState,
-    RelationState, SnapshotActivationDisposition, SnapshotActivationOutcome,
+    ActiveTableGeneration, ActiveTableMetadata, ActiveTableRequirement, ManagedTableRecord,
+    ManagedTableState, RelationState, SnapshotActivationDisposition, SnapshotActivationOutcome,
     SnapshotActivationRequest, SnapshotActivationTable, SnapshotTargetError, database_generation,
     ensure_one_metadata_row, load_relation_state, manifest, matches_activation, progress,
     relation_oid, validate_managed_fence, validate_managed_identity,
@@ -822,6 +822,45 @@ pub async fn validate_active_tables(
     Ok(active)
 }
 
+/// Loads target-authoritative generations for all active tables in one pipeline.
+///
+/// Table-local reconciliation can advance `managed_tables.table_generation` without changing the
+/// pipeline topology generation. Full snapshot planning must read this state before proposing a
+/// new activation, otherwise it can retry forever with a generation that is no longer newer than
+/// the active relation.
+pub async fn load_active_table_generations(
+    client: &mut Client,
+    fence: crate::checkpoint::PipelineFence,
+) -> Result<Vec<ActiveTableGeneration>, SnapshotTargetError> {
+    let transaction = client.transaction().await?;
+    lock_pipeline_fence(&transaction, fence).await?;
+    let sql = format!(
+        "SELECT target_schema, target_table, pipeline_id, snapshot_group_id, relation_oid, source_relation_id, table_generation, schema_fingerprint, state, fencing_token FROM {}.managed_tables WHERE pipeline_id = $1 AND state = 'active' ORDER BY target_schema, target_table FOR UPDATE",
+        quote_identifier(TARGET_METADATA_SCHEMA)?
+    );
+    let rows = transaction
+        .query(&sql, &[&fence.pipeline_id.as_uuid()])
+        .await?;
+    let mut active = Vec::with_capacity(rows.len());
+    for row in rows {
+        let target = QualifiedName::new(
+            row.try_get::<_, String>("target_schema")?,
+            row.try_get::<_, String>("target_table")?,
+        )
+        .map_err(crate::schema::SchemaError::from)?;
+        let record = super::managed_table_record_from_row(&target, &row)?;
+        validate_managed_fence(&target, &record, fence.fencing_token)?;
+        require_state(&target, &record, ManagedTableState::Active)?;
+        active.push(ActiveTableGeneration {
+            target,
+            source_relation_id: record.source_relation_id,
+            table_generation: record.table_generation,
+        });
+    }
+    transaction.commit().await?;
+    Ok(active)
+}
+
 fn classify_table(
     request: &SnapshotActivationRequest,
     table: &SnapshotActivationTable,
@@ -841,12 +880,13 @@ fn classify_table(
             ));
         }
         RelationState::Managed(record) => {
-            validate_managed_identity(
-                &table.target,
-                &record,
-                request.fence.pipeline_id,
-                table.source_relation_id,
-            )?;
+            if record.pipeline_id != request.fence.pipeline_id {
+                return Err(SnapshotTargetError::ManagedByOtherPipeline {
+                    table: table.target.to_string(),
+                    expected: request.fence.pipeline_id,
+                    actual: record.pipeline_id,
+                });
+            }
             validate_managed_fence(&table.target, &record, request.fence.fencing_token)?;
             require_state(&table.target, &record, ManagedTableState::Active)?;
             Some(record)

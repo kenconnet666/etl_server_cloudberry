@@ -394,6 +394,12 @@ struct CanonicalPagePlan {
     sql: String,
     key_indexes: Vec<usize>,
     value_count: usize,
+    projection: CanonicalProjection,
+}
+
+struct CanonicalPageQuery {
+    rows: Vec<CanonicalSnapshotRow>,
+    has_more: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -650,15 +656,18 @@ impl<'client> SnapshotSession<'client> {
             limits,
             CanonicalProjection::KeysOnly,
         )?;
-        let rows = self
+        let page = self
             .query_canonical_page(plan, cursor, limits, &table_identity)
-            .await?
+            .await?;
+        let rows = page
+            .rows
             .into_iter()
             .map(|row| CanonicalSnapshotKeyRow { key: row.key })
             .collect();
         finish_key_page(
             rows,
             limits.row_limit,
+            page.has_more,
             &self.snapshot_id,
             table_identity,
             start_exclusive,
@@ -695,12 +704,13 @@ impl<'client> SnapshotSession<'client> {
             limits,
             CanonicalProjection::AllColumns,
         )?;
-        let rows = self
+        let page = self
             .query_canonical_page(plan, cursor, limits, &table_identity)
             .await?;
         finish_row_page(
-            rows,
+            page.rows,
             limits.row_limit,
+            page.has_more,
             &self.snapshot_id,
             table_identity,
             start_exclusive,
@@ -750,7 +760,7 @@ impl<'client> SnapshotSession<'client> {
         cursor: Option<&SnapshotCursor>,
         limits: SnapshotPageLimits,
         table_identity: &SnapshotTableIdentity,
-    ) -> SourceResult<Vec<CanonicalSnapshotRow>> {
+    ) -> SourceResult<CanonicalPageQuery> {
         validate_cursor_scope(cursor, &self.snapshot_id, table_identity)?;
         let start_text = validate_key(
             "cursor",
@@ -774,8 +784,14 @@ impl<'client> SnapshotSession<'client> {
         let mut rows = Vec::new();
         let mut materialized_bytes = 0usize;
         let mut previous_key: Option<Vec<Bytes>> = None;
+        let mut returned_rows = 0usize;
+        let mut truncated_for_budget = false;
+        let mut oversized_row_bytes = None;
 
         while let Some(row) = stream.as_mut().try_next().await? {
+            returned_rows = returned_rows.checked_add(1).ok_or_else(|| {
+                SourceError::contract("canonical snapshot returned row count overflow")
+            })?;
             let expected_arity = plan
                 .value_count
                 .checked_add(1)
@@ -800,31 +816,47 @@ impl<'client> SnapshotSession<'client> {
                 ));
             }
 
-            let row_bytes = estimate_canonical_row_bytes(&canonical).ok_or_else(|| {
+            let row_bytes = match plan.projection {
+                CanonicalProjection::KeysOnly => estimate_canonical_key_row_bytes(&canonical.key),
+                CanonicalProjection::AllColumns => estimate_canonical_row_bytes(&canonical),
+            }
+            .ok_or_else(|| {
                 SourceError::contract("canonical snapshot page byte estimate overflow")
             })?;
-            materialized_bytes = materialized_bytes.checked_add(row_bytes).ok_or_else(|| {
-                SourceError::contract("canonical snapshot page byte estimate overflow")
-            })?;
-            if materialized_bytes > limits.max_page_bytes {
-                return Err(SourceError::contract(format!(
-                    "canonical snapshot page requires {materialized_bytes} estimated bytes, exceeding max_page_bytes {}",
-                    limits.max_page_bytes
-                )));
+            let next_materialized_bytes =
+                materialized_bytes.checked_add(row_bytes).ok_or_else(|| {
+                    SourceError::contract("canonical snapshot page byte estimate overflow")
+                })?;
+            if !truncated_for_budget && next_materialized_bytes <= limits.max_page_bytes {
+                materialized_bytes = next_materialized_bytes;
+                previous_key = Some(canonical.key.clone());
+                rows.push(canonical);
+                continue;
             }
 
             previous_key = Some(canonical.key.clone());
-            rows.push(canonical);
+            truncated_for_budget = true;
+            if rows.is_empty() {
+                oversized_row_bytes.get_or_insert(row_bytes);
+            }
         }
 
         let max_rows = limits.limit_plus_one()?;
-        if rows.len() > max_rows {
+        if returned_rows > max_rows {
             return Err(SourceError::contract(format!(
-                "canonical snapshot returned {} rows for LIMIT {max_rows}",
-                rows.len()
+                "canonical snapshot returned {returned_rows} rows for LIMIT {max_rows}"
             )));
         }
-        Ok(rows)
+        if let Some(row_bytes) = oversized_row_bytes {
+            return Err(SourceError::contract(format!(
+                "canonical snapshot row requires {row_bytes} estimated bytes, exceeding max_page_bytes {}",
+                limits.max_page_bytes
+            )));
+        }
+        Ok(CanonicalPageQuery {
+            rows,
+            has_more: truncated_for_budget || returned_rows > limits.row_limit,
+        })
     }
 
     /// Commit only after all COPY streams have been drained. Dropping this session rolls back.
@@ -900,6 +932,7 @@ fn build_canonical_page_plan(
         sql,
         key_indexes,
         value_count: selected_columns.len(),
+        projection,
     })
 }
 
@@ -1149,6 +1182,7 @@ fn decode_canonical_row(
 fn finish_key_page(
     mut rows: Vec<CanonicalSnapshotKeyRow>,
     row_limit: usize,
+    has_more_hint: bool,
     snapshot_id: &str,
     table_identity: SnapshotTableIdentity,
     start_exclusive: Option<Vec<Bytes>>,
@@ -1162,7 +1196,7 @@ fn finish_key_page(
             rows.len()
         )));
     }
-    let has_more = rows.len() > row_limit;
+    let has_more = has_more_hint || rows.len() > row_limit;
     if has_more {
         rows.truncate(row_limit);
     }
@@ -1183,6 +1217,7 @@ fn finish_key_page(
 fn finish_row_page(
     mut rows: Vec<CanonicalSnapshotRow>,
     row_limit: usize,
+    has_more_hint: bool,
     snapshot_id: &str,
     table_identity: SnapshotTableIdentity,
     start_exclusive: Option<Vec<Bytes>>,
@@ -1196,7 +1231,7 @@ fn finish_row_page(
             rows.len()
         )));
     }
-    let has_more = rows.len() > row_limit;
+    let has_more = has_more_hint || rows.len() > row_limit;
     if has_more {
         rows.truncate(row_limit);
     }
@@ -1229,6 +1264,16 @@ fn estimate_key_page_bytes(rows: &[CanonicalSnapshotKeyRow]) -> Option<usize> {
             .checked_add(containers)?
             .checked_add(payload)
     })
+}
+
+fn estimate_canonical_key_row_bytes(key: &[Bytes]) -> Option<usize> {
+    let containers = key.len().checked_mul(size_of::<Bytes>())?;
+    let payload = key
+        .iter()
+        .try_fold(0usize, |bytes, value| bytes.checked_add(value.len()))?;
+    size_of::<CanonicalSnapshotKeyRow>()
+        .checked_add(containers)?
+        .checked_add(payload)
 }
 
 fn estimate_canonical_row_bytes(row: &CanonicalSnapshotRow) -> Option<usize> {
@@ -1645,6 +1690,7 @@ mod tests {
         let first = finish_key_page(
             vec![key(&[b"a", b"1"]), key(&[b"a", b"2"]), key(&[b"a", b"3"])],
             2,
+            false,
             "snapshot-a",
             table_identity.clone(),
             None,
@@ -1669,6 +1715,7 @@ mod tests {
         let tail = finish_key_page(
             vec![key(&[b"b", b"1"])],
             2,
+            false,
             "snapshot-a",
             table_identity.clone(),
             Some(start.key().to_vec()),
@@ -1689,6 +1736,7 @@ mod tests {
         let empty = finish_key_page(
             Vec::new(),
             2,
+            false,
             "snapshot-a",
             table_identity.clone(),
             Some(tail_cursor.key().to_vec()),

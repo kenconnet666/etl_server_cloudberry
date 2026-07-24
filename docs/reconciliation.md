@@ -1,10 +1,9 @@
 # PostgreSQL 到 Cloudberry 的一致性校验与修复设计
 
-> 状态：设计文档。本文不表示 reconciliation/repair 已经实现，也不解锁
-> Physical HA 或 Citus 数据面。当前实现只提供 `crates/engine/src/reconcile.rs`
-> 中 validation-gated 的 page/range、digest 和 bounded diff 纯原语；它不获取 fence、
-> 不建立 source snapshot、不写 target，也不持久化 cursor。下面的 target/source session API
-> 仍是后续实现契约。
+> 状态：Standalone 实现与设计约束。周期 runner、source exported snapshot、main-slot durable
+> boundary、target/source canonical reader、持久 run state 和差异触发表级 shadow reload 已接入并
+> 通过真实 PostgreSQL 18 / Cloudberry 2.1 测试。原地 row repair、Physical HA 与 Citus 数据面仍为
+> validation-gated；本文中描述这些能力的未来式段落仍是后续契约，不代表已开放支持。
 
 ## 目标与边界
 

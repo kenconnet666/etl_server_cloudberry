@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a runnable single-node Apache Cloudberry 2.1 Docker image locally.
+# Build a runnable single-host Apache Cloudberry 2.1 Docker image locally.
 #
 # Apache Cloudberry 2.1 publishes no ready-to-run server image (only build/test
 # env images). This script closes that gap: it installs the official 2.1.0
@@ -18,6 +18,7 @@ RPM_GLOB="apache-cloudberry-db-incubating-2.1.0-1.el9.x86_64.rpm"
 IMAGE="cbdb-local:2.1.0"
 CONTAINER="${CBDB_CONTAINER:-cbdb}"
 HOST_PORT="${CBDB_PORT:-55433}"
+SEGMENT_COUNT="${CBDB_SEGMENTS:-1}"
 
 mkdir -p "${WORK}"
 
@@ -39,13 +40,16 @@ fi
 
 echo "== starting ${CONTAINER} on host port ${HOST_PORT} =="
 cp "${HERE}/init-singlenode.sh" "${WORK}/init-singlenode.sh"
+cp "${HERE}/container-entrypoint.sh" "${WORK}/container-entrypoint.sh"
 sed -i 's/\r$//' "${WORK}/init-singlenode.sh"
+sed -i 's/\r$//' "${WORK}/container-entrypoint.sh"
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
 docker run -d --name "${CONTAINER}" --shm-size=1g \
-  -p "${HOST_PORT}:5432" -v "${WORK}:/rpm" "${IMAGE}" sleep infinity
+  -p "${HOST_PORT}:5432" -v "${WORK}:/rpm" "${IMAGE}" \
+  bash /rpm/container-entrypoint.sh
 
-echo "== initializing single-node cluster (slow) =="
-docker exec "${CONTAINER}" bash /rpm/init-singlenode.sh
+echo "== initializing single-host cluster with ${SEGMENT_COUNT} primary segment(s) (slow) =="
+docker exec -e CBDB_SEGMENTS="${SEGMENT_COUNT}" "${CONTAINER}" bash /rpm/init-singlenode.sh
 
 echo
 echo "Cloudberry ready. Point target tests at it with:"

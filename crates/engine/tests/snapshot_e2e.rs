@@ -98,7 +98,7 @@ async fn run_e2e(
         .batch_execute(&format!(
             "CREATE SCHEMA {src};
              CREATE TABLE {src}.orders (
-                 tenant text NOT NULL,
+                 tenant text COLLATE \"C\" NOT NULL,
                  seq bigint NOT NULL,
                  payload text,
                  PRIMARY KEY (tenant, seq)
@@ -251,9 +251,9 @@ fn orders_schema(schema_name: &str, relation_id: u32) -> TableSchema {
         kind: TableKind::Ordinary,
         replica_identity: ReplicaIdentity::Default,
         columns: vec![
-            typed_column(1, "tenant", "text", PgTypeKind::Text, Some(1), false),
-            typed_column(2, "seq", "int8", PgTypeKind::Int8, Some(2), false),
-            typed_column(3, "payload", "text", PgTypeKind::Text, None, true),
+            typed_column(1, "tenant", 25, "text", PgTypeKind::Text, Some(1), false),
+            typed_column(2, "seq", 20, "int8", PgTypeKind::Int8, Some(2), false),
+            typed_column(3, "payload", 25, "text", PgTypeKind::Text, None, true),
         ],
         distribution_key: Vec::new(),
         partition_key: Vec::new(),
@@ -263,16 +263,18 @@ fn orders_schema(schema_name: &str, relation_id: u32) -> TableSchema {
 fn typed_column(
     attnum: i16,
     name: &str,
+    type_oid: u32,
     type_name: &str,
     kind: PgTypeKind,
     primary_key_ordinal: Option<u16>,
     nullable: bool,
 ) -> ColumnSchema {
+    let stable_text_key = primary_key_ordinal.is_some() && kind == PgTypeKind::Text;
     ColumnSchema {
         attnum,
         name: name.to_owned(),
         data_type: PgType {
-            oid: u32::try_from(attnum).unwrap(),
+            oid: type_oid,
             name: QualifiedName::new("pg_catalog", type_name).unwrap(),
             kind,
         },
@@ -280,7 +282,7 @@ fn typed_column(
         primary_key_ordinal,
         generated: GeneratedColumn::None,
         identity: IdentityColumn::None,
-        collation: None,
+        collation: stable_text_key.then(|| QualifiedName::new("pg_catalog", "C").unwrap()),
     }
 }
 

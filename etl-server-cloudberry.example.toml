@@ -8,7 +8,7 @@ spool_directory = "data/spool"
 
 [admin]
 username = "admin"
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$replace_with_hash_password_output$invalid"
+password_hash_env = "ETL_ADMIN_PASSWORD_HASH"
 
 [control]
 database_url_env = "ETL_CONTROL_DATABASE_URL"

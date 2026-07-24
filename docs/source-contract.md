@@ -14,7 +14,9 @@
 - 只有 `Standalone` topology 已完成真实 pipeline runtime 与恢复矩阵验证。
 - `PhysicalHa` 当前复用单 active primary 的 Standalone 路径，但 failover logical slot 连续性尚未实现或验证；source identity/timeline 变化会安全停止并要求新 generation，不能宣称无缝 HA。
 - `Citus` 当前会被 runtime 明确拒绝。相应章节定义准入目标，不表示已经具备端到端 snapshot/WAL/apply 能力。
-- reconciliation 目前只有有界算法与读接口，尚未接入周期性 runtime runner；生产部署不能依赖后台对账自动发现静默漂移。
+- Standalone 已接入周期性 reconciliation runner：在 source exported snapshot 与 main-slot
+  durable boundary 对齐后执行 canonical compare；发现差异时触发表级 shadow reload。原地 row
+  repair 仍保持 validation-gated，Physical HA/Citus 也不继承这项 Standalone 证据。
 - 对配置范围内的表采用严格 fail-closed：发现任意不合格表即拒绝整条 pipeline 启动，且不会静默排除该表。
 - 逐表持久化 `BLOCKED` 并继续复制其他合格表是后续能力；在 metadata 和恢复语义完成前不得按目标契约宣称已实现。
 

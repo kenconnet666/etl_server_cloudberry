@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up a single-node Apache Cloudberry 2.1 inside a rockylinux9 container that
+# Bring up a single-host Apache Cloudberry 2.1 inside a rockylinux9 container that
 # already has the Cloudberry RPM installed at /usr/local/cloudberry-db.
 #
 # This is the local/CI workaround for the missing official runnable Cloudberry
@@ -13,7 +13,13 @@ set -euo pipefail
 
 GPHOME=/usr/local/cloudberry-db
 DATADIR=/data
+SEGMENT_COUNT=${CBDB_SEGMENTS:-1}
 export MASTER_DATA_DIRECTORY="${DATADIR}/coordinator/gpseg-1"
+
+if [[ ! ${SEGMENT_COUNT} =~ ^[1-9][0-9]*$ ]]; then
+  echo "CBDB_SEGMENTS must be a positive integer" >&2
+  exit 1
+fi
 
 echo "== create gpadmin user =="
 id gpadmin >/dev/null 2>&1 || useradd -m -s /bin/bash gpadmin
@@ -38,12 +44,19 @@ HOST=$(hostname)
 su - gpadmin -c "cat > ~/hostfile <<EOF
 ${HOST}
 EOF"
-su - gpadmin -c "mkdir -p ${DATADIR}/coordinator ${DATADIR}/primary"
+SEGMENT_DIRECTORIES=""
+for index in $(seq 1 "${SEGMENT_COUNT}"); do
+  directory="${DATADIR}/primary${index}"
+  mkdir -p "${directory}"
+  chown gpadmin:gpadmin "${directory}"
+  SEGMENT_DIRECTORIES+="${directory} "
+done
+su - gpadmin -c "mkdir -p ${DATADIR}/coordinator"
 su - gpadmin -c "cat > ~/gpinitsystem_config <<EOF
 ARRAY_NAME=\"cbdb singlenode\"
 SEG_PREFIX=gpseg
 PORT_BASE=6000
-declare -a DATA_DIRECTORY=(${DATADIR}/primary)
+declare -a DATA_DIRECTORY=(${SEGMENT_DIRECTORIES})
 COORDINATOR_HOSTNAME=${HOST}
 COORDINATOR_DIRECTORY=${DATADIR}/coordinator
 COORDINATOR_PORT=5432
@@ -68,4 +81,4 @@ su - gpadmin -c "
   createdb target 2>/dev/null || true
   psql -d target -c 'SELECT version();'
 "
-echo "== single-node Cloudberry ready on :5432 (db=target, user=gpadmin) =="
+echo "== single-host Cloudberry with ${SEGMENT_COUNT} primary segment(s) ready on :5432 (db=target, user=gpadmin) =="

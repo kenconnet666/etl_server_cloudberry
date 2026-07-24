@@ -74,9 +74,10 @@ impl DdlInstallSpec {
 
     fn worker_guard_sql(&self) -> &'static str {
         if self.allow_citus_worker_guard {
-            "        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus')
-           AND NOT pg_catalog.citus_is_coordinator() THEN
-            RETURN;
+            "        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus') THEN
+            IF NOT pg_catalog.citus_is_coordinator() THEN
+                RETURN;
+            END IF;
         END IF;"
         } else {
             "        NULL;"
@@ -1069,7 +1070,10 @@ mod tests {
         assert!(sql.contains("pg_event_trigger_dropped_objects"));
         assert!(sql.contains("parse_ident(object_identity, true)"));
         assert!(sql.contains("TG_TAG LIKE 'DROP %'"));
-        assert!(sql.contains("NOT pg_catalog.citus_is_coordinator()"));
+        assert!(
+            sql.contains("IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'citus') THEN")
+        );
+        assert!(sql.contains("IF NOT pg_catalog.citus_is_coordinator() THEN"));
         assert!(!sql.contains("to_regclass('pg_catalog.pg_dist_node')"));
         assert!(sql.contains("current_setting('pg2cb.internal_ddl', true)"));
         assert!(sql.contains("'table_transitions', table_transitions"));

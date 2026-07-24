@@ -1,10 +1,10 @@
 [server]
-listen = "127.0.0.1:8080"
-secure_cookies = false
+listen = "0.0.0.0:8080"
+secure_cookies = true
 session_ttl_seconds = 28800
 
 [engine]
-spool_directory = "data/spool"
+spool_directory = "/var/lib/pg2cb/spool"
 reconcile_interval_seconds = 2
 lease_ttl_seconds = 30
 lease_renew_interval_seconds = 10
@@ -21,3 +21,4 @@ database_url_env = "ETL_CONTROL_DATABASE_URL"
 
 [security]
 master_key_env = "ETL_MASTER_KEY"
+

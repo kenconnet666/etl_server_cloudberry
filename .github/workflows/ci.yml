@@ -102,13 +102,15 @@ jobs:
             --test snapshot_page_pg18 \
             --test snapshot_copy_pg18 \
             --test snapshot_slot_pg18 \
-            -- --ignored --nocapture
+            --test reconciliation_boundary_pg18 \
+            --test reconciliation_copy_pg18 \
+            -- --ignored --nocapture --test-threads=1
         env:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           RUST_LOG: info
 
       - name: Run control-store integration tests
-        run: cargo test -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored --nocapture
+        run: cargo test -p cloudberry-etl-metadata --test control_store_pg18 -- --ignored --nocapture --test-threads=1
         env:
           PG2CB_TEST_CONTROL_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           RUST_LOG: info
@@ -155,7 +157,10 @@ jobs:
             --test cloudberry21 \
             --test schema_event_cloudberry21 \
             --test chunk_ledger_cloudberry21 \
+            --test reconciliation_cloudberry21 \
+            --test reconciliation_reader_cloudberry21 \
             -- --ignored --nocapture \
+            --test-threads=1 \
             --skip cloudberry21_parallel_aoco_copy_benchmark \
             --skip cloudberry21_pax_experimental_smoke
         env:
@@ -169,6 +174,7 @@ jobs:
             --test phase1_recovery_e2e \
             --test schema_transition_e2e \
             -- --ignored --nocapture \
+            --test-threads=1 \
             --skip standalone_aoco_throughput_benchmark \
             --skip standalone_pax_experimental_throughput_benchmark \
             --skip standalone_aoco_operation_coalescing_benchmark
@@ -176,6 +182,18 @@ jobs:
           PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
           PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target
           RUST_LOG: info
+
+      - name: Run external-process recovery E2E
+        run: |
+          cargo test -p etl-server-cloudberry \
+            --test standalone_process_e2e \
+            -- --ignored --nocapture --test-threads=1
+        env:
+          PG2CB_TEST_SOURCE_DSN: postgres://postgres:pg2cb_test@127.0.0.1:5432/source
+          PG2CB_TEST_TARGET_DSN: postgres://gpadmin@127.0.0.1:55433/target
+          PG2CB_TEST_SOURCE_CONTAINER: pg18
+          PG2CB_TEST_TARGET_CONTAINER: cbdb
+          RUST_LOG: warn
 
   web-checks:
     name: Web Build
@@ -191,5 +209,50 @@ jobs:
       - name: Install and build web
         working-directory: web
         run: |
-          npm install
+          npm ci
           npm run build
+
+  deployment-checks:
+    name: Standalone Deployment Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate operational scripts
+        run: |
+          bash -n deploy/standalone/control-db-backup.sh
+          bash -n deploy/standalone/rollback-drill.sh
+          bash -n tests/integration/standalone-soak-gate.sh
+
+      - name: Create non-secret Compose fixtures
+        run: |
+          install -d -m 700 deploy/standalone/secrets
+          printf '%s' 'pg2cb-ci-password' > deploy/standalone/secrets/control_db_password
+          printf '%s' 'postgres://pg2cb:pg2cb-ci-password@control-db:5432/pg2cb_control?sslmode=disable' > deploy/standalone/secrets/control_database_url
+          printf '%s' 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' > deploy/standalone/secrets/master_key
+          printf '%s' '$argon2id$v=19$m=16384,t=2,p=1$cGcyY2J0ZXN0c2FsdDEyMw$HJwLH1iZRaNJzPkUWMiK8TfSxXA0nQMcZIw8XJN59wo' > deploy/standalone/secrets/admin_password_hash
+          chmod 600 deploy/standalone/secrets/*
+
+      - name: Validate Compose bundle
+        env:
+          PG2CB_DOMAIN: etl.example.com
+          PG2CB_ACME_EMAIL: ops@example.com
+          PG2CB_IMAGE: etl-server-cloudberry:ci
+        run: docker compose -f deploy/standalone/compose.yaml config --quiet
+
+      - name: Validate Caddy configuration
+        run: |
+          docker run --rm \
+            -e PG2CB_DOMAIN=etl.example.com \
+            -e PG2CB_ACME_EMAIL=ops@example.com \
+            -v "$PWD/deploy/standalone/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Validate Prometheus configuration and alerts
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/standalone:/etc/prometheus:ro" \
+            prom/prometheus:v3.5.0 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/standalone:/etc/prometheus:ro" \
+            prom/prometheus:v3.5.0 check rules /etc/prometheus/alerts.yml

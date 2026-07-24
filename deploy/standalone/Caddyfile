@@ -1,0 +1,19 @@
+{
+	email {$PG2CB_ACME_EMAIL}
+}
+
+{$PG2CB_DOMAIN} {
+	encode zstd gzip
+
+	@internal path /metrics /health/ready
+	respond @internal 404
+
+	reverse_proxy app:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+		-Server
+	}
+}

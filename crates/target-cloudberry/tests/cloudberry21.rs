@@ -945,7 +945,7 @@ async fn run_snapshot_activation_test(
     };
     activate_pipeline_fence(client, first_fence).await?;
 
-    let old_plans = snapshot_plans(target_schema, 1, "old");
+    let old_plans = snapshot_plans(target_schema, 100, 1, "old");
     let first_request =
         activation_request(first_fence, &old_plans, "old", [(0, 50_u64), (1, 60_u64)]);
     assert_eq!(
@@ -1026,7 +1026,9 @@ async fn run_snapshot_activation_test(
         fencing_token: 10,
     };
     activate_pipeline_fence(client, second_fence).await?;
-    let new_plans = snapshot_plans(target_schema, 2, "new");
+    // A source table can be dropped and recreated under the same mapped name. The replacement
+    // snapshot must retain target ownership while moving to the new source relation identity.
+    let new_plans = snapshot_plans(target_schema, 10_100, 2, "new");
     let active_new_plans = &new_plans[..1];
     let second_request = activation_request(
         second_fence,
@@ -1267,13 +1269,14 @@ async fn load_snapshot_shadow(
 
 fn snapshot_plans(
     target_schema: &str,
+    relation_id_base: u32,
     generation: u64,
     shadow_suffix: &str,
 ) -> Vec<SnapshotTargetPlan> {
     (0..2)
         .map(|index| {
             plan_snapshot_target(
-                &snapshot_source_schema(100 + index, generation, index),
+                &snapshot_source_schema(relation_id_base + index, generation, index),
                 QualifiedName::new(target_schema, format!("items_{index}")).unwrap(),
                 QualifiedName::new(
                     target_schema,
@@ -1908,17 +1911,18 @@ fn column(
     nullable: bool,
     primary_key_ordinal: Option<u16>,
 ) -> ColumnSchema {
-    let type_name = match kind {
-        PgTypeKind::Int8 => "int8",
-        PgTypeKind::Int4 => "int4",
-        PgTypeKind::Text => "text",
+    let (type_oid, type_name) = match kind {
+        PgTypeKind::Int8 => (20, "int8"),
+        PgTypeKind::Int4 => (23, "int4"),
+        PgTypeKind::Text => (25, "text"),
         _ => unreachable!("integration helper only uses three built-in types"),
     };
+    let stable_text_key = primary_key_ordinal.is_some() && kind == PgTypeKind::Text;
     ColumnSchema {
         attnum,
         name: name.into(),
         data_type: PgType {
-            oid: 0,
+            oid: type_oid,
             name: QualifiedName::new("pg_catalog", type_name)
                 .expect("static identifiers are valid"),
             kind,
@@ -1927,7 +1931,8 @@ fn column(
         primary_key_ordinal,
         generated: GeneratedColumn::None,
         identity: IdentityColumn::None,
-        collation: None,
+        collation: stable_text_key
+            .then(|| QualifiedName::new("pg_catalog", "C").expect("static collation is valid")),
     }
 }
 

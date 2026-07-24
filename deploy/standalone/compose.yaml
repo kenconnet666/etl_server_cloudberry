@@ -1,0 +1,178 @@
+name: pg2cb-standalone
+
+services:
+  control-db:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pg2cb_control
+      POSTGRES_USER: pg2cb
+      POSTGRES_PASSWORD_FILE: /run/secrets/control_db_password
+    secrets:
+      - control_db_password
+    volumes:
+      # PostgreSQL 18 stores data below a major-version directory so pg_upgrade can operate
+      # without crossing a mount boundary.
+      - control_data:/var/lib/postgresql
+    networks:
+      - control
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pg2cb -d pg2cb_control"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "${PG2CB_CONTROL_CPUS:-1.0}"
+          memory: "${PG2CB_CONTROL_MEMORY:-1G}"
+
+  migrate:
+    image: ${PG2CB_IMAGE:-etl-server-cloudberry:local}
+    command: ["migrate", "--config", "/etc/pg2cb/etl-server-cloudberry.toml"]
+    restart: "no"
+    environment:
+      ETL_CONTROL_DATABASE_URL_FILE: /run/secrets/control_database_url
+      ETL_MASTER_KEY_FILE: /run/secrets/master_key
+      ETL_ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
+    secrets:
+      - control_database_url
+      - master_key
+      - admin_password_hash
+    volumes:
+      - ./etl-server-cloudberry.toml:/etc/pg2cb/etl-server-cloudberry.toml:ro
+    networks:
+      - control
+    depends_on:
+      control-db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    image: ${PG2CB_IMAGE:-etl-server-cloudberry:local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      ETL_CONTROL_DATABASE_URL_FILE: /run/secrets/control_database_url
+      ETL_MASTER_KEY_FILE: /run/secrets/master_key
+      ETL_ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
+      RUST_LOG: ${RUST_LOG:-info}
+    secrets:
+      - control_database_url
+      - master_key
+      - admin_password_hash
+    volumes:
+      - ./etl-server-cloudberry.toml:/etc/pg2cb/etl-server-cloudberry.toml:ro
+      - spool_data:/var/lib/pg2cb
+    networks:
+      - control
+      - edge
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health/live"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 4
+    deploy:
+      resources:
+        limits:
+          cpus: "${PG2CB_APP_CPUS:-2.0}"
+          memory: "${PG2CB_APP_MEMORY:-2G}"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      PG2CB_DOMAIN: ${PG2CB_DOMAIN:?set PG2CB_DOMAIN in .env}
+      PG2CB_ACME_EMAIL: ${PG2CB_ACME_EMAIL:?set PG2CB_ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    depends_on:
+      app:
+        condition: service_healthy
+    cap_drop: ["ALL"]
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - edge
+    depends_on:
+      app:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+secrets:
+  control_db_password:
+    file: ${PG2CB_CONTROL_DB_PASSWORD_FILE:-./secrets/control_db_password}
+  control_database_url:
+    file: ${PG2CB_CONTROL_DATABASE_URL_FILE:-./secrets/control_database_url}
+  master_key:
+    file: ${PG2CB_MASTER_KEY_FILE:-./secrets/master_key}
+  admin_password_hash:
+    file: ${PG2CB_ADMIN_PASSWORD_HASH_FILE:-./secrets/admin_password_hash}
+
+volumes:
+  control_data:
+  spool_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+
+networks:
+  control:
+    internal: true
+  edge:

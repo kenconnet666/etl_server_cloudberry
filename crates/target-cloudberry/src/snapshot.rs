@@ -34,8 +34,8 @@ mod progress;
 
 pub use activation::{
     activate_snapshot_group, activate_table_snapshot_group,
-    activate_table_snapshot_group_in_transaction, quarantine_active_table_in_transaction,
-    validate_active_snapshot_group, validate_active_tables,
+    activate_table_snapshot_group_in_transaction, load_active_table_generations,
+    quarantine_active_table_in_transaction, validate_active_snapshot_group, validate_active_tables,
 };
 pub(crate) use cleanup::cleanup_exact_loading_snapshot_group_in_transaction;
 pub use cleanup::{
@@ -364,6 +364,14 @@ pub struct ActiveTableMetadata {
     pub table_generation: u64,
     pub schema_fingerprint: String,
     pub snapshot_group_id: Option<Uuid>,
+}
+
+/// Target-authoritative generation used when planning a new full snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTableGeneration {
+    pub target: QualifiedName,
+    pub source_relation_id: u32,
+    pub table_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -962,12 +970,13 @@ fn validate_target_for_load(
         }
         RelationState::Managed(record) => record,
     };
-    validate_managed_identity(
-        &plan.target,
-        record,
-        ownership.fence.pipeline_id,
-        plan.source_relation_id,
-    )?;
+    if record.pipeline_id != ownership.fence.pipeline_id {
+        return Err(SnapshotTargetError::ManagedByOtherPipeline {
+            table: plan.target.to_string(),
+            expected: ownership.fence.pipeline_id,
+            actual: record.pipeline_id,
+        });
+    }
     validate_managed_fence(&plan.target, record, ownership.fence.fencing_token)?;
     if record.state != ManagedTableState::Active {
         return Err(SnapshotTargetError::UnexpectedManagedTableState {
@@ -977,11 +986,19 @@ fn validate_target_for_load(
         });
     }
     if record.table_generation == plan.source_generation
+        && record.source_relation_id == plan.source_relation_id
         && record.schema_fingerprint == ownership.schema_fingerprint
     {
         return Err(SnapshotTargetError::TargetAlreadyActive(
             plan.target.to_string(),
         ));
+    }
+    if record.table_generation >= plan.source_generation {
+        return Err(SnapshotTargetError::ActivationGenerationNotNewer {
+            table: plan.target.to_string(),
+            active: record.table_generation,
+            proposed: plan.source_generation,
+        });
     }
     Ok(())
 }

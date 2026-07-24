@@ -21,11 +21,13 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin pg2cb \
-    && install --directory --owner=pg2cb --group=pg2cb /app/web /etc/pg2cb
+    && install --directory --owner=pg2cb --group=pg2cb \
+        /app/web /etc/pg2cb /var/lib/pg2cb /var/lib/pg2cb/spool
 WORKDIR /app
 COPY --from=rust-builder /workspace/target/release/etl-server-cloudberry /usr/local/bin/etl-server-cloudberry
 COPY --from=web-builder --chown=pg2cb:pg2cb /workspace/web/dist/ /app/web/
 USER pg2cb
+VOLUME ["/var/lib/pg2cb"]
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8080/health/live >/dev/null || exit 1

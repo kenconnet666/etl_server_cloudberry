@@ -777,7 +777,8 @@ COMMENT ON EVENT TRIGGER {} IS '{}';"#,
                             COALESCE(bool_and(payload->'affected_schemas' =
                                 jsonb_build_array($2::text)), false)
                        FROM {}.ddl_audit
-                      WHERE command_tag = $1",
+                      WHERE command_tag = $1
+                        AND payload->'affected_schemas' = jsonb_build_array($2::text)",
                     quote_identifier(&objects.metadata_schema)
                 ),
                 &[&command_tag, &objects.other_schema],

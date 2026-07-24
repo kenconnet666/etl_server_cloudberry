@@ -96,6 +96,9 @@ fn load_config(path: &PathBuf) -> Result<BootstrapConfig> {
 fn check_config(path: PathBuf) -> Result<()> {
     let config = load_config(&path)?;
     config
+        .admin_password_hash()
+        .context("administrator password hash environment is invalid")?;
+    config
         .control_database_url()
         .context("control database environment is invalid")?;
     MasterKey::from_base64(&config.master_key()?).context("master key is invalid")?;
@@ -150,7 +153,7 @@ async fn serve(path: PathBuf, web_dir: PathBuf) -> Result<()> {
     };
     let auth = AuthState::new(
         config.admin.username.clone(),
-        config.admin.password_hash.clone(),
+        config.admin_password_hash()?,
         config.server.secure_cookies,
         Duration::from_secs(config.server.session_ttl_seconds),
     );

@@ -1,0 +1,51 @@
+groups:
+  - name: pg2cb
+    rules:
+      - alert: Pg2cbServiceDown
+        expr: up{job="pg2cb"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ETL management service is unavailable
+
+      - alert: Pg2cbPipelineNotOwned
+        expr: pg2cb_pipelines_desired_running > pg2cb_pipelines_running
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: A desired-running pipeline has no active job
+
+      - alert: Pg2cbPipelineResourceWait
+        expr: pg2cb_pipeline_resource_wait == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pipeline is waiting for spool or WAL capacity
+
+      - alert: Pg2cbWalRetentionWarning
+        expr: pg2cb_pipeline_wal_retention_warning == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Source logical slot is near its WAL retention limit
+
+      - alert: Pg2cbRuntimeError
+        expr: pg2cb_pipeline_last_error_info == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pipeline has a persistent runtime error
+
+      - alert: Pg2cbApplyStalled
+        expr: pg2cb_pipeline_estimated_byte_lag > 67108864 and time() - pg2cb_pipeline_last_apply_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Pipeline apply is stalled with more than 64 MiB lag
+
